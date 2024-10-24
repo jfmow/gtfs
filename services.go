@@ -114,7 +114,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 	mainQuery := sq.Select(
 		"st.trip_id", "st.arrival_time", "st.departure_time", "st.stop_id", "st.stop_sequence", "st.stop_headsign",
 		"s.stop_id", "s.stop_name", "s.stop_lat", "s.stop_lon", "s.stop_code", "s.location_type", "s.parent_station",
-		"s.wheelchair_boarding",
+		"s.wheelchair_boarding", "s.platform_code",
 		"t.route_id", "t.trip_headsign", "t.shape_id", "t.service_id", "t.direction_id", "t.wheelchair_accessible", "t.bikes_allowed", "r.route_color").
 		From("stop_times st").
 		Join("trips t ON st.trip_id = t.trip_id").
@@ -159,6 +159,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 			&stop.LocationType,
 			&stop.ParentStation,
 			&stop.WheelChairBoarding,
+			&trip.Platform,
 			&tripData.RouteID,
 			&tripData.TripHeadsign,
 			&tripData.ShapeID,
@@ -178,7 +179,9 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		trip.TripData = tripData
 
 		// Assign platform
-		trip.Platform = determinePlatform(stop.StopName, reStationPlatform, reCapitalLetter)
+		if trip.Platform == "" {
+			trip.Platform = determinePlatform(stop.StopName, reStationPlatform, reCapitalLetter)
+		}
 
 		// Collect results
 		services = append(services, trip)
