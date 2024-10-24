@@ -28,14 +28,21 @@ type StopTimes struct {
 func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int, date string) ([]StopTimes, error) {
 	db := v.db
 
-	// Precompute date and dayOfWeek once
-	today := time.Now()
+	// Parse provided date string into time.Time object for proper handling
+	var serviceDate time.Time
+	var err error
 	if date == "" {
-		date = fmt.Sprintf("%d%02d%02d", today.Year(), int(today.Month()), today.Day())
+		serviceDate = time.Now()
+		date = serviceDate.Format("20060102") // Default to today's date formatted as YYYYMMDD
+	} else {
+		serviceDate, err = time.Parse("20060102", date)
+		if err != nil {
+			return nil, errors.New("invalid date format, use YYYYMMDD")
+		}
 	}
-	dayOfWeek := today.Weekday().String()
+	dayOfWeek := serviceDate.Weekday().String()
 
-	// Combine query to check for child stops and use original stop if none found
+	// Query child stops (if any), otherwise use the provided stopID
 	childStopsQuery := sq.Select("stop_id").
 		From("stops").
 		Where(sq.Eq{"parent_station": stopID})
@@ -57,64 +64,66 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		stopIDsToQuery = []string{stopID}
 	}
 
-	// Precompute service_id SQL with UNION and reuse in the main query
-	// Get regular services for the date
-	serviceQuery := sq.Select("service_id").From("calendar").
+	// Regular services for the date from calendar
+	serviceQuery := sq.Select("service_id").
+		From("calendar").
 		Where(sq.LtOrEq{"start_date": date}).
 		Where(sq.GtOrEq{"end_date": date}).
 		Where(sq.Eq{dayOfWeek: 1})
-	
-	// Get special added services (exception_type = 1) from calendar_dates
-	specialServiceQuery := sq.Select("service_id").From("calendar_dates").
+
+	// Special added services (exception_type = 1) from calendar_dates
+	specialServiceQuery := sq.Select("service_id").
+		From("calendar_dates").
 		Where(sq.Eq{"date": date, "exception_type": 1})
 
 	// Exclude services that are explicitly removed (exception_type = 2) on this date
-	excludedServiceQuery := sq.Select("service_id").From("calendar_dates").
+	excludedServiceQuery := sq.Select("service_id").
+		From("calendar_dates").
 		Where(sq.Eq{"date": date, "exception_type": 2})
 
-	serviceSQL, serviceArgs, err := serviceQuery.ToSql()
+	// Combine regular services and special services using UNION
+	regularServiceSQL, regularServiceArgs, err := serviceQuery.ToSql()
 	if err != nil {
 		return nil, err
 	}
-	specialServiceSQL, specialArgs, err := specialServiceQuery.ToSql()
+	specialServiceSQL, specialServiceArgs, err := specialServiceQuery.ToSql()
 	if err != nil {
 		return nil, err
 	}
-	excludedServiceSQL, excludedArgs, err := excludedServiceQuery.ToSql()
+	excludedServiceSQL, excludedServiceArgs, err := excludedServiceQuery.ToSql()
 	if err != nil {
 		return nil, err
 	}
 
-	// Combine regular services and special services with UNION
-	unionSQL := fmt.Sprintf("%s UNION %s", serviceSQL, specialServiceSQL)
-	serviceArgs = append(serviceArgs, specialArgs...)
+	// Combine service args for union and main query
+	unionSQL := fmt.Sprintf("%s UNION %s", regularServiceSQL, specialServiceSQL)
+	serviceArgs := append(regularServiceArgs, specialServiceArgs...)
 
-	startTime := time.Date(0, 1, 1, startHour, 0, 0, 0, time.UTC) // startHour in HH:00:00 format
+	// Calculate time range for query
+	startTime := time.Date(0, 1, 1, startHour, 0, 0, 0, time.UTC)
 	endTime := startTime.Add(time.Duration(hourRange) * time.Hour)
-	endOfDay := time.Date(today.Year(), today.Month(), today.Day(), 23, 59, 59, 0, time.UTC)
+	endOfDay := time.Date(serviceDate.Year(), serviceDate.Month(), serviceDate.Day(), 23, 59, 59, 0, time.UTC)
 	if endTime.After(endOfDay) {
-		endTime = endOfDay // If it exceeds, set to the end of the day
+		endTime = endOfDay
 	}
-	// Format the start and end times as "HH:MM:SS" strings
 	startTimeStr := startTime.Format("15:04:05")
 	endTimeStr := endTime.Format("15:04:05")
 
-	// Main query needs to exclude services from `excludedServiceQuery`
-	// Format excludedServiceSQL as a subquery for filtering
+	// Main query excluding explicitly removed services
 	mainQuery := sq.Select(
 		"st.trip_id", "st.arrival_time", "st.departure_time", "st.stop_id", "st.stop_sequence", "st.stop_headsign",
 		"s.stop_id", "s.stop_name", "s.stop_lat", "s.stop_lon", "s.stop_code", "s.location_type", "s.parent_station",
 		"s.wheelchair_boarding",
 		"t.route_id", "t.trip_headsign", "t.shape_id", "t.service_id", "t.direction_id", "t.wheelchair_accessible", "t.bikes_allowed", "r.route_color").
 		From("stop_times st").
-		Join("trips t ON st.trip_id = t.trip_id"). // Joining trips to fetch trip data
+		Join("trips t ON st.trip_id = t.trip_id").
 		Join("stops s ON st.stop_id = s.stop_id").
 		Join("routes r ON t.route_id = r.route_id").
 		Where(sq.Eq{"st.stop_id": stopIDsToQuery}).
 		Where(fmt.Sprintf("t.service_id IN (%s)", unionSQL), serviceArgs...).
-		Where(fmt.Sprintf("t.service_id NOT IN (%s)", excludedServiceSQL), excludedArgs...). // Exclude removed services
+		Where(fmt.Sprintf("t.service_id NOT IN (%s)", excludedServiceSQL), excludedServiceArgs...).
 		Where(sq.GtOrEq{"st.arrival_time": startTimeStr}).
-		Where(sq.LtOrEq{"st.arrival_time": endTimeStr}). // Filtering by hour range
+		Where(sq.LtOrEq{"st.arrival_time": endTimeStr}).
 		OrderBy("st.arrival_time")
 
 	rows, err := mainQuery.RunWith(db).Query()
@@ -186,7 +195,6 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 
 	return services, nil
 }
-
 
 func (v Database) GetCachedServicesAtStop(stopID string, startHour int, hourRange int, date string) ([]StopTimes, error) {
 	today := time.Now()
