@@ -6,7 +6,7 @@ import (
 	"github.com/robfig/cron"
 )
 
-func (v Database) EnableAutoUpdate() {
+func (v Database) EnableAutoUpdateGTFSData() {
 	c := cron.New()
 
 	// Add the cron schedule and task to the cron job
@@ -34,7 +34,9 @@ func (v Database) EnableAutoUpdate() {
 				fmt.Printf("Failed to write new data to the database: %v", err)
 			}
 			fmt.Println("Feed data updated automatically")
+			v.precomputeServices()
 		}
+
 	})
 
 	// Start the cron job scheduler
