@@ -32,7 +32,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 	var serviceDate time.Time
 	var err error
 	if date == "" {
-		serviceDate = time.Now()
+		serviceDate = time.Now().In(time.FixedZone("NZST", 13*60*60))
 		date = serviceDate.Format("20060102") // Default to today's date formatted as YYYYMMDD
 	} else {
 		serviceDate, err = time.Parse("20060102", date)
@@ -40,7 +40,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 			return nil, errors.New("invalid date format, use YYYYMMDD")
 		}
 	}
-	dayOfWeek := serviceDate.Weekday().String()
+	dayOfWeek := strings.ToLower(serviceDate.Weekday().String()) // Use weekday from the provided date
 
 	// Query child stops (if any), otherwise use the provided stopID
 	childStopsQuery := sq.Select("stop_id").
@@ -65,11 +65,12 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 	}
 
 	// Regular services for the date from calendar
+	// Ensure the correct day-of-week column is used (e.g., monday, tuesday, etc.)
 	serviceQuery := sq.Select("service_id").
 		From("calendar").
 		Where(sq.LtOrEq{"start_date": date}).
 		Where(sq.GtOrEq{"end_date": date}).
-		Where(sq.Eq{dayOfWeek: 1})
+		Where(sq.Eq{dayOfWeek: 1}) // Only services active on that weekday
 
 	// Special added services (exception_type = 1) from calendar_dates
 	specialServiceQuery := sq.Select("service_id").
