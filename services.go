@@ -89,6 +89,16 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 	unionSQL := fmt.Sprintf("%s UNION %s", serviceSQL, specialServiceSQL)
 	serviceArgs = append(serviceArgs, specialArgs...)
 
+	startTime := time.Date(0, 1, 1, startHour, 0, 0, 0, time.UTC) // startHour in HH:00:00 format
+	endTime := startTime.Add(time.Duration(hourRange) * time.Hour)
+	endOfDay := time.Date(today.Year(), today.Month(), today.Day(), 23, 59, 59, 0, time.UTC)
+	if endTime.After(endOfDay) {
+		endTime = endOfDay // If it exceeds, set to the end of the day
+	}
+	// Format the start and end times as "HH:MM:SS" strings
+	startTimeStr := startTime.Format("15:04:05")
+	endTimeStr := endTime.Format("15:04:05")
+
 	// Main query needs to exclude services from `excludedServiceQuery`
 	// Format excludedServiceSQL as a subquery for filtering
 	mainQuery := sq.Select(
