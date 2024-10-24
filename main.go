@@ -126,17 +126,13 @@ func New(url string, databaseName string) (Database, error) {
 		}
 
 		fmt.Println("Data updated successfully.")
+		database.precomputeServices()
 
 	} else {
 		fmt.Println("Feed data is still up to date.")
 	}
 
-	_, err = database.precomputeServices()
-	if err != nil {
-		panic(err)
-	}
-
-	database.EnableAutoUpdate()
+	database.EnableAutoUpdateGTFSData()
 
 	return database, nil
 }
