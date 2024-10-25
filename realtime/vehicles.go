@@ -184,4 +184,5 @@ type VehicleVehicle struct {
 	ID           string `json:"id"`
 	Label        string `json:"label"`
 	LicensePlate string `json:"license_plate"`
+	Type         string `json:"type"` //Blank always
 }
