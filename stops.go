@@ -81,57 +81,6 @@ func (v Database) GetStops() (Stops, error) {
 	return stops, nil
 }
 
-func (v Database) GetStopsByType(stopType string) (Stops, error) {
-	db := v.db
-	baseQuery := sq.Select("stop_id", "stop_code", "stop_name", "stop_lat", "stop_lon", "location_type", "parent_station", "platform_code", "wheelchair_boarding").From("stops")
-
-	rows, err := baseQuery.Where(sq.ILike{"stop_name": stopType}).RunWith(db).Query()
-
-	if err != nil {
-		return nil, err
-	}
-
-	defer rows.Close() // Ensure the rows are closed after usage
-
-	// Slice to hold all the trips
-	var stops Stops
-
-	// Iterate over the rows
-	for rows.Next() {
-		var stop Stop
-		// Scan the row data into the trip struct
-		err := rows.Scan(
-			&stop.StopId,
-			&stop.StopCode,
-			&stop.StopName,
-			&stop.StopLat,
-			&stop.StopLon,
-			&stop.LocationType,
-			&stop.ParentStation,
-			&stop.PlatformNumber,
-			&stop.WheelChairBoarding,
-		)
-		if err != nil {
-			return nil, err
-		}
-		stop.StopType = typeOfStop(stop.StopName)
-		// Append each trip to the slice
-		stops = append(stops, stop)
-	}
-
-	// Check for any error encountered during iteration
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-
-	// If no trips were found, return a custom error
-	if len(stops) == 0 {
-		return nil, errors.New("no stops found")
-	}
-
-	return stops, nil
-}
-
 func (v Database) GetStopsForTripID(tripID string) (Stops, error) {
 	db := v.db
 
