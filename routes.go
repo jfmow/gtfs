@@ -106,7 +106,13 @@ func (v Database) GetRouteByID(routeID string) (Route, error) {
 	return route, nil
 }
 
-func (v Database) SearchForRouteByID(searchText string) ([]StopSearch, error) {
+type RouteSearch struct {
+	RouteID        string `json:"route_id"`
+	RouteLongName  string `json:"route_long_name"`
+	RouteShortName string `json:"route_short_name"`
+}
+
+func (v Database) SearchForRouteByID(searchText string) ([]RouteSearch, error) {
 	// Normalize the input search text and make it lowercase
 	normalizedSearchText := strings.ToLower(searchText)
 
@@ -122,7 +128,7 @@ func (v Database) SearchForRouteByID(searchText string) ([]StopSearch, error) {
 	}
 	defer rows.Close()
 
-	var routeSearchResults []StopSearch
+	var routeSearchResults []RouteSearch
 
 	// Iterate over the rows
 	for rows.Next() {
@@ -131,7 +137,7 @@ func (v Database) SearchForRouteByID(searchText string) ([]StopSearch, error) {
 		if err != nil {
 			return nil, err
 		}
-		routeSearchResults = append(routeSearchResults, StopSearch{Name: route.RouteId})
+		routeSearchResults = append(routeSearchResults, RouteSearch{RouteID: route.RouteId, RouteLongName: route.RouteLongName, RouteShortName: route.RouteShortName})
 	}
 
 	// Check for any error encountered during iteration
