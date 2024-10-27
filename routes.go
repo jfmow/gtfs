@@ -1,6 +1,8 @@
 package gtfs
+
 import (
 	"errors"
+	"strings"
 
 	sq "github.com/Masterminds/squirrel"
 )
@@ -102,4 +104,44 @@ func (v Database) GetRouteByID(routeID string) (Route, error) {
 	}
 
 	return route, nil
+}
+
+func (v Database) SearchForRouteByID(searchText string) ([]StopSearch, error) {
+	// Normalize the input search text and make it lowercase
+	normalizedSearchText := strings.ToLower(searchText)
+
+	// Create a SQL query to find matching stops
+	query := sq.Select("route_id", "route_short_name", "route_long_name")
+	query = query.From("routes")
+	query = query.Where(sq.Like{"LOWER(route_id)": "%" + normalizedSearchText + "%"})
+
+	// Run the query
+	rows, err := query.RunWith(v.db).Query()
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var routeSearchResults []StopSearch
+
+	// Iterate over the rows
+	for rows.Next() {
+		var route Route
+		err := rows.Scan(&route.RouteId, &route.RouteShortName, &route.RouteLongName)
+		if err != nil {
+			return nil, err
+		}
+		routeSearchResults = append(routeSearchResults, StopSearch{Name: route.RouteId})
+	}
+
+	// Check for any error encountered during iteration
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(routeSearchResults) == 0 {
+		return nil, errors.New("no routes found for search")
+	}
+
+	return routeSearchResults, nil
 }
