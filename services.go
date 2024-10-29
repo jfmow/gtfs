@@ -38,14 +38,14 @@ func (v Database) dteQuery() {
 		LeftJoin("calendar_dates cd ON c.service_id = cd.service_id").
 		Where("c.start_date <= ?", date).
 		Where("c.end_date >= ?", date).
-		Where("(c.weekDay = 1 OR c.weekDay - ? = ?)", currentWeek, fmt.Sprintf("Weekday-%d", currentWeek)).
+		Where(fmt.Sprintf("(c.%s = 1 OR c.%s - ? = ?)", weekDay, weekDay), currentWeek, fmt.Sprintf("Weekday-%d", currentWeek)).
 		Where("cd.date IS NULL OR (cd.date = ? AND cd.exception_type = 1)", date).
-		OrderBy("CASE "+
-			"WHEN c.service_id LIKE '%' || ? || '%' THEN 1 "+ // Prioritize services that match the weekDay
-			"WHEN c.service_id LIKE 'Ex%' THEN 2 "+ // Then, prioritize exceptions
-			"WHEN c.service_id LIKE 'Daily%' THEN 3 "+ // Lastly, prioritize daily services
-			"ELSE 4 "+ // Any other cases go last
-			"END", strings.Title(weekDay)).
+		OrderBy("CASE " +
+			fmt.Sprintf("WHEN c.service_id LIKE '%%%s%%' THEN 1 ", strings.Title(weekDay)) + // Prioritize services that match the weekDay
+			"WHEN c.service_id LIKE 'Ex%' THEN 2 " + // Then, prioritize exceptions
+			"WHEN c.service_id LIKE 'Daily%' THEN 3 " + // Lastly, prioritize daily services
+			"ELSE 4 " + // Any other cases go last
+			"END").
 		Limit(1)
 
 	// Generate the SQL query and arguments
