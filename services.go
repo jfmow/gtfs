@@ -73,6 +73,32 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		Where(sq.GtOrEq{"end_date": date}).
 		Where(sq.Eq{dayOfWeek: 1}) // Active on this weekday
 
+	serviceQuery2 := sq.Select("DISTINCT c.service_id").
+		From("calendar c").
+		LeftJoin("calendar_dates cd ON c.service_id = cd.service_id").
+		Where(sq.LtOrEq{"c.start_date": date}).
+		Where(sq.GtOrEq{"c.end_date": date}).
+		Where(sq.Or{
+			sq.Eq{dayOfWeek: 1},            // Active on Thursday
+			sq.Eq{dayOfWeek: "Weekday-44"}, // or for special conditions (assuming weekday-44 logic)
+		}).
+		Where(sq.Or{
+			sq.Eq{"cd.date": nil}, // No specific date in calendar_dates
+			sq.And{
+				sq.Eq{"cd.date": date},        // or the specific date matches
+				sq.Eq{"cd.exception_type": 1}, // and exception type is 1
+			},
+		}).
+		OrderBy(
+			"CASE " +
+				"WHEN c.service_id LIKE '%Thursday%' THEN 1 " +
+				"WHEN c.service_id LIKE 'Ex%' THEN 2 " +
+				"WHEN c.service_id LIKE 'Daily%' THEN 3 " +
+				"ELSE 4 END").
+		Limit(1)
+
+	fmt.Println(serviceQuery2.Exec())
+
 	// Query for special added services (exception_type = 1) on specific dates
 	specialServiceQuery := sq.Select("service_id").
 		From("calendar_dates").
@@ -83,7 +109,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		From("calendar_dates").
 		Where(sq.Eq{"date": date, "exception_type": 2})
 
-	// Compile SQL for the regular and special services
+	// Compile union query for regular and special services
 	regularServiceSQL, regularServiceArgs, err := serviceQuery.ToSql()
 	if err != nil {
 		return nil, err
@@ -97,7 +123,6 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		return nil, err
 	}
 
-	// Create a union SQL for the regular and special services
 	unionSQL := fmt.Sprintf("(%s UNION %s)", regularServiceSQL, specialServiceSQL)
 	serviceArgs := append(regularServiceArgs, specialServiceArgs...)
 
@@ -127,7 +152,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		Where(sq.LtOrEq{"st.arrival_time": endTimeStr}).
 		OrderBy("st.arrival_time")
 
-	// Log the query for debugging
+	// Log query for debugging
 	querySQL, queryArgs, err := mainQuery.ToSql()
 	if err != nil {
 		return nil, err
@@ -184,7 +209,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		trip.StopData = stop
 		trip.TripData = tripData
 
-		// Assign platform if not already set
+		// Assign platform
 		if trip.Platform == "" {
 			trip.Platform = determinePlatform(stop.StopName, reStationPlatform, reCapitalLetter)
 		}
