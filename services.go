@@ -27,7 +27,7 @@ type StopTimes struct {
 	RouteColor    string `json:"route_color"`
 }
 
-func dteQuery() {
+func (v Database) dteQuery() {
 	currentWeek := 44
 	date := "20241031"
 	weekDay := "thursday" // This variable can be used for comparison in the order clause.
@@ -49,16 +49,31 @@ func dteQuery() {
 		Limit(1)
 
 	// Generate the SQL query and arguments
-	sql, args, err := builder.ToSql()
+	sqlQuery, args, err := builder.ToSql()
 	if err != nil {
 		// Handle the error
-		fmt.Println("Error building query:", err)
+		log.Println("Error building query:", err)
 		return
 	}
 
 	// Print the generated SQL query and arguments
-	fmt.Println("SQL Query:", sql)
+	fmt.Println("SQL Query:", sqlQuery)
 	fmt.Println("Arguments:", args)
+
+	// Execute the query
+	var serviceID string
+	err = v.db.QueryRow(sqlQuery, args...).Scan(&serviceID) // Use QueryRow for a single result
+	if err != nil {
+		if err == sql.ErrNoRows {
+			fmt.Println("No service found.")
+		} else {
+			log.Println("Error executing query:", err)
+		}
+		return
+	}
+
+	// Print the result
+	fmt.Printf("Found service_id: %s\n", serviceID)
 }
 
 func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int, date string) ([]StopTimes, error) {
@@ -108,7 +123,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		Where(sq.GtOrEq{"end_date": date}).
 		Where(sq.Eq{dayOfWeek: 1}) // Active on this weekday
 
-	dteQuery()
+	v.dteQuery()
 
 	// Query for special added services (exception_type = 1) on specific dates
 	specialServiceQuery := sq.Select("service_id").
