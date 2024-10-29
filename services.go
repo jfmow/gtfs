@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Masterminds/squirrel"
 	sq "github.com/Masterminds/squirrel"
 )
 
@@ -24,6 +25,40 @@ type StopTimes struct {
 	StopData      Stop   `json:"stop_data"`
 	TripData      Trip   `json:"trip_data"`
 	RouteColor    string `json:"route_color"`
+}
+
+func dteQuery() {
+	currentWeek := 44
+	date := "20241031"
+	weekDay := "thursday" // This variable can be used for comparison in the order clause.
+
+	// Create a squirrel statement builder
+	builder := squirrel.Select("DISTINCT c.service_id").
+		From("calendar c").
+		LeftJoin("calendar_dates cd ON c.service_id = cd.service_id").
+		Where("c.start_date <= ?", date).
+		Where("c.end_date >= ?", date).
+		Where("(c.weekDay = 1 OR c.weekDay - ? = ?)", currentWeek, fmt.Sprintf("Weekday-%d", currentWeek)).
+		Where("cd.date IS NULL OR (cd.date = ? AND cd.exception_type = 1)", date).
+		OrderBy("CASE "+
+			"WHEN c.service_id LIKE '%' || ? || '%' THEN 1 "+ // Prioritize services that match the weekDay
+			"WHEN c.service_id LIKE 'Ex%' THEN 2 "+ // Then, prioritize exceptions
+			"WHEN c.service_id LIKE 'Daily%' THEN 3 "+ // Lastly, prioritize daily services
+			"ELSE 4 "+ // Any other cases go last
+			"END", strings.Title(weekDay)).
+		Limit(1)
+
+	// Generate the SQL query and arguments
+	sql, args, err := builder.ToSql()
+	if err != nil {
+		// Handle the error
+		fmt.Println("Error building query:", err)
+		return
+	}
+
+	// Print the generated SQL query and arguments
+	fmt.Println("SQL Query:", sql)
+	fmt.Println("Arguments:", args)
 }
 
 func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int, date string) ([]StopTimes, error) {
@@ -73,31 +108,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		Where(sq.GtOrEq{"end_date": date}).
 		Where(sq.Eq{dayOfWeek: 1}) // Active on this weekday
 
-	serviceQuery2 := sq.Select("DISTINCT c.service_id").
-		From("calendar c").
-		LeftJoin("calendar_dates cd ON c.service_id = cd.service_id").
-		Where(sq.LtOrEq{"c.start_date": date}).
-		Where(sq.GtOrEq{"c.end_date": date}).
-		Where(sq.Or{
-			sq.Eq{dayOfWeek: 1},            // Active on Thursday
-			sq.Eq{dayOfWeek: "Weekday-44"}, // or for special conditions (assuming weekday-44 logic)
-		}).
-		Where(sq.Or{
-			sq.Eq{"cd.date": nil}, // No specific date in calendar_dates
-			sq.And{
-				sq.Eq{"cd.date": date},        // or the specific date matches
-				sq.Eq{"cd.exception_type": 1}, // and exception type is 1
-			},
-		}).
-		OrderBy(
-			"CASE "+
-				"WHEN c.service_id LIKE '%' || ? || '%' THEN 1 "+ // Use the dayOfWeek variable for ordering
-				"WHEN c.service_id LIKE 'Ex%' THEN 2 "+
-				"WHEN c.service_id LIKE 'Daily%' THEN 3 "+
-				"ELSE 4 END", dayOfWeek). // Bind dayOfWeek parameter to the query
-		Limit(1)
-
-	fmt.Println(serviceQuery2.ToSql())
+	dteQuery()
 
 	// Query for special added services (exception_type = 1) on specific dates
 	specialServiceQuery := sq.Select("service_id").
