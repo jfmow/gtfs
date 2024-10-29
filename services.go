@@ -97,15 +97,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 				"ELSE 4 END", dayOfWeek). // Bind dayOfWeek parameter to the query
 		Limit(1)
 
-	res1, _ := serviceQuery2.RunWith(db).Query()
-
-	defer res1.Close()
-
-	for res1.Next() {
-		var date string
-		res1.Scan(&date)
-		fmt.Println(date)
-	}
+	fmt.Println(serviceQuery2.ToSql())
 
 	// Query for special added services (exception_type = 1) on specific dates
 	specialServiceQuery := sq.Select("service_id").
