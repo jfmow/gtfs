@@ -66,18 +66,25 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 
 	// Regular services for the date from calendar
 	// Ensure the correct day-of-week column is used (e.g., monday, tuesday, etc.)
+	_, weekNumber := serviceDate.ISOWeek()
+	weekdayWithWeek := fmt.Sprintf("%s-%d", dayOfWeek, weekNumber)
+
+	// Build service query for regular schedule in calendar.txt
 	serviceQuery := sq.Select("service_id").
 		From("calendar").
 		Where(sq.LtOrEq{"start_date": date}).
 		Where(sq.GtOrEq{"end_date": date}).
-		Where(sq.Eq{dayOfWeek: 1}) // Only services active on that weekday
+		Where(sq.Or{
+			sq.Eq{dayOfWeek: 1},       // Standard weekday field
+			sq.Eq{weekdayWithWeek: 1}, // Specific Weekday-<weekNumber> field
+		})
 
-	// Special added services (exception_type = 1) from calendar_dates
+	// Query for special added services (exception_type = 1) in calendar_dates.txt
 	specialServiceQuery := sq.Select("service_id").
 		From("calendar_dates").
 		Where(sq.Eq{"date": date, "exception_type": 1})
 
-	// Exclude services that are explicitly removed (exception_type = 2) on this date
+	// Query for excluded services (exception_type = 2) in calendar_dates.txt
 	excludedServiceQuery := sq.Select("service_id").
 		From("calendar_dates").
 		Where(sq.Eq{"date": date, "exception_type": 2})
@@ -114,6 +121,8 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 	endTimeStr := endTime.Format("15:04:05")
 
 	// Main query excluding explicitly removed services
+
+	// Main query to fetch trips
 	mainQuery := sq.Select(
 		"st.trip_id", "st.arrival_time", "st.departure_time", "st.stop_id", "st.stop_sequence", "st.stop_headsign",
 		"s.stop_id", "s.stop_name", "s.stop_lat", "s.stop_lon", "s.stop_code", "s.location_type", "s.parent_station",
