@@ -90,11 +90,11 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 			},
 		}).
 		OrderBy(
-			"CASE " +
-				"WHEN c.service_id LIKE '%Thursday%' THEN 1 " +
-				"WHEN c.service_id LIKE 'Ex%' THEN 2 " +
-				"WHEN c.service_id LIKE 'Daily%' THEN 3 " +
-				"ELSE 4 END").
+			"CASE "+
+				"WHEN c.service_id LIKE '%' || ? || '%' THEN 1 "+ // Use the dayOfWeek variable for ordering
+				"WHEN c.service_id LIKE 'Ex%' THEN 2 "+
+				"WHEN c.service_id LIKE 'Daily%' THEN 3 "+
+				"ELSE 4 END", dayOfWeek). // Bind dayOfWeek parameter to the query
 		Limit(1)
 
 	res1, _ := serviceQuery2.RunWith(db).Query()
