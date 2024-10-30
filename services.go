@@ -298,6 +298,7 @@ func (v Database) GetServicesAtStop(stopID string, dateStr string) ([]StopTimes,
 			&stop.StopCode,
 			&stop.LocationType,
 			&stop.ParentStation,
+			&stop.PlatformNumber,
 		); err != nil {
 			return nil, fmt.Errorf("error scanning row: %v", err)
 		}
