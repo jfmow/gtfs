@@ -3,14 +3,11 @@ package gtfs
 import (
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"log"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/Masterminds/squirrel"
 	sq "github.com/Masterminds/squirrel"
 )
 
@@ -27,54 +24,8 @@ type StopTimes struct {
 	RouteColor    string `json:"route_color"`
 }
 
-func (v Database) dteQuery(currentWeek int, date string, weekDay string) string {
-
-	// Create a squirrel statement builder
-	builder := squirrel.Select("DISTINCT c.service_id").
-		From("calendar c").
-		LeftJoin("calendar_dates cd ON c.service_id = cd.service_id").
-		Where("c.start_date <= ?", date).
-		Where("c.end_date >= ?", date).
-		Where(fmt.Sprintf("(c.%s = 1 OR c.%s - ? = ?)", weekDay, weekDay), currentWeek, fmt.Sprintf("Weekday-%d", currentWeek)).
-		Where("cd.date IS NULL OR (cd.date = ? AND cd.exception_type = 1)", date).
-		OrderBy("CASE " +
-			fmt.Sprintf("WHEN c.service_id LIKE '%%%s%%' THEN 1 ", strings.Title(weekDay)) + // Prioritize services that match the weekDay
-			"WHEN c.service_id LIKE 'Ex%' THEN 2 " + // Then, prioritize exceptions
-			"WHEN c.service_id LIKE 'Daily%' THEN 3 " + // Lastly, prioritize daily services
-			"ELSE 4 " + // Any other cases go last
-			"END").
-		Limit(1)
-
-	// Generate the SQL query and arguments
-	sqlQuery, args, err := builder.ToSql()
-	if err != nil {
-		// Handle the error
-		log.Println("Error building query:", err)
-		return ""
-	}
-
-	// Print the generated SQL query and arguments
-	fmt.Println("SQL Query:", sqlQuery)
-	fmt.Println("Arguments:", args)
-
-	// Execute the query
-	var serviceID string
-	err = v.db.QueryRow(sqlQuery, args...).Scan(&serviceID) // Use QueryRow for a single result
-	if err != nil {
-		if err == sql.ErrNoRows {
-			fmt.Println("No service found.")
-		} else {
-			log.Println("Error executing query:", err)
-		}
-		return ""
-	}
-
-	// Print the result
-	fmt.Printf("Found service_id: %s\n", serviceID)
-	return serviceID
-}
-
-func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int, date string) ([]StopTimes, error) {
+/*
+func (v Database) GetServicesAtStopOld(stopID string, startHour int, hourRange int, date string) ([]StopTimes, error) {
 	db := v.db
 
 	// Parse date or default to today in local timezone
@@ -90,7 +41,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		}
 	}
 
-	dayOfWeek := strings.ToLower(serviceDate.Weekday().String())
+	//dayOfWeek := strings.ToLower(serviceDate.Weekday().String())
 
 	// Query for child stops (if any) or use the provided stopID
 	childStopsQuery := sq.Select("stop_id").
@@ -114,12 +65,32 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		stopIDsToQuery = []string{stopID}
 	}
 
-	// Define weekday-based and exception service queries
-	_, week := time.Now().ISOWeek()
-	serviceID := v.dteQuery(week, date, dayOfWeek)
-	fmt.Println(serviceID)
-
 	// Query for special added services (exception_type = 1) on specific dates
+	specialServiceQuery := sq.Select("service_id").
+		From("calendar_dates").
+		Where(sq.Eq{"date": date, "exception_type": 1})
+
+	// Query to exclude removed services (exception_type = 2) on specific dates
+	excludedServiceQuery := sq.Select("service_id").
+		From("calendar_dates").
+		Where(sq.Eq{"date": date, "exception_type": 2})
+
+	// Compile union query for regular and special services
+	regularServiceSQL, regularServiceArgs, err := serviceQuery.ToSql()
+	if err != nil {
+		return nil, err
+	}
+	specialServiceSQL, specialServiceArgs, err := specialServiceQuery.ToSql()
+	if err != nil {
+		return nil, err
+	}
+	excludedServiceSQL, excludedServiceArgs, err := excludedServiceQuery.ToSql()
+	if err != nil {
+		return nil, err
+	}
+
+	unionSQL := fmt.Sprintf("(%s UNION %s)", regularServiceSQL, specialServiceSQL)
+	serviceArgs := append(regularServiceArgs, specialServiceArgs...)
 
 	// Calculate the time range to filter by `startHour` and `hourRange`
 	startTime := time.Date(0, 1, 1, startHour, 0, 0, 0, time.UTC)
@@ -141,7 +112,8 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		Join("stops s ON st.stop_id = s.stop_id").
 		Join("routes r ON t.route_id = r.route_id").
 		Where(sq.Eq{"st.stop_id": stopIDsToQuery}).
-		Where(sq.Eq{"t.service_id": serviceID}).
+		Where(fmt.Sprintf("t.service_id IN %s", unionSQL), serviceArgs...).
+		Where(fmt.Sprintf("t.service_id NOT IN (%s)", excludedServiceSQL), excludedServiceArgs...).
 		Where(sq.GtOrEq{"st.arrival_time": startTimeStr}).
 		Where(sq.LtOrEq{"st.arrival_time": endTimeStr}).
 		OrderBy("st.arrival_time")
@@ -223,6 +195,130 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 	}
 
 	return services, nil
+}*/
+
+func (v Database) GetServicesAtStop(stopID string, dateStr string) ([]StopTimes, error) {
+	db := v.db
+
+	date, err := time.Parse("20060102", dateStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid date format: %v", err)
+	}
+	dateFormatted := date.Format("2006-01-02")
+
+	// Use squirrel to build the query
+	query := sq.Select(
+		"DISTINCT stop_times.trip_id",
+		"stop_times.arrival_time",
+		"stop_times.departure_time",
+		"stop_times.stop_id",
+		"stop_times.stop_sequence",
+		"stop_times.stop_headsign",
+		"trips.service_id",
+		"trips.route_id",
+		"routes.route_color",
+		"stops.stop_id",
+		"stops.stop_name",
+		"stops.stop_lat",
+		"stops.stop_lon",
+		"stops.stop_code",
+		"stops.location_type",
+		"stops.parent_station",
+		"stops.platform_code",
+	).
+		From("stop_times").
+		Join("stops ON stop_times.stop_id = stops.stop_id").
+		Join("trips ON stop_times.trip_id = trips.trip_id").
+		Join("routes ON trips.route_id = routes.route_id").
+		LeftJoin("calendar ON trips.service_id = calendar.service_id").
+		LeftJoin("calendar_dates ON trips.service_id = calendar_dates.service_id").
+		Where(sq.Eq{"stop_times.stop_id": stopID}).
+		Where(
+			sq.Or{
+				sq.And{
+					sq.Eq{"calendar_dates.date": dateStr},
+					sq.Eq{"calendar_dates.exception_type": 1},
+				},
+				sq.And{
+					sq.Expr("calendar_dates.date IS NULL"),
+					sq.Expr("calendar.start_date <= ?", dateStr),
+					sq.Expr("calendar.end_date >= ?", dateStr),
+					sq.Or{
+						sq.Expr("strftime('%w', ?) = '1' AND calendar.monday = 1", dateFormatted),
+						sq.Expr("strftime('%w', ?) = '2' AND calendar.tuesday = 1", dateFormatted),
+						sq.Expr("strftime('%w', ?) = '3' AND calendar.wednesday = 1", dateFormatted),
+						sq.Expr("strftime('%w', ?) = '4' AND calendar.thursday = 1", dateFormatted),
+						sq.Expr("strftime('%w', ?) = '5' AND calendar.friday = 1", dateFormatted),
+						sq.Expr("strftime('%w', ?) = '6' AND calendar.saturday = 1", dateFormatted),
+						sq.Expr("strftime('%w', ?) = '0' AND calendar.sunday = 1", dateFormatted),
+					},
+				},
+			},
+		).
+		GroupBy("stop_times.trip_id, stop_times.arrival_time").
+		OrderBy("stop_times.arrival_time")
+
+	// Prepare the SQL query
+	sqlQuery, args, err := query.ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("error building SQL query: %v", err)
+	}
+
+	// Execute the query
+	rows, err := db.Query(sqlQuery, args...)
+	if err != nil {
+		return nil, fmt.Errorf("error executing query: %v", err)
+	}
+	defer rows.Close()
+
+	reStationPlatform := regexp.MustCompile(`Train Station (\d)$`)
+	reCapitalLetter := regexp.MustCompile(`[A-Z]$`)
+
+	// Process the results into StopTimes structs
+	var stopTimes []StopTimes
+	for rows.Next() {
+		var stopTime StopTimes
+		var trip Trip
+		var stop Stop
+
+		if err := rows.Scan(
+			&stopTime.TripID,
+			&stopTime.ArrivalTime,
+			&stopTime.DepartureTime,
+			&stopTime.StopId,
+			&stopTime.StopSequence,
+			&stopTime.StopHeadsign,
+			&trip.ServiceID,
+			&trip.RouteID,
+			&stopTime.RouteColor,
+			&stop.StopId,
+			&stop.StopName,
+			&stop.StopLat,
+			&stop.StopLon,
+			&stop.StopCode,
+			&stop.LocationType,
+			&stop.ParentStation,
+		); err != nil {
+			return nil, fmt.Errorf("error scanning row: %v", err)
+		}
+
+		// Assign additional data to stopTime
+		if stopTime.Platform == "" {
+			stopTime.Platform = determinePlatform(stop.StopName, reStationPlatform, reCapitalLetter)
+		}
+		stopTime.TripData = trip
+
+		stop.StopType = typeOfStop(stop.StopName)
+		stopTime.StopData = stop
+
+		stopTimes = append(stopTimes, stopTime)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error with rows: %v", err)
+	}
+
+	return stopTimes, nil
 }
 
 func (v Database) GetCachedServicesAtStop(stopID string, startHour int, hourRange int, date string) ([]StopTimes, error) {
@@ -317,7 +413,7 @@ func (v Database) precomputeServices() (bool, error) {
 	// Loop over stops and dates, and store the services
 	for index, stop := range stopsData {
 		for _, date := range dates {
-			servicesData, err := v.GetServicesAtStop(stop.StopId, 0, 22, date)
+			servicesData, err := v.GetServicesAtStop(stop.StopId, date)
 			if err == nil {
 				stringData, err := json.Marshal(servicesData)
 				if err == nil {
