@@ -27,10 +27,7 @@ type StopTimes struct {
 	RouteColor    string `json:"route_color"`
 }
 
-func (v Database) dteQuery() {
-	currentWeek := 44
-	date := "20241031"
-	weekDay := "thursday" // This variable can be used for comparison in the order clause.
+func (v Database) dteQuery(currentWeek int, date string, weekDay string) string {
 
 	// Create a squirrel statement builder
 	builder := squirrel.Select("DISTINCT c.service_id").
@@ -53,7 +50,7 @@ func (v Database) dteQuery() {
 	if err != nil {
 		// Handle the error
 		log.Println("Error building query:", err)
-		return
+		return ""
 	}
 
 	// Print the generated SQL query and arguments
@@ -69,11 +66,12 @@ func (v Database) dteQuery() {
 		} else {
 			log.Println("Error executing query:", err)
 		}
-		return
+		return ""
 	}
 
 	// Print the result
 	fmt.Printf("Found service_id: %s\n", serviceID)
+	return serviceID
 }
 
 func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int, date string) ([]StopTimes, error) {
@@ -117,40 +115,11 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 	}
 
 	// Define weekday-based and exception service queries
-	serviceQuery := sq.Select("service_id").
-		From("calendar").
-		Where(sq.LtOrEq{"start_date": date}).
-		Where(sq.GtOrEq{"end_date": date}).
-		Where(sq.Eq{dayOfWeek: 1}) // Active on this weekday
-
-	v.dteQuery()
+	_, week := time.Now().ISOWeek()
+	serviceID := v.dteQuery(week, date, dayOfWeek)
+	fmt.Println(serviceID)
 
 	// Query for special added services (exception_type = 1) on specific dates
-	specialServiceQuery := sq.Select("service_id").
-		From("calendar_dates").
-		Where(sq.Eq{"date": date, "exception_type": 1})
-
-	// Query to exclude removed services (exception_type = 2) on specific dates
-	excludedServiceQuery := sq.Select("service_id").
-		From("calendar_dates").
-		Where(sq.Eq{"date": date, "exception_type": 2})
-
-	// Compile union query for regular and special services
-	regularServiceSQL, regularServiceArgs, err := serviceQuery.ToSql()
-	if err != nil {
-		return nil, err
-	}
-	specialServiceSQL, specialServiceArgs, err := specialServiceQuery.ToSql()
-	if err != nil {
-		return nil, err
-	}
-	excludedServiceSQL, excludedServiceArgs, err := excludedServiceQuery.ToSql()
-	if err != nil {
-		return nil, err
-	}
-
-	unionSQL := fmt.Sprintf("(%s UNION %s)", regularServiceSQL, specialServiceSQL)
-	serviceArgs := append(regularServiceArgs, specialServiceArgs...)
 
 	// Calculate the time range to filter by `startHour` and `hourRange`
 	startTime := time.Date(0, 1, 1, startHour, 0, 0, 0, time.UTC)
@@ -172,8 +141,7 @@ func (v Database) GetServicesAtStop(stopID string, startHour int, hourRange int,
 		Join("stops s ON st.stop_id = s.stop_id").
 		Join("routes r ON t.route_id = r.route_id").
 		Where(sq.Eq{"st.stop_id": stopIDsToQuery}).
-		Where(fmt.Sprintf("t.service_id IN %s", unionSQL), serviceArgs...).
-		Where(fmt.Sprintf("t.service_id NOT IN (%s)", excludedServiceSQL), excludedServiceArgs...).
+		Where(sq.Eq{"t.service_id": serviceID}).
 		Where(sq.GtOrEq{"st.arrival_time": startTimeStr}).
 		Where(sq.LtOrEq{"st.arrival_time": endTimeStr}).
 		OrderBy("st.arrival_time")
