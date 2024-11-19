@@ -91,7 +91,7 @@ func (v Database) GetServicesAtStop(stopID, dayOfWeek, date string) ([]StopTimes
 		st.stop_headsign, 
 		tfs.service_id, 
 		tfs.route_id, 
-		st.route_color,
+		r.route_color,
 		s.stop_id, 
 		s.stop_name, 
 		s.stop_lat, 
@@ -99,10 +99,11 @@ func (v Database) GetServicesAtStop(stopID, dayOfWeek, date string) ([]StopTimes
 		s.stop_code, 
 		s.location_type, 
 		s.parent_station, 
-		s.platform_number
+		s.platform_code
 	FROM stop_times AS st
 	JOIN trips_for_services AS tfs ON st.trip_id = tfs.trip_id
 	JOIN stops AS s ON st.stop_id = s.stop_id
+	JOIN routes AS r ON tfs.route_id = r.route_id
 	WHERE s.stop_id = ?
 	ORDER BY st.arrival_time
 `, activeServicesSQL, addedExceptionsSQL, inactiveExceptionsSQL)
@@ -123,7 +124,6 @@ func (v Database) GetServicesAtStop(stopID, dayOfWeek, date string) ([]StopTimes
 	reCapitalLetter := regexp.MustCompile(`[A-Z]$`)
 
 	// Collect the results
-	// Collect the results
 	var results []StopTimes
 	for rows.Next() {
 		var row StopTimes
@@ -138,7 +138,7 @@ func (v Database) GetServicesAtStop(stopID, dayOfWeek, date string) ([]StopTimes
 			&row.StopHeadsign,
 			&trip.ServiceID,
 			&trip.RouteID,
-			&row.RouteColor,
+			&row.RouteColor, // Scan route_color from routes table
 			&stop.StopId,
 			&stop.StopName,
 			&stop.StopLat,
