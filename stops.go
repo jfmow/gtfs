@@ -265,6 +265,29 @@ func (v Database) GetStopByStopID(stopID string) (Stops, error) {
 	return stops, nil
 }
 
+func (v Database) GetChildStopsByParentStopID(stopID string) (Stops, error) {
+	// Base query to select stops
+	stops, err := v.GetStops()
+	if err != nil {
+		return nil, errors.New("no stops found")
+	}
+
+	var result Stops
+
+	for _, a := range stops {
+		if a.ParentStation == stopID || a.StopId == stopID {
+			result = append(result, a)
+		}
+	}
+
+	// If no stops were found, return a custom error
+	if len(result) == 0 {
+		return nil, errors.New("no child stops found")
+	}
+
+	return result, nil
+}
+
 // SearchForStopsByName searches for stops based on a partial name match
 func (v Database) SearchForStopsByName(searchText string) ([]StopSearch, error) {
 	// Normalize the input search text and make it lowercase

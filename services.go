@@ -29,6 +29,7 @@ Day of week: monday
 */
 func (v Database) GetServicesAtStop(stopID, dayOfWeek, date string) ([]StopTimes, error) {
 	db := v.db
+
 	// Initialize squirrel builder
 	sb := sq.StatementBuilder.PlaceholderFormat(sq.Question)
 
