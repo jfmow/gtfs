@@ -126,7 +126,6 @@ func New(url string, databaseName string) (Database, error) {
 		}
 
 		fmt.Println("Data updated successfully.")
-		database.precomputeServices()
 
 	} else {
 		fmt.Println("Feed data is still up to date.")
