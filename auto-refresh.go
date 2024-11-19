@@ -34,7 +34,6 @@ func (v Database) EnableAutoUpdateGTFSData() {
 				fmt.Printf("Failed to write new data to the database: %v", err)
 			}
 			fmt.Println("Feed data updated automatically")
-			v.precomputeServices()
 		}
 
 	})
