@@ -24,7 +24,7 @@ type StopTimes struct {
 	RouteColor    string `json:"route_color"`
 }
 
-func (v Database) GetActiveTrips(date, currentWeekDay string, stopID string) ([]StopTimes, error) {
+func (v Database) GetActiveTrips(date, currentWeekDay, stopID, departureTimeFilter string, limit int) ([]StopTimes, error) {
 	// Open the SQLite database
 	db := v.db // Assuming db is already connected, if not, you can open it here
 
@@ -94,15 +94,33 @@ func (v Database) GetActiveTrips(date, currentWeekDay string, stopID string) ([]
 	JOIN routes r ON t.route_id = r.route_id
 	`, dayColumn)
 
-	// If a stop_id is provided, add a filter for stop_id
-	if stopID != "" {
-		query += " WHERE st.stop_id = ?"
+	// Add the departure time filter if specified
+	if departureTimeFilter != "" {
+		query += " WHERE st.departure_time > ?"
 	}
 
-	// Execute the query with the variable date and optionally the stop_id
+	// If a stop_id is provided, add a filter for stop_id
+	if stopID != "" {
+		if departureTimeFilter != "" {
+			query += " AND st.stop_id = ?"
+		} else {
+			query += " WHERE st.stop_id = ?"
+		}
+	}
+
+	// Add limit to the query if specified
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+
+	// Execute the query with the variable date, departure time filter, and optionally the stop_id
 	var rows *sql.Rows
 	var err error
-	if stopID != "" {
+	if departureTimeFilter != "" && stopID != "" {
+		rows, err = db.Query(query, date, date, date, date, departureTimeFilter, stopID)
+	} else if departureTimeFilter != "" {
+		rows, err = db.Query(query, date, date, date, date, departureTimeFilter)
+	} else if stopID != "" {
 		rows, err = db.Query(query, date, date, date, date, stopID)
 	} else {
 		rows, err = db.Query(query, date, date, date, date)
