@@ -387,6 +387,7 @@ func (v Database) refreshDatabaseData() {
 	}
 
 	v.createDefaultGTFSTables()
+	v.createIndexes()
 
 	// Fetch and write new data
 	data, err := fetchZip(v.url)
@@ -399,4 +400,68 @@ func (v Database) refreshDatabaseData() {
 	}
 
 	fmt.Println("Data updated successfully.")
+}
+
+func (v Database) createIndexes() {
+	query := `
+		-- Indexes for agency table
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_agency_agency_id ON agency (agency_id);
+
+		-- Indexes for stops table
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_stops_stop_id ON stops (stop_id);
+		CREATE INDEX IF NOT EXISTS idx_stops_zone_id ON stops (zone_id);
+		CREATE INDEX IF NOT EXISTS idx_stops_parent_station ON stops (parent_station);
+
+		-- Indexes for routes table
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_routes_route_id ON routes (route_id);
+		CREATE INDEX IF NOT EXISTS idx_routes_agency_id ON routes (agency_id);
+		CREATE INDEX IF NOT EXISTS idx_routes_route_color ON routes (route_color);
+
+		-- Indexes for trips table
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_trips_trip_id ON trips (trip_id);
+		CREATE INDEX IF NOT EXISTS idx_trips_service_id ON trips (service_id);
+		CREATE INDEX IF NOT EXISTS idx_trips_route_id ON trips (route_id);
+
+		-- Indexes for stop_times table
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_stop_times_trip_id_sequence ON stop_times (trip_id, stop_sequence);
+		CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id ON stop_times (stop_id);
+
+		-- Indexes for calendar table
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_service_id ON calendar (service_id);
+		CREATE INDEX IF NOT EXISTS idx_calendar_start_end_date ON calendar (start_date, end_date);
+
+		-- Indexes for calendar_dates table
+		CREATE INDEX IF NOT EXISTS idx_calendar_dates_date_exception_type ON calendar_dates (date, exception_type);
+		CREATE INDEX IF NOT EXISTS idx_calendar_dates_service_id ON calendar_dates (service_id);
+
+		-- Indexes for fare_attributes table
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_fare_attributes_fare_id ON fare_attributes (fare_id);
+		CREATE INDEX IF NOT EXISTS idx_fare_attributes_agency_id ON fare_attributes (agency_id);
+
+		-- Indexes for fare_rules table
+		CREATE INDEX IF NOT EXISTS idx_fare_rules_fare_id ON fare_rules (fare_id);
+		CREATE INDEX IF NOT EXISTS idx_fare_rules_route_id ON fare_rules (route_id);
+
+		-- Indexes for shapes table
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_shapes_shape_id_sequence ON shapes (shape_id, shape_pt_sequence);
+
+		-- Indexes for frequencies table
+		CREATE INDEX IF NOT EXISTS idx_frequencies_trip_id ON frequencies (trip_id);
+
+		-- Indexes for transfers table
+		CREATE INDEX IF NOT EXISTS idx_transfers_from_to_stop_id ON transfers (from_stop_id, to_stop_id);
+
+		-- Indexes for pathways table
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_pathways_pathway_id ON pathways (pathway_id);
+		CREATE INDEX IF NOT EXISTS idx_pathways_from_stop_id ON pathways (from_stop_id);
+		CREATE INDEX IF NOT EXISTS idx_pathways_to_stop_id ON pathways (to_stop_id);
+
+		-- Indexes for levels table
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_levels_level_id ON levels (level_id);
+	`
+
+	_, err := v.db.Exec(query)
+	if err != nil {
+		log.Panicf("%s", err.Error())
+	}
 }
