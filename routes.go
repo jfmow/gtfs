@@ -48,12 +48,26 @@ func (v Database) GetRoutes() ([]Route, error) {
 			return nil, err
 		}
 		switch route.RouteType {
-		case 3:
-			route.VehicleType = "bus"
+		case 0:
+			route.VehicleType = "Tram/Light Rail"
+		case 1:
+			route.VehicleType = "Subway/Metro"
 		case 2:
-			route.VehicleType = "train"
+			route.VehicleType = "Train"
+		case 3:
+			route.VehicleType = "Bus"
 		case 4:
-			route.VehicleType = "ferry"
+			route.VehicleType = "Ferry"
+		case 5:
+			route.VehicleType = "Cable Tram"
+		case 6:
+			route.VehicleType = "Gondola"
+		case 7:
+			route.VehicleType = "Train (up hill)"
+		case 11:
+			route.VehicleType = "Trolleybus"
+		case 12:
+			route.VehicleType = "Monorail"
 		}
 		// Append each trip to the slice
 		routes = append(routes, route)
@@ -95,12 +109,26 @@ func (v Database) GetRouteByID(routeID string) (Route, error) {
 		return Route{}, err
 	}
 	switch route.RouteType {
-	case 3:
-		route.VehicleType = "bus"
+	case 0:
+		route.VehicleType = "Tram/Light Rail"
+	case 1:
+		route.VehicleType = "Subway/Metro"
 	case 2:
-		route.VehicleType = "train"
+		route.VehicleType = "Train"
+	case 3:
+		route.VehicleType = "Bus"
 	case 4:
-		route.VehicleType = "ferry"
+		route.VehicleType = "Ferry"
+	case 5:
+		route.VehicleType = "Cable Tram"
+	case 6:
+		route.VehicleType = "Gondola"
+	case 7:
+		route.VehicleType = "Train (up hill)"
+	case 11:
+		route.VehicleType = "Trolleybus"
+	case 12:
+		route.VehicleType = "Monorail"
 	}
 
 	return route, nil
