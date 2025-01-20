@@ -74,7 +74,7 @@ func (v vehicles) GetVehicles() (VehiclesMap, error) {
 	}
 
 	cachedVehiclesData[v.name] = vehicles
-	lastUpdatedTripUpdatesCache = time.Now()
+	lastUpdatedVehiclesCache = time.Now()
 
 	return vehicles, nil
 }
