@@ -30,7 +30,7 @@ type StopSearch struct {
 
 type Stops []Stop
 
-func (v Database) GetStops() (Stops, error) {
+func (v Database) GetStops(includeChildStops bool) (Stops, error) {
 	db := v.db
 	baseQuery := sq.Select("stop_id", "stop_code", "stop_name", "stop_lat", "stop_lon", "location_type", "parent_station", "platform_code", "wheelchair_boarding").From("stops")
 
@@ -62,6 +62,9 @@ func (v Database) GetStops() (Stops, error) {
 		)
 		if err != nil {
 			return nil, err
+		}
+		if stop.LocationType == 0 && stop.ParentStation != "" && !includeChildStops {
+			continue
 		}
 		stop.StopType = typeOfStop(stop.StopName)
 		// Append each trip to the slice
@@ -267,7 +270,7 @@ func (v Database) GetStopByStopID(stopID string) (Stops, error) {
 
 func (v Database) GetChildStopsByParentStopID(stopID string) (Stops, error) {
 	// Base query to select stops
-	stops, err := v.GetStops()
+	stops, err := v.GetStops(true)
 	if err != nil {
 		return nil, errors.New("no stops found")
 	}
@@ -289,12 +292,12 @@ func (v Database) GetChildStopsByParentStopID(stopID string) (Stops, error) {
 }
 
 // SearchForStopsByName searches for stops based on a partial name match
-func (v Database) SearchForStopsByName(searchText string) ([]StopSearch, error) {
+func (v Database) SearchForStopsByName(searchText string, includeChildStops bool) ([]StopSearch, error) {
 	// Normalize the input search text and make it lowercase
 	normalizedSearchText := strings.ToLower(searchText)
 
 	// Create a SQL query to find matching stops
-	query := sq.Select("stop_id, stop_code, stop_name")
+	query := sq.Select("stop_id, stop_code, stop_name", "parent_station", "location_type")
 	query = query.From("stops")
 	query = query.Where(sq.Like{"LOWER(stop_name)": "%" + normalizedSearchText + "%"})
 
@@ -310,9 +313,12 @@ func (v Database) SearchForStopsByName(searchText string) ([]StopSearch, error) 
 	// Iterate over the rows
 	for rows.Next() {
 		var stop Stop
-		err := rows.Scan(&stop.StopId, &stop.StopCode, &stop.StopName)
+		err := rows.Scan(&stop.StopId, &stop.StopCode, &stop.StopName, &stop.ParentStation, &stop.LocationType)
 		if err != nil {
 			return nil, err
+		}
+		if stop.LocationType == 0 && stop.ParentStation != "" && !includeChildStops {
+			continue
 		}
 		stop.StopType = typeOfStop(stop.StopName) // Set the stop type
 		stopSearchResults = append(stopSearchResults, StopSearch{Name: stop.StopName + " " + stop.StopCode, TypeOfStop: stop.StopType})
