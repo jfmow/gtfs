@@ -250,15 +250,33 @@ func (v Database) createDefaultGTFSTables() {
 }
 
 func (v Database) deleteOldData() error {
-	// Delete data from relevant tables (customize as needed)
-	tables := []string{"stop_times", "trips", "stops", "calendar_dates", "feed_info"}
-	for _, table := range tables {
-		query := fmt.Sprintf("DELETE FROM %s", table)
+	// Query to get all table names from the sqlite_master table
+	rows, err := v.db.Query("SELECT name FROM sqlite_master WHERE type='table'")
+	if err != nil {
+		return fmt.Errorf("failed to fetch tables: %w", err)
+	}
+	defer rows.Close()
+
+	// Iterate over the tables and delete data from each
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			return fmt.Errorf("failed to scan table name: %w", err)
+		}
+
+		// Skip system tables that don't need data deletion
+		if tableName == "sqlite_sequence" || tableName == "sqlite_master" {
+			continue
+		}
+
+		// Delete data from the table
+		query := fmt.Sprintf("DELETE FROM %s", tableName)
 		_, err := v.db.Exec(query)
 		if err != nil {
-			return fmt.Errorf("failed to delete data from table %s: %w", table, err)
+			return fmt.Errorf("failed to delete data from table %s: %w", tableName, err)
 		}
 	}
+
 	fmt.Println("Old data deleted successfully")
 	return nil
 }

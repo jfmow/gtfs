@@ -7,7 +7,13 @@ import (
 func (v Database) EnableAutoUpdateGTFSData() {
 	c := cron.New()
 
-	c.AddFunc("@every 01h00m00s", func() {
+	// Run at 11 PM every day
+	c.AddFunc("0 23 * * *", func() {
+		v.refreshDatabaseData()
+	})
+
+	// Run at 3 AM every day
+	c.AddFunc("0 3 * * *", func() {
 		v.refreshDatabaseData()
 	})
 
