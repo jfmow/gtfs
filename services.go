@@ -203,7 +203,7 @@ func (v Database) GetActiveTrips(date, currentWeekDay string, stopID string) ([]
 			StopId:        result.StopId,
 			StopSequence:  result.StopSequence,
 			StopHeadsign:  result.StopHeadsign,
-			Platform:      "",
+			Platform:      result.Platform,
 			StopData:      stopData,
 			TripData:      tripData,
 		}
