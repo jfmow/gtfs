@@ -68,6 +68,7 @@ func New(url string, databaseName string) (Database, error) {
 	isUpToDate, err := database.IsFeedDataUpToDate()
 
 	if !isUpToDate || err != nil {
+		fmt.Println("Feed data is not up to date.")
 		database.refreshDatabaseData()
 	} else {
 		fmt.Println("Feed data is still up to date.")
