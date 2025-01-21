@@ -47,28 +47,8 @@ func (v Database) GetRoutes() ([]Route, error) {
 		if err != nil {
 			return nil, err
 		}
-		switch route.RouteType {
-		case 0:
-			route.VehicleType = "Tram/Light Rail"
-		case 1:
-			route.VehicleType = "Subway/Metro"
-		case 2:
-			route.VehicleType = "Train"
-		case 3:
-			route.VehicleType = "Bus"
-		case 4:
-			route.VehicleType = "Ferry"
-		case 5:
-			route.VehicleType = "Cable Tram"
-		case 6:
-			route.VehicleType = "Gondola"
-		case 7:
-			route.VehicleType = "Train (up hill)"
-		case 11:
-			route.VehicleType = "Trolleybus"
-		case 12:
-			route.VehicleType = "Monorail"
-		}
+
+		route.VehicleType = getRouteVehicleType(route)
 		// Append each trip to the slice
 		routes = append(routes, route)
 	}
@@ -108,44 +88,90 @@ func (v Database) GetRouteByID(routeID string) (Route, error) {
 	if err != nil {
 		return Route{}, err
 	}
-	switch route.RouteType {
-	case 0:
-		route.VehicleType = "Tram/Light Rail"
-	case 1:
-		route.VehicleType = "Subway/Metro"
-	case 2:
-		route.VehicleType = "Train"
-	case 3:
-		route.VehicleType = "Bus"
-	case 4:
-		route.VehicleType = "Ferry"
-	case 5:
-		route.VehicleType = "Cable Tram"
-	case 6:
-		route.VehicleType = "Gondola"
-	case 7:
-		route.VehicleType = "Train (up hill)"
-	case 11:
-		route.VehicleType = "Trolleybus"
-	case 12:
-		route.VehicleType = "Monorail"
-	}
+
+	route.VehicleType = getRouteVehicleType(route)
 
 	return route, nil
 }
 
-type RouteSearch struct {
-	RouteID        string `json:"route_id"`
-	RouteLongName  string `json:"route_long_name"`
-	RouteShortName string `json:"route_short_name"`
+func (v Database) GetRoutesByStopId(stopId string) ([]Route, error) {
+	query := `
+		SELECT DISTINCT r.route_id, r.route_short_name, r.route_long_name, r.route_type, r.route_color
+		FROM stop_times st
+		JOIN trips t ON st.trip_id = t.trip_id
+		JOIN routes r ON t.route_id = r.route_id
+		WHERE st.stop_id = ?;
+	`
+	db := v.db
+
+	rows, err := db.Query(query, stopId)
+	if err != nil {
+		return nil, errors.New("no routes found for stop")
+	}
+
+	var routes []Route
+	defer rows.Close()
+
+	for rows.Next() {
+		var route Route
+		// Scan the row data into the trip struct
+		err := rows.Scan(
+			&route.RouteId,
+			&route.RouteShortName,
+			&route.RouteLongName,
+			&route.RouteType,
+			&route.RouteColor,
+		)
+		if err != nil {
+			return nil, err
+		}
+		route.VehicleType = getRouteVehicleType(route)
+		// Append each trip to the slice
+		routes = append(routes, route)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(routes) == 0 {
+		return nil, errors.New("no routes found")
+	}
+	return routes, nil
 }
 
-func (v Database) SearchForRouteByID(searchText string) ([]RouteSearch, error) {
+func getRouteVehicleType(route Route) string {
+	switch route.RouteType {
+	case 0:
+		return "Tram/Light Rail"
+	case 1:
+		return "Subway/Metro"
+	case 2:
+		return "Train"
+	case 3:
+		return "Bus"
+	case 4:
+		return "Ferry"
+	case 5:
+		return "Cable Tram"
+	case 6:
+		return "Gondola"
+	case 7:
+		return "Train (up hill)"
+	case 11:
+		return "Trolleybus"
+	case 12:
+		return "Monorail"
+	}
+	return "unknown"
+}
+
+func (v Database) SearchForRouteByID(searchText string) ([]Route, error) {
 	// Normalize the input search text and make it lowercase
 	normalizedSearchText := strings.ToLower(searchText)
 
 	// Create a SQL query to find matching stops
-	query := sq.Select("route_id", "route_short_name", "route_long_name")
+	query := sq.Select("route_id", "agency_id", "route_short_name", "route_long_name", "route_type", "route_color")
 	query = query.From("routes")
 	query = query.Where(sq.Like{"LOWER(route_id)": "%" + normalizedSearchText + "%"})
 
@@ -156,16 +182,45 @@ func (v Database) SearchForRouteByID(searchText string) ([]RouteSearch, error) {
 	}
 	defer rows.Close()
 
-	var routeSearchResults []RouteSearch
+	var routeSearchResults []Route
 
 	// Iterate over the rows
 	for rows.Next() {
 		var route Route
-		err := rows.Scan(&route.RouteId, &route.RouteShortName, &route.RouteLongName)
+		err := rows.Scan(
+			&route.RouteId,
+			&route.AgencyId,
+			&route.RouteShortName,
+			&route.RouteLongName,
+			&route.RouteType,
+			&route.RouteColor,
+		)
 		if err != nil {
 			return nil, err
 		}
-		routeSearchResults = append(routeSearchResults, RouteSearch{RouteID: route.RouteId, RouteLongName: route.RouteLongName, RouteShortName: route.RouteShortName})
+		switch route.RouteType {
+		case 0:
+			route.VehicleType = "Tram/Light Rail"
+		case 1:
+			route.VehicleType = "Subway/Metro"
+		case 2:
+			route.VehicleType = "Train"
+		case 3:
+			route.VehicleType = "Bus"
+		case 4:
+			route.VehicleType = "Ferry"
+		case 5:
+			route.VehicleType = "Cable Tram"
+		case 6:
+			route.VehicleType = "Gondola"
+		case 7:
+			route.VehicleType = "Train (up hill)"
+		case 11:
+			route.VehicleType = "Trolleybus"
+		case 12:
+			route.VehicleType = "Monorail"
+		}
+		routeSearchResults = append(routeSearchResults, route)
 	}
 
 	// Check for any error encountered during iteration

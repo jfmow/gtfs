@@ -71,6 +71,7 @@ func New(url string, databaseName string) (Database, error) {
 		database.refreshDatabaseData()
 	} else {
 		fmt.Println("Feed data is still up to date.")
+		database.createIndexes()
 	}
 
 	database.EnableAutoUpdateGTFSData()

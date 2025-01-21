@@ -443,6 +443,11 @@ func (v Database) createIndexes() {
 		-- Indexes for stop_times table
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_stop_times_trip_id_sequence ON stop_times (trip_id, stop_sequence);
 		CREATE INDEX IF NOT EXISTS idx_stop_times_stop_id ON stop_times (stop_id);
+		CREATE INDEX IF NOT EXISTS idx_stop_times_trip_id ON stop_times (trip_id);
+
+		-- Additional indexes for query optimization
+		CREATE INDEX IF NOT EXISTS idx_routes_trip ON trips (route_id, trip_id); -- Optimizes joining routes and trips
+		CREATE INDEX IF NOT EXISTS idx_stop_times_route_stop ON stop_times (stop_id, trip_id); -- Optimizes joining stop_times and trips
 
 		-- Indexes for calendar table
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_service_id ON calendar (service_id);

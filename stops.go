@@ -291,6 +291,63 @@ func (v Database) GetChildStopsByParentStopID(stopID string) (Stops, error) {
 	return result, nil
 }
 
+func (v Database) GetStopsByRouteId(routeId string) (Stops, error) {
+	query := `
+	SELECT DISTINCT s.stop_id, s.stop_code, s.stop_name, s.stop_lat, s.stop_lon, s.location_type, s.parent_station, s.platform_code, s.wheelchair_boarding, st.stop_sequence
+	FROM routes r
+	JOIN trips t ON r.route_id = t.route_id
+	JOIN stop_times st ON t.trip_id = st.trip_id
+	JOIN stops s ON st.stop_id = s.stop_id
+	WHERE r.route_id = ?
+	ORDER BY s.stop_id;
+	`
+	rows, err := v.db.Query(query, routeId)
+	if err != nil {
+		return nil, errors.New("no stops found for route")
+	}
+
+	defer rows.Close()
+
+	// Slice to hold the stops
+	var stops Stops
+
+	// Iterate over the rows
+	for rows.Next() {
+		var stop Stop
+		// Scan the row data into the Stop struct
+		err := rows.Scan(
+			&stop.StopId,
+			&stop.StopCode,
+			&stop.StopName,
+			&stop.StopLat,
+			&stop.StopLon,
+			&stop.LocationType,
+			&stop.ParentStation,
+			&stop.PlatformNumber,
+			&stop.WheelChairBoarding,
+			&stop.Sequence,
+		)
+		if err != nil {
+			return nil, err
+		}
+		stop.StopType = typeOfStop(stop.StopName)
+		// Append each stop to the slice
+		stops = append(stops, stop)
+	}
+
+	// Check for any error encountered during iteration
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// If no stops were found, return a custom error
+	if len(stops) == 0 {
+		return nil, errors.New("no stops found for the given trip ID")
+	}
+
+	return stops, nil
+}
+
 // SearchForStopsByName searches for stops based on a partial name match
 func (v Database) SearchForStopsByName(searchText string, includeChildStops bool) ([]StopSearch, error) {
 	// Normalize the input search text and make it lowercase
