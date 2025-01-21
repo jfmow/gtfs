@@ -108,6 +108,8 @@ func (v Database) GetActiveTrips(date, currentWeekDay, stopID, departureTimeFilt
 		}
 	}
 
+	query += " ORDER BY st.departure_time ASC"
+
 	// Add limit to the query if specified
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
