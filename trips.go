@@ -2,6 +2,7 @@ package gtfs
 
 import (
 	"errors"
+	"fmt"
 
 	sq "github.com/Masterminds/squirrel"
 )
@@ -43,4 +44,52 @@ func (v Database) GetTripByID(tripID string) (Trip, error) {
 	}
 
 	return trip, nil
+}
+
+// Get the stopId's of the stops a trip stops at
+func (v Database) GetServicesStopsByTripId(tripId string) ([]string, error) {
+	query := `
+		SELECT stop_id FROM stop_times WHERE trip_id = ?
+	`
+
+	rows, err := v.db.Query(query, tripId)
+	if err != nil {
+		fmt.Println(err)
+		return nil, errors.New("problem querying db")
+	}
+
+	defer rows.Close()
+
+	var stops []string
+
+	for rows.Next() {
+		var stopId string
+
+		err := rows.Scan(
+			&stopId,
+		)
+		if err != nil {
+			fmt.Println(err)
+			return nil, errors.New("unable to scan row")
+		}
+
+		var allStops Stops
+
+		parentStops, err := v.GetParentStopsByChildStopID(stopId)
+		if err != nil {
+			return nil, errors.New("invalid stop id")
+		}
+		allStops = append(allStops, parentStops...)
+
+		for _, stop := range allStops {
+			stops = append(stops, stop.StopId)
+		}
+
+	}
+
+	if len(stops) == 0 {
+		return nil, errors.New("no stops found")
+	}
+
+	return stops, nil
 }

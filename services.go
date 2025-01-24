@@ -130,7 +130,7 @@ func (v Database) GetActiveTrips(date, currentWeekDay, stopID, departureTimeFilt
 
 	if err != nil {
 		fmt.Println(err)
-		return nil, errors.New("An error occurred querying for the data")
+		return nil, errors.New("an error occurred querying for the data")
 	}
 	defer rows.Close()
 
@@ -253,6 +253,8 @@ func determinePlatform(stopName string, reStationPlatform, reCapitalLetter *rege
 	}
 	return "no platform"
 }
+
+//TODO: use pre processing
 
 // Check if the current week has been processed
 func (v Database) hasProcessedCurrentWeek(today time.Time) (bool, error) {

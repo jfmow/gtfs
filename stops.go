@@ -291,6 +291,36 @@ func (v Database) GetChildStopsByParentStopID(stopID string) (Stops, error) {
 	return result, nil
 }
 
+func (v Database) GetParentStopsByChildStopID(childStopId string) (Stops, error) {
+	// Base query to select stops
+	stops, err := v.GetStops(false)
+	if err != nil {
+		return nil, errors.New("no stops found")
+	}
+
+	stops2, err := v.GetStopByStopID(childStopId)
+	if err != nil {
+		return nil, errors.New("invalid stopId")
+	}
+
+	stopID := stops2[0].ParentStation
+
+	var result Stops
+
+	for _, a := range stops {
+		if a.StopId == stopID {
+			result = append(result, a)
+		}
+	}
+
+	// If no stops were found, return a custom error
+	if len(result) == 0 {
+		return nil, errors.New("no child stops found")
+	}
+
+	return result, nil
+}
+
 func (v Database) GetStopsByRouteId(routeId string) (Stops, error) {
 	query := `
 	SELECT DISTINCT s.stop_id, s.stop_code, s.stop_name, s.stop_lat, s.stop_lon, s.location_type, s.parent_station, s.platform_code, s.wheelchair_boarding, st.stop_sequence

@@ -9,11 +9,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 )
 
-func newDatabase(url string, databaseName string) (Database, error) {
+func newDatabase(url string, databaseName string, tz *time.Location, mailToEmail string) (Database, error) {
 	if url == "" {
 		return Database{}, errors.New("missing url")
 	}
@@ -36,7 +37,7 @@ func newDatabase(url string, databaseName string) (Database, error) {
 	}
 
 	// Initialize the Database struct
-	database := Database{db: db, url: url}
+	database := Database{db: db, url: url, timeZone: tz, mailToEmail: mailToEmail}
 	return database, nil
 }
 
@@ -238,6 +239,18 @@ func (v Database) createDefaultGTFSTables() {
 			feed_version TEXT DEFAULT '',
 			feed_contact_email TEXT DEFAULT '',
 			feed_contact_url TEXT DEFAULT ''
+		);
+
+		-- Table: notifications
+		CREATE TABLE IF NOT EXISTS notifications (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,    -- Auto-incrementing primary key
+			endpoint TEXT NOT NULL,                   -- Make endpoint NOT NULL if required
+			p256dh TEXT NOT NULL DEFAULT '',
+			auth TEXT NOT NULL DEFAULT '',
+			stop TEXT NOT NULL DEFAULT '',
+			recent_notifications TEXT DEFAULT '',
+			created INTEGER NOT NULL DEFAULT '',
+			CONSTRAINT unique_notification UNIQUE (endpoint, p256dh, auth, stop)  -- Composite unique constraint
 		);
 
 	`
@@ -481,6 +494,9 @@ func (v Database) createIndexes() {
 
 		-- Indexes for levels table
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_levels_level_id ON levels (level_id);
+
+		-- Indexes for notifications table
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_stop ON notifications (stop);
 	`
 
 	_, err := v.db.Exec(query)

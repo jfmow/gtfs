@@ -9,8 +9,10 @@ import (
 )
 
 type Database struct {
-	db  *sqlx.DB
-	url string
+	db          *sqlx.DB
+	url         string
+	timeZone    *time.Location
+	mailToEmail string
 }
 
 func (v Database) IsFeedDataUpToDate() (bool, error) {
@@ -57,9 +59,19 @@ func (v Database) FeedEndDate() (time.Time, error) {
 	return feedEndTime, nil
 }
 
-// New creates a new database instance and checks for feed updates
-func New(url string, databaseName string) (Database, error) {
-	database, err := newDatabase(url, databaseName)
+/*
+# Creates a new gtfs instance
+
+  - url: url to gtfs .zip
+
+  - databaseName: the name for the .db file to be created with
+
+  - tz: the timezone to process gtfs with
+
+  - mailToEmail: the email to use with notifications (e.g hi@example.com (NOT: mailto:hi@example.com))
+*/
+func New(url string, databaseName string, tz *time.Location, mailToEmail string) (Database, error) {
+	database, err := newDatabase(url, databaseName, tz, mailToEmail)
 	if err != nil {
 		panic(err)
 	}
