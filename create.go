@@ -46,7 +46,7 @@ type CSVRecord struct {
 	Data   string
 }
 
-var tableNames = []string{
+var defaultTableNames = []string{
 	"agency",
 	"stops",
 	"routes",
@@ -104,7 +104,7 @@ func writeFilesToDB(zipData []byte, v Database) error {
 
 		fmt.Println("Headers from file:", headers)
 
-		if !contains(tableNames, tableName) {
+		if !contains(defaultTableNames, tableName) {
 			v.createTableIfNotExists(tableName, headers)
 		} else {
 			columns, err := v.getTableColumns(tableName)
