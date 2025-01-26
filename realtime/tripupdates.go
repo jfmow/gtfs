@@ -137,8 +137,9 @@ type StopTimeUpdate struct {
 }
 
 type Arrival struct {
-	Delay int64 `json:"delay"`
-	Time  int64 `json:"time"`
+	Delay       int64 `json:"delay"`
+	Time        int64 `json:"time"`
+	Uncertainty int64 `json:"uncertainty"`
 }
 
 type Trip struct {

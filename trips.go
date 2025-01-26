@@ -28,6 +28,7 @@ func (v Database) GetTripByID(tripID string) (Trip, error) {
 			route_id,
 			trip_headsign,
 			shape_id,
+			service_id,
 			direction_id,
 			wheelchair_accessible,
 			bikes_allowed

@@ -28,14 +28,20 @@ Get all the services stopping at a given stop (child stop/parent with not childr
   - StopId: the id of the stop. REQUIRED
   - departureTimeFilter: the time to filter from, so any services after departureTimeFilter ("15:03:00"). NOT required, can be ""
   - limit: the amount of services to get. REQUIRED
+  - date: "20060102"
 */
-func (v Database) GetActiveTrips(stopID, departureTimeFilter string, limit int) ([]StopTimes, error) {
+func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date string, limit int) ([]StopTimes, error) {
 	// Open the SQLite database
 	db := v.db // Assuming db is already connected, if not, you can open it here
 
 	now := time.Now().In(v.timeZone)
 	dayColumn := strings.ToLower(now.Weekday().String())
-	dateString := now.Format("20060102")
+	var dateString string
+	if date != "" {
+		dateString = date
+	} else {
+		dateString = now.Format("20060102")
+	}
 
 	// Base query with placeholders for the date and dynamic weekday column
 	query := fmt.Sprintf(`
