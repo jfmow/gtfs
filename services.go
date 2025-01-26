@@ -7,8 +7,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	sq "github.com/Masterminds/squirrel"
 )
 
 type StopTimes struct {
@@ -24,20 +22,20 @@ type StopTimes struct {
 	RouteColor    string `json:"route_color"`
 }
 
-func (v Database) GetActiveTrips(date, currentWeekDay, stopID, departureTimeFilter string, limit int) ([]StopTimes, error) {
+/*
+Get all the services stopping at a given stop (child stop/parent with not children)
+
+  - StopId: the id of the stop. REQUIRED
+  - departureTimeFilter: the time to filter from, so any services after departureTimeFilter ("15:03:00"). NOT required, can be ""
+  - limit: the amount of services to get. REQUIRED
+*/
+func (v Database) GetActiveTrips(stopID, departureTimeFilter string, limit int) ([]StopTimes, error) {
 	// Open the SQLite database
 	db := v.db // Assuming db is already connected, if not, you can open it here
 
-	// Base query with placeholders for the date
-	dayColumn := map[string]string{
-		"Sunday":    "sunday",
-		"Monday":    "monday",
-		"Tuesday":   "tuesday",
-		"Wednesday": "wednesday",
-		"Thursday":  "thursday",
-		"Friday":    "friday",
-		"Saturday":  "saturday",
-	}[currentWeekDay]
+	now := time.Now().In(v.timeZone)
+	dayColumn := strings.ToLower(now.Weekday().String())
+	dateString := now.Format("20060102")
 
 	// Base query with placeholders for the date and dynamic weekday column
 	query := fmt.Sprintf(`
@@ -119,13 +117,13 @@ func (v Database) GetActiveTrips(date, currentWeekDay, stopID, departureTimeFilt
 	var rows *sql.Rows
 	var err error
 	if departureTimeFilter != "" && stopID != "" {
-		rows, err = db.Query(query, date, date, date, date, departureTimeFilter, stopID)
+		rows, err = db.Query(query, dateString, dateString, dateString, dateString, departureTimeFilter, stopID)
 	} else if departureTimeFilter != "" {
-		rows, err = db.Query(query, date, date, date, date, departureTimeFilter)
+		rows, err = db.Query(query, dateString, dateString, dateString, dateString, departureTimeFilter)
 	} else if stopID != "" {
-		rows, err = db.Query(query, date, date, date, date, stopID)
+		rows, err = db.Query(query, dateString, dateString, dateString, dateString, stopID)
 	} else {
-		rows, err = db.Query(query, date, date, date, date)
+		rows, err = db.Query(query, dateString, dateString, dateString, dateString)
 	}
 
 	if err != nil {
@@ -235,11 +233,16 @@ func (v Database) GetActiveTrips(date, currentWeekDay, stopID, departureTimeFilt
 	// Check for any error during iteration
 	if err := rows.Err(); err != nil {
 		fmt.Println(err)
-		return nil, errors.New("An error occurred building for the data")
+		return nil, errors.New("an error occurred going through the retrieved data")
 	}
 	return results, nil
 }
 
+/*
+Get the service stopping at a given stop, based on its trip id
+
+Because it's searching by trip id only one service will be returned (if found)
+*/
 func (v Database) GetServiceByTripAndStop(tripID, stopId, departureTimeFilter string) (StopTimes, error) {
 	if tripID == "" {
 		return StopTimes{}, errors.New("missing trip id")
@@ -285,14 +288,7 @@ func (v Database) GetServiceByTripAndStop(tripID, stopId, departureTimeFilter st
 	query += " ORDER BY st.departure_time ASC"
 
 	// Execute the query with the provided trip_id
-	var rows *sql.Row
-	var err error
-	rows = db.QueryRow(query, tripID, stopId, departureTimeFilter)
-
-	if err != nil {
-		fmt.Println(err)
-		return StopTimes{}, errors.New("an error occurred querying for the data")
-	}
+	rows := db.QueryRow(query, tripID, stopId, departureTimeFilter)
 
 	// Regular expressions for platform determination
 	reStationPlatform := regexp.MustCompile(`Train Station (\d)$`)
@@ -394,14 +390,18 @@ func (v Database) GetServiceByTripAndStop(tripID, stopId, departureTimeFilter st
 	// Check for any error during the query execution
 	if err := rows.Err(); err != nil {
 		fmt.Println(err)
-		return StopTimes{}, errors.New("An error occurred building for the data")
+		return StopTimes{}, errors.New("an error occurred building for the data")
 	}
 
 	// Return the result
 	return stopTimeData, nil
 }
 
-// Function to determine the platform number based on stop name
+/*
+Function to determine the platform number based on stop name
+
+(only use if you don't have a platform_code)
+*/
 func determinePlatform(stopName string, reStationPlatform, reCapitalLetter *regexp.Regexp) string {
 	if matches := reStationPlatform.FindStringSubmatch(stopName); len(matches) > 1 {
 		return matches[1]
@@ -413,76 +413,4 @@ func determinePlatform(stopName string, reStationPlatform, reCapitalLetter *rege
 		return string(stopName[len(stopName)-1])
 	}
 	return "no platform"
-}
-
-//TODO: use pre processing
-
-// Check if the current week has been processed
-func (v Database) hasProcessedCurrentWeek(today time.Time) (bool, error) {
-	var lastProcessedWeek string
-
-	// Get the current week's number (Monday as the start of the week)
-	currentYear, currentWeek := today.ISOWeek()
-	currentWeekStr := fmt.Sprintf("%d-W%d", currentYear, currentWeek)
-
-	// Build the query using squirrel
-	baseQuery := sq.Select("last_processed_week").
-		From("week_cache").
-		Where(sq.Eq{"last_processed_week": currentWeekStr})
-
-	// Execute the query
-	err := baseQuery.RunWith(v.db).QueryRow().Scan(&lastProcessedWeek)
-	if err != nil && err != sql.ErrNoRows {
-		return false, fmt.Errorf("failed to query last processed week: %w", err)
-	}
-
-	// Check if the current week matches the last processed week
-	return lastProcessedWeek == currentWeekStr, nil
-}
-
-// Mark the current week as processed
-func (v Database) markWeekAsProcessed(today time.Time) error {
-	currentYear, currentWeek := today.ISOWeek()
-	currentWeekStr := fmt.Sprintf("%d-W%d", currentYear, currentWeek)
-
-	// Delete any existing entry for the current week
-	deleteQuery := sq.Delete("week_cache").
-		Where(sq.Eq{"last_processed_week": currentWeekStr})
-
-	_, err := deleteQuery.RunWith(v.db).Exec()
-	if err != nil {
-		return fmt.Errorf("failed to delete existing week entry: %w", err)
-	}
-
-	// Insert the current week string
-	insertQuery := sq.Insert("week_cache").
-		Columns("last_processed_week").
-		Values(currentWeekStr)
-
-	_, err = insertQuery.RunWith(v.db).Exec()
-	if err != nil {
-		return fmt.Errorf("failed to insert processed week: %w", err)
-	}
-	return nil
-}
-
-func getNext7Days(start, end time.Time) []string {
-	var dates []string
-
-	// Loop for the next 7 days or until the endDate, whichever comes first
-	for i := 0; i < 7; i++ {
-		// Calculate the current date
-		current := start.AddDate(0, 0, i)
-
-		// If the current date exceeds the end date, stop
-		if current.After(end) {
-			break
-		}
-
-		// Format the date as YYYYMMDD
-		dateStr := fmt.Sprintf("%d%02d%02d", current.Year(), current.Month(), current.Day())
-		dates = append(dates, dateStr)
-	}
-
-	return dates
 }

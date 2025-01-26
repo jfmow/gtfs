@@ -3,8 +3,6 @@ package gtfs
 import (
 	"errors"
 	"fmt"
-
-	sq "github.com/Masterminds/squirrel"
 )
 
 type Trip struct {
@@ -18,13 +16,28 @@ type Trip struct {
 	WheelchairAccessible int    `json:"wheelchair_accessible"`
 }
 
+/*
+Get a trip by it's trip id
+*/
 func (v Database) GetTripByID(tripID string) (Trip, error) {
 	db := v.db
-	baseQuery := sq.Select("trip_id", "route_id", "trip_headsign", "shape_id", "service_id", "direction_id", "wheelchair_accessible", "bikes_allowed").From("trips")
 
-	active := baseQuery.Where(sq.Eq{"trip_id": tripID})
+	query := `
+		SELECT
+			trip_id,
+			route_id,
+			trip_headsign,
+			shape_id,
+			direction_id,
+			wheelchair_accessible,
+			bikes_allowed
+		FROM 
+			trips
+		WHERE
+			trip_id = ?
+	`
 
-	row := active.RunWith(db).QueryRow()
+	row := db.QueryRow(query, tripID)
 
 	var trip Trip
 
@@ -46,10 +59,19 @@ func (v Database) GetTripByID(tripID string) (Trip, error) {
 	return trip, nil
 }
 
-// Get the stopId's of the stops a trip stops at
-func (v Database) GetServicesStopsByTripId(tripId string) ([]string, error) {
+/*
+Get the stops for a
+
+Returns an array of stopIds (parent stops)
+*/
+func (v Database) GetServicesStopsByTrip(tripId string) ([]string, error) {
 	query := `
-		SELECT stop_id FROM stop_times WHERE trip_id = ?
+		SELECT 
+			stop_id 
+		FROM 
+			stop_times 
+		WHERE 
+			trip_id = ?
 	`
 
 	rows, err := v.db.Query(query, tripId)

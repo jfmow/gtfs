@@ -3,8 +3,6 @@ package gtfs
 import (
 	"errors"
 	"strings"
-
-	sq "github.com/Masterminds/squirrel"
 )
 
 type Route struct {
@@ -17,11 +15,24 @@ type Route struct {
 	VehicleType    string `json:"vehicle_type"`
 }
 
+/*
+Get all the stored routes
+*/
 func (v Database) GetRoutes() ([]Route, error) {
 	db := v.db
-	baseQuery := sq.Select("route_id", "agency_id", "route_short_name", "route_long_name", "route_type", "route_color").From("routes")
+	query := `
+		SELECT 
+			route_id,
+			agency_id,
+			route_short_name,
+			route_long_name,
+			route_type,
+			route_color
+		FROM
+			routes
+	`
 
-	rows, err := baseQuery.RunWith(db).Query()
+	rows, err := db.Query(query)
 
 	if err != nil {
 		return nil, err
@@ -66,12 +77,26 @@ func (v Database) GetRoutes() ([]Route, error) {
 	return routes, nil
 }
 
+/*
+Get a route by its route ids
+*/
 func (v Database) GetRouteByID(routeID string) (Route, error) {
 	db := v.db
-	baseQuery := sq.Select("route_id", "agency_id", "route_short_name", "route_long_name", "route_type", "route_color").From("routes").
-		Where(sq.Eq{"route_id": routeID})
+	query := `
+		SELECT
+			route_id,
+			agency_id,
+			route_short_name,
+			route_long_name,
+			route_type,
+			route_color
+		FROM
+			routes
+		WHERE
+			route_id = ?
+	`
 
-	row := baseQuery.RunWith(db).QueryRow()
+	row := db.QueryRow(query, routeID)
 
 	// Slice to hold all the trips
 	var route Route
@@ -94,6 +119,9 @@ func (v Database) GetRouteByID(routeID string) (Route, error) {
 	return route, nil
 }
 
+/*
+Get all the routes that pass through a given stops
+*/
 func (v Database) GetRoutesByStopId(stopId string) ([]Route, error) {
 	query := `
 		SELECT DISTINCT r.route_id, r.route_short_name, r.route_long_name, r.route_type, r.route_color
@@ -140,6 +168,9 @@ func (v Database) GetRoutesByStopId(stopId string) ([]Route, error) {
 	return routes, nil
 }
 
+/*
+Determine the type of vehicle a given route uses
+*/
 func getRouteVehicleType(route Route) string {
 	switch route.RouteType {
 	case 0:
@@ -166,17 +197,30 @@ func getRouteVehicleType(route Route) string {
 	return "unknown"
 }
 
+/*
+Search for a route based on a partial match to its id
+*/
 func (v Database) SearchForRouteByID(searchText string) ([]Route, error) {
 	// Normalize the input search text and make it lowercase
 	normalizedSearchText := strings.ToLower(searchText)
 
 	// Create a SQL query to find matching stops
-	query := sq.Select("route_id", "agency_id", "route_short_name", "route_long_name", "route_type", "route_color")
-	query = query.From("routes")
-	query = query.Where(sq.Like{"LOWER(route_id)": "%" + normalizedSearchText + "%"})
+	query := `
+		SELECT 
+			route_id,
+			agency_id,
+			route_short_name,
+			route_long_name,
+			route_type,
+			route_color
+		FROM 
+			routes
+		WHERE
+			LOWER(route_id) LIKE ?
+	`
 
 	// Run the query
-	rows, err := query.RunWith(v.db).Query()
+	rows, err := v.db.Query(query, "%"+normalizedSearchText+"%")
 	if err != nil {
 		return nil, err
 	}

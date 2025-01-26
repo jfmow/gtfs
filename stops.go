@@ -1,12 +1,11 @@
 package gtfs
 
 import (
+	"database/sql"
 	"errors"
 	"math"
 	"sort"
 	"strings"
-
-	sq "github.com/Masterminds/squirrel"
 )
 
 type Stop struct {
@@ -28,27 +27,41 @@ type StopSearch struct {
 	TypeOfStop string `json:"type_of_stop"`
 }
 
-type Stops []Stop
-
-func (v Database) GetStops(includeChildStops bool) (Stops, error) {
+/*
+Get all the stored stops
+*/
+func (v Database) GetStops(includeChildStops bool) ([]Stop, error) {
 	db := v.db
-	baseQuery := sq.Select("stop_id", "stop_code", "stop_name", "stop_lat", "stop_lon", "location_type", "parent_station", "platform_code", "wheelchair_boarding").From("stops")
+	query := `
+		SELECT
+			stop_id,
+			stop_code,
+			stop_name,
+			stop_lat,
+			stop_lon,
+			location_type,
+			parent_station,
+			platform_code,
+			wheelchair_boarding
+		FROM
+			stops
+	`
+	if !includeChildStops {
+		// Add filtering to exclude child stops
+		query += ` WHERE (location_type == 1 OR parent_station = '')`
+	}
 
-	rows, err := baseQuery.RunWith(db).Query()
-
+	rows, err := db.Query(query)
 	if err != nil {
 		return nil, err
 	}
-
 	defer rows.Close() // Ensure the rows are closed after usage
 
-	// Slice to hold all the trips
 	var stops Stops
 
 	// Iterate over the rows
 	for rows.Next() {
 		var stop Stop
-		// Scan the row data into the trip struct
 		err := rows.Scan(
 			&stop.StopId,
 			&stop.StopCode,
@@ -63,11 +76,7 @@ func (v Database) GetStops(includeChildStops bool) (Stops, error) {
 		if err != nil {
 			return nil, err
 		}
-		if stop.LocationType == 0 && stop.ParentStation != "" && !includeChildStops {
-			continue
-		}
 		stop.StopType = typeOfStop(stop.StopName)
-		// Append each trip to the slice
 		stops = append(stops, stop)
 	}
 
@@ -76,7 +85,6 @@ func (v Database) GetStops(includeChildStops bool) (Stops, error) {
 		return nil, err
 	}
 
-	// If no trips were found, return a custom error
 	if len(stops) == 0 {
 		return nil, errors.New("no stops found")
 	}
@@ -84,19 +92,99 @@ func (v Database) GetStops(includeChildStops bool) (Stops, error) {
 	return stops, nil
 }
 
-func (v Database) GetStopsForTripID(tripID string) (Stops, error) {
+/*
+Get the child stops of a parent stop
+*/
+func (v Database) GetChildStopsByParentStopID(stopID string) ([]Stop, error) {
 	db := v.db
 
-	// Query to select stop details for a given tripID by joining stop_times with stops
-	baseQuery := sq.Select(
-		"s.stop_id", "s.stop_code", "s.stop_name", "s.stop_lat", "s.stop_lon", "s.location_type", "s.parent_station", "s.platform_code", "s.wheelchair_boarding", "st.stop_sequence").
-		From("stop_times st").
-		Join("stops s ON st.stop_id = s.stop_id").
-		Where(sq.Eq{"st.trip_id": tripID}).
-		OrderBy("st.stop_sequence") // Order by the stop sequence in stop_times
+	// Query to fetch parent stop and its children
+	query := `
+		SELECT
+			stop_id,
+			stop_code,
+			stop_name,
+			stop_lat,
+			stop_lon,
+			location_type,
+			parent_station,
+			platform_code,
+			wheelchair_boarding
+		FROM
+			stops
+		WHERE
+			(stop_id = ? AND parent_station = '' AND location_type == 0) OR parent_station = ?
+	`
+
+	rows, err := db.Query(query, stopID, stopID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() // Ensure the rows are closed after usage
+
+	var stops Stops
+
+	for rows.Next() {
+		var stop Stop
+		err := rows.Scan(
+			&stop.StopId,
+			&stop.StopCode,
+			&stop.StopName,
+			&stop.StopLat,
+			&stop.StopLon,
+			&stop.LocationType,
+			&stop.ParentStation,
+			&stop.PlatformNumber,
+			&stop.WheelChairBoarding,
+		)
+		if err != nil {
+			return nil, err
+		}
+		stop.StopType = typeOfStop(stop.StopName)
+		stops = append(stops, stop)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(stops) == 0 {
+		return nil, errors.New("no child stops found")
+	}
+
+	return stops, nil
+}
+
+/*
+Get the stops for a trip
+*/
+func (v Database) GetStopsForTripID(tripID string) ([]Stop, error) {
+	db := v.db
+
+	query := `
+		SELECT
+			s.stop_id,
+			s.stop_code,
+			s.stop_name,
+			s.stop_lat,
+			s.stop_lon,
+			s.location_type,
+			s.parent_station,
+			s.platform_code,
+			s.wheelchair_boarding,
+			st.stop_sequence
+		FROM
+			stop_times st
+		JOIN
+			stops s ON st.stop_id = s.stop_id
+		WHERE
+			st.trip_id = ?
+		ORDER BY
+			st.stop_sequence
+	`
 
 	// Execute the query
-	rows, err := baseQuery.RunWith(db).Query()
+	rows, err := db.Query(query, tripID)
 	if err != nil {
 		return nil, err
 	}
@@ -142,70 +230,65 @@ func (v Database) GetStopsForTripID(tripID string) (Stops, error) {
 	return stops, nil
 }
 
-func (v Database) GetStopByNameOrCode(nameOrCode string) (Stops, error) {
+/*
+Get a stop by its name or its stop code
+*/
+func (v Database) GetStopByNameOrCode(nameOrCode string) (*Stop, error) {
 	db := v.db
 
-	// Base query to select stops
-	baseQuery := sq.Select(
-		"stop_id", "stop_code", "stop_name", "stop_lat", "stop_lon",
-		"location_type", "parent_station", "platform_code", "wheelchair_boarding").
-		From("stops")
-
-	// Use a WHERE clause to search by stop name, stop code, or a combination of both
-	whereClause := sq.Or{
-		sq.Eq{"stop_name": nameOrCode},                           // Search by stop name
-		sq.Eq{"stop_code": nameOrCode},                           // Search by stop code
-		sq.Expr("stop_name || ' ' || stop_code = ?", nameOrCode), // Search by name + stop code
-	}
-
-	baseQuery = baseQuery.Where(whereClause)
+	query := `
+		SELECT
+			stop_id,
+			stop_code,
+			stop_name,
+			stop_lat,
+			stop_lon,
+			location_type,
+			parent_station,
+			platform_code,
+			wheelchair_boarding
+		FROM
+			STOPS
+		WHERE
+			stop_name = ?
+		OR
+			stop_code = ?
+		OR
+			stop_name || ' ' || stop_code = ?
+	`
 
 	// Execute the query
-	rows, err := baseQuery.RunWith(db).Query()
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close() // Ensure the rows are closed after usage
+	rows := db.QueryRow(query, nameOrCode, nameOrCode, nameOrCode)
 
 	// Slice to hold all the stops
-	var stops Stops
-
-	// Iterate over the rows
-	for rows.Next() {
-		var stop Stop
-		// Scan the row data into the Stop struct
-		err := rows.Scan(
-			&stop.StopId,
-			&stop.StopCode,
-			&stop.StopName,
-			&stop.StopLat,
-			&stop.StopLon,
-			&stop.LocationType,
-			&stop.ParentStation,
-			&stop.PlatformNumber,
-			&stop.WheelChairBoarding,
-		)
-		if err != nil {
-			return nil, err
+	var stop Stop
+	// Scan the row data into the Stop struct
+	err := rows.Scan(
+		&stop.StopId,
+		&stop.StopCode,
+		&stop.StopName,
+		&stop.StopLat,
+		&stop.StopLon,
+		&stop.LocationType,
+		&stop.ParentStation,
+		&stop.PlatformNumber,
+		&stop.WheelChairBoarding,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, errors.New("no stop found")
 		}
-		stop.StopType = typeOfStop(stop.StopName)
-		// Append each stop to the slice
-		stops = append(stops, stop)
-	}
-
-	// Check for any error encountered during iteration
-	if err = rows.Err(); err != nil {
 		return nil, err
 	}
 
-	// If no stops were found, return a custom error
-	if len(stops) == 0 {
-		return nil, errors.New("no stops found")
-	}
+	stop.StopType = typeOfStop(stop.StopName)
 
-	return stops, nil
+	return &stop, nil
 }
 
+/*
+Get a stop by its id
+*/
 func (v Database) GetStopByStopID(stopID string) (*Stop, error) {
 	db := v.db
 
@@ -250,52 +333,72 @@ func (v Database) GetStopByStopID(stopID string) (*Stop, error) {
 	return &stop, nil
 }
 
-func (v Database) GetChildStopsByParentStopID(stopID string) (Stops, error) {
-	// Base query to select stops
-	stops, err := v.GetStops(true)
+/*
+Get the parent stop to a child stop (if the child is its own parent you just get back the child)
+*/
+func (v Database) GetParentStopByChildStopID(childStopID string) (*Stop, error) {
+	db := v.db
+
+	// Query to fetch either the parent stop or the stop itself if it has no parent
+	query := `
+		SELECT
+			stop_id,
+			stop_code,
+			stop_name,
+			stop_lat,
+			stop_lon,
+			location_type,
+			parent_station,
+			platform_code,
+			wheelchair_boarding
+		FROM
+			stops
+		WHERE
+			stop_id = (
+				SELECT
+					CASE
+						WHEN parent_station = '' OR parent_station IS NULL THEN stop_id
+						ELSE parent_station
+					END
+				FROM
+					stops
+				WHERE
+					stop_id = ?
+			)
+	`
+
+	// Execute the query with the child stop ID
+	row := db.QueryRow(query, childStopID)
+
+	var stop Stop
+	err := row.Scan(
+		&stop.StopId,
+		&stop.StopCode,
+		&stop.StopName,
+		&stop.StopLat,
+		&stop.StopLon,
+		&stop.LocationType,
+		&stop.ParentStation,
+		&stop.PlatformNumber,
+		&stop.WheelChairBoarding,
+	)
 	if err != nil {
-		return nil, errors.New("no stops found")
-	}
-
-	var result Stops
-
-	for _, a := range stops {
-		if a.ParentStation == stopID || a.StopId == stopID {
-			result = append(result, a)
+		if err == sql.ErrNoRows {
+			return nil, errors.New("no parent stop or self stop found for the given stop ID")
 		}
+		return nil, err
 	}
 
-	// If no stops were found, return a custom error
-	if len(result) == 0 {
-		return nil, errors.New("no child stops found")
-	}
+	// Determine the stop type (optional, based on your existing logic)
+	stop.StopType = typeOfStop(stop.StopName)
 
-	return result, nil
+	return &stop, nil
 }
 
-func (v Database) GetParentStopByChildStopID(childStopId string) (*Stop, error) {
-
-	childStop, err := v.GetStopByStopID(childStopId)
-	if err != nil {
-		return nil, errors.New("invalid stopId")
-	}
-
-	parentStopId := childStop.ParentStation
-
-	if parentStopId != "" {
-		//stop has a parent
-		parentStop, err := v.GetStopByStopID(parentStopId)
-		if err != nil {
-			return nil, errors.New("invalid parent stop id")
-		}
-		return parentStop, nil
-	} else {
-		//stop has no parent/is a parent
-		return childStop, nil
-	}
-}
-
-func (v Database) GetStopsByRouteId(routeId string) (Stops, error) {
+/*
+Get the stops for a given route
+*/
+func (v Database) GetStopsByRouteId(routeId string) ([]Stop, error) {
 	query := `
 	SELECT DISTINCT s.stop_id, s.stop_code, s.stop_name, s.stop_lat, s.stop_lon, s.location_type, s.parent_station, s.platform_code, s.wheelchair_boarding, st.stop_sequence
 	FROM routes r
@@ -352,18 +455,28 @@ func (v Database) GetStopsByRouteId(routeId string) (Stops, error) {
 	return stops, nil
 }
 
-// SearchForStopsByName searches for stops based on a partial name match
+/*
+Search the db of stops for a partial name match of a stop
+*/
 func (v Database) SearchForStopsByName(searchText string, includeChildStops bool) ([]StopSearch, error) {
 	// Normalize the input search text and make it lowercase
 	normalizedSearchText := strings.ToLower(searchText)
 
-	// Create a SQL query to find matching stops
-	query := sq.Select("stop_id, stop_code, stop_name", "parent_station", "location_type")
-	query = query.From("stops")
-	query = query.Where(sq.Like{"LOWER(stop_name)": "%" + normalizedSearchText + "%"})
+	query := `
+		SELECT
+			stop_id,
+			stop_code,
+			stop_name,
+			parent_station,
+			location_type
+		FROM
+			stops
+		WHERE
+			LOWER(stop_name) LIKE ?
+	`
 
 	// Run the query
-	rows, err := query.RunWith(v.db).Query()
+	rows, err := v.db.Query(query, "%"+normalizedSearchText+"%")
 	if err != nil {
 		return nil, err
 	}
@@ -397,6 +510,9 @@ func (v Database) SearchForStopsByName(searchText string, includeChildStops bool
 	return stopSearchResults, nil
 }
 
+/*
+Try to figure out the type of stop based on name
+*/
 func typeOfStop(stopName string) string {
 	isFerryTerminal := strings.Contains(stopName, "Ferry Terminal")
 	isTrainStation := strings.Contains(stopName, "Train Station")
@@ -413,7 +529,12 @@ func typeOfStop(stopName string) string {
 	return "bus"
 }
 
-func (stops Stops) FindClosestStops(userLat, userLon float64) Stops {
+type Stops []Stop
+
+/*
+Find the closest stop(s) to a given set of coordinates
+*/
+func (stops Stops) FindClosestStops(lat, lon float64) []Stop {
 	var stopDistances []StopWithDistance
 
 	// Iterate through the map, where each key corresponds to a slice of stops
@@ -421,7 +542,7 @@ func (stops Stops) FindClosestStops(userLat, userLon float64) Stops {
 	for _, v := range stops {
 		stop := v
 		// Calculate the distance between the user and the stop
-		distance := calculateDistance(userLat, userLon, stop.StopLat, stop.StopLon)
+		distance := calculateDistance(lat, lon, stop.StopLat, stop.StopLon)
 
 		// Store stop and its distance
 		stopDistances = append(stopDistances, StopWithDistance{
