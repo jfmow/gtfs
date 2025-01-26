@@ -118,10 +118,14 @@ type TripUpdatesResponse struct {
 type TripUpdate struct {
 	Trip           Trip           `json:"trip"`
 	StopTimeUpdate StopTimeUpdate `json:"stop_time_update"`
-	Vehicle        Vehicle        `json:"vehicle"`
-	Timestamp      int64          `json:"timestamp"`
-	Delay          int64          `json:"delay"`
-	ID             string         `json:"id"`
+	Vehicle        struct {
+		ID           string `json:"id"`
+		Label        string `json:"label"`
+		LicensePlate string `json:"license_plate"`
+	} `json:"vehicle"`
+	Timestamp int64  `json:"timestamp"`
+	Delay     int64  `json:"delay"`
+	ID        string `json:"id"`
 }
 
 type StopTimeUpdate struct {
