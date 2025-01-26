@@ -63,12 +63,14 @@ func (v tripUpdates) GetTripUpdates() (TripUpdatesMap, error) {
 		// Handle case where Status and Response are present
 		if result.Response != nil {
 			for _, i := range result.Response.Entity {
+				i.TripUpdate.ID = i.ID
 				updates[i.TripUpdate.Trip.TripID] = i.TripUpdate
 			}
 		}
 	} else {
 		// Handle case where Status and Response are not present (use header and entity)
 		for _, i := range result.Entity {
+			i.TripUpdate.ID = i.ID
 			updates[i.TripUpdate.Trip.TripID] = i.TripUpdate
 		}
 	}
@@ -119,6 +121,7 @@ type TripUpdate struct {
 	Vehicle        Vehicle        `json:"vehicle"`
 	Timestamp      int64          `json:"timestamp"`
 	Delay          int64          `json:"delay"`
+	ID             string         `json:"id"`
 }
 
 type StopTimeUpdate struct {

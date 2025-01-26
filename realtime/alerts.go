@@ -63,12 +63,14 @@ func (v alerts) GetAlerts() (AlertMap, error) {
 		// Handle case where Status and Response are present
 		if result.Response != nil {
 			for _, i := range result.Response.Entity {
+				i.Alert.ID = i.ID
 				alerts = append(alerts, i.Alert)
 			}
 		}
 	} else {
 		// Handle case where Status and Response are not present (use header and entity)
 		for _, i := range result.Entity {
+			i.Alert.ID = i.ID
 			alerts = append(alerts, i.Alert)
 		}
 	}
@@ -128,6 +130,7 @@ type Alert struct {
 	Effect          string           `json:"effect"`
 	HeaderText      Text             `json:"header_text"`
 	DescriptionText Text             `json:"description_text"`
+	ID              string           `json:"alert_id"`
 }
 
 type ActivePeriod struct {

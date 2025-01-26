@@ -75,11 +75,11 @@ func (v Database) GetServicesStopsByTripId(tripId string) ([]string, error) {
 
 		var allStops Stops
 
-		parentStops, err := v.GetParentStopsByChildStopID(stopId)
+		parentStop, err := v.GetParentStopByChildStopID(stopId)
 		if err != nil {
 			return nil, errors.New("invalid stop id")
 		}
-		allStops = append(allStops, parentStops...)
+		allStops = append(allStops, *parentStop)
 
 		for _, stop := range allStops {
 			stops = append(stops, stop.StopId)

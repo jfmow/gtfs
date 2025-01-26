@@ -206,66 +206,48 @@ func (v Database) GetStopByNameOrCode(nameOrCode string) (Stops, error) {
 	return stops, nil
 }
 
-func (v Database) GetStopByStopID(stopID string) (Stops, error) {
+func (v Database) GetStopByStopID(stopID string) (*Stop, error) {
 	db := v.db
 
-	// Base query to select stops
-	baseQuery := sq.Select(
-		"stop_id", "stop_code", "stop_name", "stop_lat", "stop_lon",
-		"location_type", "parent_station", "platform_code", "wheelchair_boarding").
-		From("stops")
-
-	// Use a WHERE clause to search by stop name, stop code, or a combination of both
-	whereClause := sq.Or{
-		sq.Eq{"stop_id": stopID}, // Search by name + stop code
-	}
-
-	baseQuery = baseQuery.Where(whereClause)
+	query := `
+		SELECT
+			stop_id,
+			stop_code,
+			stop_name,
+			stop_lat,
+			stop_lon,
+			location_type,
+			parent_station,
+			platform_code,
+			wheelchair_boarding
+		FROM 
+			stops
+		WHERE
+			stop_id = ?
+	`
 
 	// Execute the query
-	rows, err := baseQuery.RunWith(db).Query()
+	rows := db.QueryRow(query, stopID)
+
+	var stop Stop
+	// Scan the row data into the Stop struct
+	err := rows.Scan(
+		&stop.StopId,
+		&stop.StopCode,
+		&stop.StopName,
+		&stop.StopLat,
+		&stop.StopLon,
+		&stop.LocationType,
+		&stop.ParentStation,
+		&stop.PlatformNumber,
+		&stop.WheelChairBoarding,
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close() // Ensure the rows are closed after usage
+	stop.StopType = typeOfStop(stop.StopName)
 
-	// Slice to hold all the stops
-	var stops Stops
-
-	// Iterate over the rows
-	for rows.Next() {
-		var stop Stop
-		// Scan the row data into the Stop struct
-		err := rows.Scan(
-			&stop.StopId,
-			&stop.StopCode,
-			&stop.StopName,
-			&stop.StopLat,
-			&stop.StopLon,
-			&stop.LocationType,
-			&stop.ParentStation,
-			&stop.PlatformNumber,
-			&stop.WheelChairBoarding,
-		)
-		if err != nil {
-			return nil, err
-		}
-		stop.StopType = typeOfStop(stop.StopName)
-		// Append each stop to the slice
-		stops = append(stops, stop)
-	}
-
-	// Check for any error encountered during iteration
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-
-	// If no stops were found, return a custom error
-	if len(stops) == 0 {
-		return nil, errors.New("no stops found")
-	}
-
-	return stops, nil
+	return &stop, nil
 }
 
 func (v Database) GetChildStopsByParentStopID(stopID string) (Stops, error) {
@@ -291,34 +273,26 @@ func (v Database) GetChildStopsByParentStopID(stopID string) (Stops, error) {
 	return result, nil
 }
 
-func (v Database) GetParentStopsByChildStopID(childStopId string) (Stops, error) {
-	// Base query to select stops
-	stops, err := v.GetStops(false)
-	if err != nil {
-		return nil, errors.New("no stops found")
-	}
+func (v Database) GetParentStopByChildStopID(childStopId string) (*Stop, error) {
 
-	stops2, err := v.GetStopByStopID(childStopId)
+	childStop, err := v.GetStopByStopID(childStopId)
 	if err != nil {
 		return nil, errors.New("invalid stopId")
 	}
 
-	stopID := stops2[0].ParentStation
+	parentStopId := childStop.ParentStation
 
-	var result Stops
-
-	for _, a := range stops {
-		if a.StopId == stopID {
-			result = append(result, a)
+	if parentStopId != "" {
+		//stop has a parent
+		parentStop, err := v.GetStopByStopID(parentStopId)
+		if err != nil {
+			return nil, errors.New("invalid parent stop id")
 		}
+		return parentStop, nil
+	} else {
+		//stop has no parent/is a parent
+		return childStop, nil
 	}
-
-	// If no stops were found, return a custom error
-	if len(result) == 0 {
-		return nil, errors.New("no child stops found")
-	}
-
-	return result, nil
 }
 
 func (v Database) GetStopsByRouteId(routeId string) (Stops, error) {
