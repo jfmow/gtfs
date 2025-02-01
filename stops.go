@@ -458,7 +458,7 @@ func (v Database) GetStopsByRouteId(routeId string) ([]Stop, error) {
 /*
 Search the db of stops for a partial name match of a stop
 */
-func (v Database) SearchForStopsByName(searchText string, includeChildStops bool) ([]StopSearch, error) {
+func (v Database) SearchForStopsByNameOrCode(searchText string, includeChildStops bool) ([]StopSearch, error) {
 	// Normalize the input search text and make it lowercase
 	normalizedSearchText := strings.ToLower(searchText)
 
@@ -473,10 +473,15 @@ func (v Database) SearchForStopsByName(searchText string, includeChildStops bool
 			stops
 		WHERE
 			LOWER(stop_name) LIKE ?
+		OR
+			stop_code LIKE ?
+		OR
+			stop_name || ' ' || stop_code LIKE ?
 	`
 
 	// Run the query
-	rows, err := v.db.Query(query, "%"+normalizedSearchText+"%")
+	parametrizedString := "%" + normalizedSearchText + "%"
+	rows, err := v.db.Query(query, parametrizedString, parametrizedString, parametrizedString)
 	if err != nil {
 		return nil, err
 	}
