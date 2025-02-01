@@ -25,7 +25,7 @@ type TripUpdatesMap map[string]TripUpdate
 func (v tripUpdates) GetTripUpdates() (TripUpdatesMap, error) {
 	tripUpdateApiRequestMutex.Lock()
 	defer tripUpdateApiRequestMutex.Unlock()
-	if cachedTripUpdatesData[v.name] != nil && len(cachedTripUpdatesData[v.name]) >= 1 && lastUpdatedTripUpdatesCache.Add(15*time.Second).After(time.Now()) {
+	if cachedTripUpdatesData[v.name] != nil && len(cachedTripUpdatesData[v.name]) >= 1 && lastUpdatedTripUpdatesCache.Add(v.refreshPeriod).After(time.Now()) {
 		return cachedTripUpdatesData[v.name], nil
 	}
 

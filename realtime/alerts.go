@@ -25,7 +25,7 @@ type AlertMap []Alert
 func (v alerts) GetAlerts() (AlertMap, error) {
 	alertApiRequestMutex.Lock()
 	defer alertApiRequestMutex.Unlock()
-	if cachedAlertsData[v.name] != nil && len(cachedAlertsData[v.name]) >= 1 && lastUpdatedAlertsCache.Add(15*time.Second).After(time.Now()) {
+	if cachedAlertsData[v.name] != nil && len(cachedAlertsData[v.name]) >= 1 && lastUpdatedAlertsCache.Add(v.refreshPeriod).After(time.Now()) {
 		return cachedAlertsData[v.name], nil
 	}
 

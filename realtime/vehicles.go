@@ -25,7 +25,7 @@ type VehiclesMap map[string]Vehicle
 func (v vehicles) GetVehicles() (VehiclesMap, error) {
 	vehiclesApiRequestMutex.Lock()
 	defer vehiclesApiRequestMutex.Unlock()
-	if cachedVehiclesData[v.name] != nil && len(cachedVehiclesData[v.name]) >= 1 && lastUpdatedVehiclesCache.Add(15*time.Second).After(time.Now()) {
+	if cachedVehiclesData[v.name] != nil && len(cachedVehiclesData[v.name]) >= 1 && lastUpdatedVehiclesCache.Add(v.refreshPeriod).After(time.Now()) {
 		return cachedVehiclesData[v.name], nil
 	}
 
