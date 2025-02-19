@@ -17,7 +17,7 @@ var (
 
 var (
 	cachedVehiclesData       map[string]VehiclesMap = make(map[string]VehiclesMap)
-	lastUpdatedVehiclesCache time.Time
+	lastUpdatedVehiclesCache map[string]time.Time   = make(map[string]time.Time)
 )
 
 type VehiclesMap map[string]Vehicle
@@ -25,7 +25,7 @@ type VehiclesMap map[string]Vehicle
 func (v vehicles) GetVehicles() (VehiclesMap, error) {
 	vehiclesApiRequestMutex.Lock()
 	defer vehiclesApiRequestMutex.Unlock()
-	if cachedVehiclesData[v.name] != nil && len(cachedVehiclesData[v.name]) >= 1 && lastUpdatedVehiclesCache.Add(v.refreshPeriod).After(time.Now()) {
+	if cachedVehiclesData[v.name] != nil && len(cachedVehiclesData[v.name]) >= 1 && lastUpdatedVehiclesCache[v.name].Add(v.refreshPeriod).After(time.Now()) {
 		return cachedVehiclesData[v.name], nil
 	}
 
@@ -74,7 +74,7 @@ func (v vehicles) GetVehicles() (VehiclesMap, error) {
 	}
 
 	cachedVehiclesData[v.name] = vehicles
-	lastUpdatedVehiclesCache = time.Now()
+	lastUpdatedVehiclesCache[v.name] = time.Now()
 
 	return vehicles, nil
 }

@@ -17,7 +17,7 @@ var (
 
 var (
 	cachedTripUpdatesData       map[string]TripUpdatesMap = make(map[string]TripUpdatesMap)
-	lastUpdatedTripUpdatesCache time.Time
+	lastUpdatedTripUpdatesCache map[string]time.Time      = make(map[string]time.Time)
 )
 
 type TripUpdatesMap map[string]TripUpdate
@@ -25,7 +25,7 @@ type TripUpdatesMap map[string]TripUpdate
 func (v tripUpdates) GetTripUpdates() (TripUpdatesMap, error) {
 	tripUpdateApiRequestMutex.Lock()
 	defer tripUpdateApiRequestMutex.Unlock()
-	if cachedTripUpdatesData[v.name] != nil && len(cachedTripUpdatesData[v.name]) >= 1 && lastUpdatedTripUpdatesCache.Add(v.refreshPeriod).After(time.Now()) {
+	if cachedTripUpdatesData[v.name] != nil && len(cachedTripUpdatesData[v.name]) >= 1 && lastUpdatedTripUpdatesCache[v.name].Add(v.refreshPeriod).After(time.Now()) {
 		return cachedTripUpdatesData[v.name], nil
 	}
 
@@ -76,7 +76,7 @@ func (v tripUpdates) GetTripUpdates() (TripUpdatesMap, error) {
 	}
 
 	cachedTripUpdatesData[v.name] = updates
-	lastUpdatedTripUpdatesCache = time.Now()
+	lastUpdatedTripUpdatesCache[v.name] = time.Now()
 
 	return updates, nil
 }

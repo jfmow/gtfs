@@ -16,8 +16,8 @@ var (
 )
 
 var (
-	cachedAlertsData       map[string]AlertMap = make(map[string]AlertMap)
-	lastUpdatedAlertsCache time.Time
+	cachedAlertsData       map[string]AlertMap  = make(map[string]AlertMap)
+	lastUpdatedAlertsCache map[string]time.Time = make(map[string]time.Time)
 )
 
 type AlertMap []Alert
@@ -25,7 +25,7 @@ type AlertMap []Alert
 func (v alerts) GetAlerts() (AlertMap, error) {
 	alertApiRequestMutex.Lock()
 	defer alertApiRequestMutex.Unlock()
-	if cachedAlertsData[v.name] != nil && len(cachedAlertsData[v.name]) >= 1 && lastUpdatedAlertsCache.Add(v.refreshPeriod).After(time.Now()) {
+	if cachedAlertsData[v.name] != nil && len(cachedAlertsData[v.name]) >= 1 && lastUpdatedAlertsCache[v.name].Add(v.refreshPeriod).After(time.Now()) {
 		return cachedAlertsData[v.name], nil
 	}
 
@@ -76,7 +76,7 @@ func (v alerts) GetAlerts() (AlertMap, error) {
 	}
 
 	cachedAlertsData[v.name] = alerts
-	lastUpdatedAlertsCache = time.Now()
+	lastUpdatedAlertsCache[v.name] = time.Now()
 
 	return alerts, nil
 }

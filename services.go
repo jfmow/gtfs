@@ -10,16 +10,17 @@ import (
 )
 
 type StopTimes struct {
-	TripID        string `json:"trip_id"`
-	ArrivalTime   string `json:"arrival_time"`
-	DepartureTime string `json:"departure_time"`
-	StopId        string `json:"stop_id"`
-	StopSequence  int    `json:"stop_sequence"`
-	StopHeadsign  string `json:"stop_headsign"`
-	Platform      string `json:"platform"`
-	StopData      Stop   `json:"stop_data"`
-	TripData      Trip   `json:"trip_data"`
-	RouteColor    string `json:"route_color"`
+	TripID         string `json:"trip_id"`
+	ArrivalTime    string `json:"arrival_time"`
+	DepartureTime  string `json:"departure_time"`
+	StopId         string `json:"stop_id"`
+	StopSequence   int    `json:"stop_sequence"`
+	StopHeadsign   string `json:"stop_headsign"`
+	Platform       string `json:"platform"`
+	StopData       Stop   `json:"stop_data"`
+	TripData       Trip   `json:"trip_data"`
+	RouteColor     string `json:"route_color"`
+	RouteShortName string `json:"route_short_name"`
 }
 
 /*
@@ -84,6 +85,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date string
 		st.stop_sequence, 
 		st.stop_headsign, 
 		r.route_color, 
+		r.route_short_name,
 		s.stop_name, 
 		s.stop_lat, 
 		s.stop_lon, 
@@ -165,6 +167,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date string
 			StopLocationType    int
 			StopParentStationId string
 			Platform            string
+			RouteShortName      string
 		}
 
 		// Scan the results into StopTimes, Stop, and Trip
@@ -181,6 +184,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date string
 			&result.StopSequence,
 			&result.StopHeadsign,
 			&result.RouteColor,
+			&result.RouteShortName,
 			&result.StopName,
 			&result.StopLat,
 			&result.StopLon,
@@ -221,16 +225,17 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date string
 		}
 
 		var stopTimeData StopTimes = StopTimes{
-			TripID:        result.TripId,
-			ArrivalTime:   result.ArrivalTime,
-			DepartureTime: result.DepartureTime,
-			StopId:        result.StopId,
-			StopSequence:  result.StopSequence,
-			StopHeadsign:  result.StopHeadsign,
-			Platform:      result.Platform,
-			StopData:      stopData,
-			TripData:      tripData,
-			RouteColor:    result.RouteColor,
+			TripID:         result.TripId,
+			ArrivalTime:    result.ArrivalTime,
+			DepartureTime:  result.DepartureTime,
+			StopId:         result.StopId,
+			StopSequence:   result.StopSequence,
+			StopHeadsign:   result.StopHeadsign,
+			Platform:       result.Platform,
+			StopData:       stopData,
+			TripData:       tripData,
+			RouteColor:     result.RouteColor,
+			RouteShortName: result.RouteShortName,
 		}
 
 		// Append the result
@@ -273,6 +278,7 @@ func (v Database) GetServiceByTripAndStop(tripID, stopId, departureTimeFilter st
 			st.stop_sequence, 
 			st.stop_headsign, 
 			r.route_color, 
+			r.route_short_name,
 			s.stop_name, 
 			s.stop_lat, 
 			s.stop_lon, 
@@ -322,6 +328,7 @@ func (v Database) GetServiceByTripAndStop(tripID, stopId, departureTimeFilter st
 		StopLocationType    int
 		StopParentStationId string
 		Platform            string
+		RouteShortName      string
 	}
 
 	// Scan the result into the struct
@@ -338,6 +345,7 @@ func (v Database) GetServiceByTripAndStop(tripID, stopId, departureTimeFilter st
 		&result.StopSequence,
 		&result.StopHeadsign,
 		&result.RouteColor,
+		&result.RouteShortName,
 		&result.StopName,
 		&result.StopLat,
 		&result.StopLon,
@@ -383,15 +391,16 @@ func (v Database) GetServiceByTripAndStop(tripID, stopId, departureTimeFilter st
 
 	// Combine the data into StopTimes struct
 	var stopTimeData StopTimes = StopTimes{
-		TripID:        result.TripId,
-		ArrivalTime:   result.ArrivalTime,
-		DepartureTime: result.DepartureTime,
-		StopId:        result.StopId,
-		StopSequence:  result.StopSequence,
-		StopHeadsign:  result.StopHeadsign,
-		Platform:      result.Platform,
-		StopData:      stopData,
-		TripData:      tripData,
+		TripID:         result.TripId,
+		ArrivalTime:    result.ArrivalTime,
+		DepartureTime:  result.DepartureTime,
+		StopId:         result.StopId,
+		StopSequence:   result.StopSequence,
+		StopHeadsign:   result.StopHeadsign,
+		Platform:       result.Platform,
+		StopData:       stopData,
+		TripData:       tripData,
+		RouteShortName: result.RouteShortName,
 	}
 
 	// Check for any error during the query execution
