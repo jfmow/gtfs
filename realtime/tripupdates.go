@@ -1,17 +1,12 @@
 package realtime
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"net/http"
 	"sync"
 	"time"
 )
 
 var (
-	tripUpdateClient          = &http.Client{}
 	tripUpdateApiRequestMutex sync.Mutex
 )
 
@@ -22,57 +17,27 @@ var (
 
 type TripUpdatesMap map[string]TripUpdate
 
-func (v RealtimeRedo) GetTripUpdates() (TripUpdatesMap, error) {
+func (v Realtime) GetTripUpdates() (TripUpdatesMap, error) {
 	tripUpdateApiRequestMutex.Lock()
 	defer tripUpdateApiRequestMutex.Unlock()
 	if cachedTripUpdatesData[v.uuid] != nil && len(cachedTripUpdatesData[v.uuid]) >= 1 && lastUpdatedTripUpdatesCache[v.uuid].Add(v.refreshPeriod).After(time.Now()) {
 		return cachedTripUpdatesData[v.uuid], nil
 	}
 
-	url := v.tripUpdatesUrl
-	req, err := http.NewRequest("GET", url, nil)
+	result, err := fetchData[[]struct {
+		ID         string     `json:"id"`
+		TripUpdate TripUpdate `json:"trip_update"`
+		IsDeleted  bool       `json:"is_deleted"`
+	}](v.tripUpdatesUrl, v.apiHeader, v.apiKey)
 	if err != nil {
-		return nil, fmt.Errorf("error creating request: %w", err)
-	}
-	req.Header.Set("Cache-Control", "no-cache")
-	if v.apiHeader != "" {
-		req.Header.Set(v.apiHeader, v.apiKey)
-	}
-
-	resp, err := tripUpdateClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error making request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error reading response body: %w", err)
-	}
-
-	var result TripUpdatesResponse
-	err = json.Unmarshal(body, &result)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing JSON: %w", err)
+		return nil, err
 	}
 
 	var updates = make(TripUpdatesMap)
 
-	// Check if Status is present
-	if result.Status != nil {
-		// Handle case where Status and Response are present
-		if result.Response != nil {
-			for _, i := range result.Response.Entity {
-				i.TripUpdate.ID = i.ID
-				updates[i.TripUpdate.Trip.TripID] = i.TripUpdate
-			}
-		}
-	} else {
-		// Handle case where Status and Response are not present (use header and entity)
-		for _, i := range result.Entity {
-			i.TripUpdate.ID = i.ID
-			updates[i.TripUpdate.Trip.TripID] = i.TripUpdate
-		}
+	for _, i := range result {
+		i.TripUpdate.ID = i.ID
+		updates[i.TripUpdate.Trip.TripID] = i.TripUpdate
 	}
 
 	cachedTripUpdatesData[v.uuid] = updates
@@ -87,32 +52,6 @@ func (trips TripUpdatesMap) ByTripID(tripID string) (TripUpdate, error) {
 		return TripUpdate{}, errors.New("no trip update found for trip id")
 	}
 	return trip, nil
-}
-
-type TripUpdatesResponse struct {
-	Status   *string `json:"status,omitempty"` // Pointer to string to handle missing fields
-	Response *struct {
-		Header struct {
-			Timestamp           float64 `json:"timestamp"`
-			GtfsRealtimeVersion string  `json:"gtfs_realtime_version"`
-			Incrementality      int64   `json:"incrementality"`
-		} `json:"header"`
-		Entity []struct {
-			ID         string     `json:"id"`
-			TripUpdate TripUpdate `json:"trip_update"`
-			IsDeleted  bool       `json:"is_deleted"`
-		} `json:"entity"`
-	} `json:"response,omitempty"` // Pointer to struct for optional presence
-	Header struct {
-		Timestamp           float64 `json:"timestamp"`
-		GtfsRealtimeVersion string  `json:"gtfs_realtime_version"`
-		Incrementality      int64   `json:"incrementality"`
-	} `json:"header"`
-	Entity []struct {
-		ID         string     `json:"id"`
-		TripUpdate TripUpdate `json:"trip_update"`
-		IsDeleted  bool       `json:"is_deleted"`
-	} `json:"entity"`
 }
 
 type TripUpdate struct {

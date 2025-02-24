@@ -1,17 +1,12 @@
 package realtime
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"net/http"
 	"sync"
 	"time"
 )
 
 var (
-	alertClient          = &http.Client{}
 	alertApiRequestMutex sync.Mutex
 )
 
@@ -22,57 +17,27 @@ var (
 
 type AlertMap []Alert
 
-func (v RealtimeRedo) GetAlerts() (AlertMap, error) {
+func (v Realtime) GetAlerts() (AlertMap, error) {
 	alertApiRequestMutex.Lock()
 	defer alertApiRequestMutex.Unlock()
 	if cachedAlertsData[v.uuid] != nil && len(cachedAlertsData[v.uuid]) >= 1 && lastUpdatedAlertsCache[v.uuid].Add(v.refreshPeriod).After(time.Now()) {
 		return cachedAlertsData[v.uuid], nil
 	}
 
-	url := v.alertsUrl
-	req, err := http.NewRequest("GET", url, nil)
+	result, err := fetchData[[]struct {
+		ID        string `json:"id"`
+		Alert     Alert  `json:"alert"`
+		Timestamp string `json:"timestamp"`
+	}](v.alertsUrl, v.apiHeader, v.apiKey)
 	if err != nil {
-		return nil, fmt.Errorf("error creating request: %w", err)
-	}
-	req.Header.Set("Cache-Control", "no-cache")
-	if v.apiHeader != "" {
-		req.Header.Set(v.apiHeader, v.apiKey)
-	}
-
-	resp, err := alertClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error making request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error reading response body: %w", err)
-	}
-
-	var result alertResponse
-	err = json.Unmarshal(body, &result)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing JSON: %w", err)
+		return nil, err
 	}
 
 	var alerts AlertMap
 
-	// Check if Status is present
-	if result.Status != nil {
-		// Handle case where Status and Response are present
-		if result.Response != nil {
-			for _, i := range result.Response.Entity {
-				i.Alert.ID = i.ID
-				alerts = append(alerts, i.Alert)
-			}
-		}
-	} else {
-		// Handle case where Status and Response are not present (use header and entity)
-		for _, i := range result.Entity {
-			i.Alert.ID = i.ID
-			alerts = append(alerts, i.Alert)
-		}
+	for _, i := range result {
+		i.Alert.ID = i.ID
+		alerts = append(alerts, i.Alert)
 	}
 
 	cachedAlertsData[v.uuid] = alerts
@@ -95,32 +60,6 @@ func (alerts AlertMap) FindAlertsByRouteId(routeId string) (AlertMap, error) {
 		return AlertMap{}, errors.New("no alerts found for route/stop")
 	}
 	return sorted, nil
-}
-
-type alertResponse struct {
-	Status   *string `json:"status,omitempty"`
-	Response *struct {
-		Header struct {
-			Timestamp           float64 `json:"timestamp"`
-			GtfsRealtimeVersion string  `json:"gtfs_realtime_version"`
-			Incrementality      int64   `json:"incrementality"`
-		} `json:"header"`
-		Entity []struct {
-			ID        string `json:"id"`
-			Alert     Alert  `json:"alert"`
-			Timestamp string `json:"timestamp"`
-		} `json:"entity"`
-	} `json:"response,omitempty"`
-	Header struct {
-		Timestamp           float64 `json:"timestamp"`
-		GtfsRealtimeVersion string  `json:"gtfs_realtime_version"`
-		Incrementality      int64   `json:"incrementality"`
-	} `json:"header"`
-	Entity []struct {
-		ID        string `json:"id"`
-		Alert     Alert  `json:"alert"`
-		Timestamp string `json:"timestamp"`
-	} `json:"entity"`
 }
 
 type Alert struct {

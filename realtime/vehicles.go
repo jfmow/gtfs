@@ -4,14 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"sync"
 	"time"
 )
 
 var (
-	vehiclesClient          = &http.Client{}
 	vehiclesApiRequestMutex sync.Mutex
 )
 
@@ -22,55 +19,26 @@ var (
 
 type VehiclesMap map[string]Vehicle
 
-func (v RealtimeRedo) GetVehicles() (VehiclesMap, error) {
+func (v Realtime) GetVehicles() (VehiclesMap, error) {
 	vehiclesApiRequestMutex.Lock()
 	defer vehiclesApiRequestMutex.Unlock()
 	if cachedVehiclesData[v.uuid] != nil && len(cachedVehiclesData[v.uuid]) >= 1 && lastUpdatedVehiclesCache[v.uuid].Add(v.refreshPeriod).After(time.Now()) {
 		return cachedVehiclesData[v.uuid], nil
 	}
 
-	url := v.vehiclesUrl
-	req, err := http.NewRequest("GET", url, nil)
+	result, err := fetchData[[]struct {
+		ID        string  `json:"id"`
+		Vehicle   Vehicle `json:"vehicle"`
+		IsDeleted bool    `json:"is_deleted"`
+	}](v.vehiclesUrl, v.apiHeader, v.apiKey)
 	if err != nil {
-		return nil, fmt.Errorf("error creating request: %w", err)
-	}
-	req.Header.Set("Cache-Control", "no-cache")
-	if v.apiHeader != "" {
-		req.Header.Set(v.apiHeader, v.apiKey)
-	}
-
-	resp, err := vehiclesClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error making request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error reading response body: %w", err)
-	}
-
-	var result VehicleResponse
-	err = json.Unmarshal(body, &result)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing JSON: %w", err)
+		return nil, err
 	}
 
 	var vehicles = make(VehiclesMap)
 
-	// Check if Status is present
-	if result.Status != nil {
-		// Handle case where Status and Response are present
-		if result.Response != nil {
-			for _, i := range result.Response.Entity {
-				vehicles[i.Vehicle.Trip.TripID] = i.Vehicle
-			}
-		}
-	} else {
-		// Handle case where Status and Response are not present (use header and entity)
-		for _, i := range result.Entity {
-			vehicles[i.Vehicle.Trip.TripID] = i.Vehicle
-		}
+	for _, i := range result {
+		vehicles[i.Vehicle.Trip.TripID] = i.Vehicle
 	}
 
 	cachedVehiclesData[v.uuid] = vehicles
@@ -79,40 +47,12 @@ func (v RealtimeRedo) GetVehicles() (VehiclesMap, error) {
 	return vehicles, nil
 }
 
-func (vehicles VehiclesMap) GetVehicleByTripID(tripID string) (Vehicle, error) {
+func (vehicles VehiclesMap) ByTripID(tripID string) (Vehicle, error) {
 	vehicle, found := vehicles[tripID]
 	if !found {
 		return Vehicle{}, errors.New("no vehicle found for trip id")
 	}
 	return vehicle, nil
-}
-
-//Structs
-
-type VehicleResponse struct {
-	Status   *string `json:"status,omitempty"`
-	Response *struct {
-		Header struct {
-			Timestamp           float64 `json:"timestamp"`
-			GtfsRealtimeVersion string  `json:"gtfs_realtime_version"`
-			Incrementality      int64   `json:"incrementality"`
-		} `json:"header"`
-		Entity []struct {
-			ID        string  `json:"id"`
-			Vehicle   Vehicle `json:"vehicle"`
-			IsDeleted bool    `json:"is_deleted"`
-		} `json:"entity"`
-	} `json:"response,omitempty"`
-	Header struct {
-		Timestamp           float64 `json:"timestamp"`
-		GtfsRealtimeVersion string  `json:"gtfs_realtime_version"`
-		Incrementality      int64   `json:"incrementality"`
-	} `json:"header"`
-	Entity []struct {
-		ID        string  `json:"id"`
-		Vehicle   Vehicle `json:"vehicle"`
-		IsDeleted bool    `json:"is_deleted"`
-	} `json:"entity"`
 }
 
 type Vehicle struct {
