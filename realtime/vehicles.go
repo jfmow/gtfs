@@ -26,9 +26,6 @@ func (v RealtimeRedo) GetVehicles() (VehiclesMap, error) {
 	vehiclesApiRequestMutex.Lock()
 	defer vehiclesApiRequestMutex.Unlock()
 	if cachedVehiclesData[v.uuid] != nil && len(cachedVehiclesData[v.uuid]) >= 1 && lastUpdatedVehiclesCache[v.uuid].Add(v.refreshPeriod).After(time.Now()) {
-		fmt.Println("Returning cached vehicles data")
-		fmt.Println(v.uuid)
-		fmt.Println(" ")
 		return cachedVehiclesData[v.uuid], nil
 	}
 
