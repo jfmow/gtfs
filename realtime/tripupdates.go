@@ -22,14 +22,14 @@ var (
 
 type TripUpdatesMap map[string]TripUpdate
 
-func (v tripUpdates) GetTripUpdates() (TripUpdatesMap, error) {
+func (v RealtimeRedo) GetTripUpdates() (TripUpdatesMap, error) {
 	tripUpdateApiRequestMutex.Lock()
 	defer tripUpdateApiRequestMutex.Unlock()
-	if cachedTripUpdatesData[v.name] != nil && len(cachedTripUpdatesData[v.name]) >= 1 && lastUpdatedTripUpdatesCache[v.name].Add(v.refreshPeriod).After(time.Now()) {
-		return cachedTripUpdatesData[v.name], nil
+	if cachedTripUpdatesData[v.uuid] != nil && len(cachedTripUpdatesData[v.uuid]) >= 1 && lastUpdatedTripUpdatesCache[v.uuid].Add(v.refreshPeriod).After(time.Now()) {
+		return cachedTripUpdatesData[v.uuid], nil
 	}
 
-	url := v.url
+	url := v.tripUpdatesUrl
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
@@ -75,8 +75,8 @@ func (v tripUpdates) GetTripUpdates() (TripUpdatesMap, error) {
 		}
 	}
 
-	cachedTripUpdatesData[v.name] = updates
-	lastUpdatedTripUpdatesCache[v.name] = time.Now()
+	cachedTripUpdatesData[v.uuid] = updates
+	lastUpdatedTripUpdatesCache[v.uuid] = time.Now()
 
 	return updates, nil
 }

@@ -22,14 +22,14 @@ var (
 
 type AlertMap []Alert
 
-func (v alerts) GetAlerts() (AlertMap, error) {
+func (v RealtimeRedo) GetAlerts() (AlertMap, error) {
 	alertApiRequestMutex.Lock()
 	defer alertApiRequestMutex.Unlock()
-	if cachedAlertsData[v.name] != nil && len(cachedAlertsData[v.name]) >= 1 && lastUpdatedAlertsCache[v.name].Add(v.refreshPeriod).After(time.Now()) {
-		return cachedAlertsData[v.name], nil
+	if cachedAlertsData[v.uuid] != nil && len(cachedAlertsData[v.uuid]) >= 1 && lastUpdatedAlertsCache[v.uuid].Add(v.refreshPeriod).After(time.Now()) {
+		return cachedAlertsData[v.uuid], nil
 	}
 
-	url := v.url
+	url := v.alertsUrl
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
@@ -75,8 +75,8 @@ func (v alerts) GetAlerts() (AlertMap, error) {
 		}
 	}
 
-	cachedAlertsData[v.name] = alerts
-	lastUpdatedAlertsCache[v.name] = time.Now()
+	cachedAlertsData[v.uuid] = alerts
+	lastUpdatedAlertsCache[v.uuid] = time.Now()
 
 	return alerts, nil
 }

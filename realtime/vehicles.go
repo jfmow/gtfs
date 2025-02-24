@@ -22,14 +22,17 @@ var (
 
 type VehiclesMap map[string]Vehicle
 
-func (v vehicles) GetVehicles() (VehiclesMap, error) {
+func (v RealtimeRedo) GetVehicles() (VehiclesMap, error) {
 	vehiclesApiRequestMutex.Lock()
 	defer vehiclesApiRequestMutex.Unlock()
-	if cachedVehiclesData[v.name] != nil && len(cachedVehiclesData[v.name]) >= 1 && lastUpdatedVehiclesCache[v.name].Add(v.refreshPeriod).After(time.Now()) {
-		return cachedVehiclesData[v.name], nil
+	if cachedVehiclesData[v.uuid] != nil && len(cachedVehiclesData[v.uuid]) >= 1 && lastUpdatedVehiclesCache[v.uuid].Add(v.refreshPeriod).After(time.Now()) {
+		fmt.Println("Returning cached vehicles data")
+		fmt.Println(v.uuid)
+		fmt.Println(" ")
+		return cachedVehiclesData[v.uuid], nil
 	}
 
-	url := v.url
+	url := v.vehiclesUrl
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
@@ -73,8 +76,8 @@ func (v vehicles) GetVehicles() (VehiclesMap, error) {
 		}
 	}
 
-	cachedVehiclesData[v.name] = vehicles
-	lastUpdatedVehiclesCache[v.name] = time.Now()
+	cachedVehiclesData[v.uuid] = vehicles
+	lastUpdatedVehiclesCache[v.uuid] = time.Now()
 
 	return vehicles, nil
 }
