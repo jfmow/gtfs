@@ -149,26 +149,31 @@ func writeFilesToDB(zipData []byte, v Database) error {
 
 	return nil
 }
-
 func insertRecord(tx *sql.Tx, tableName string, record []CSVRecord) {
 	headers := getHeaders(record)
-	placeholders := make([]string, len(headers))
-	for i := range placeholders {
-		placeholders[i] = "?"
+	var placeholders []string
+	var values []interface{}
+	var filteredHeaders []string
+
+	for i, field := range record {
+		if field.Data != "" {
+			placeholders = append(placeholders, "?")
+			values = append(values, field.Data)
+			filteredHeaders = append(filteredHeaders, headers[i])
+		}
+	}
+
+	if len(values) == 0 {
+		log.Println("Skipping insert: No valid data in record")
+		return
 	}
 
 	insertSQL := fmt.Sprintf(`INSERT INTO %s (%s) VALUES (%s);`,
 		tableName,
-		strings.Join(headers, ", "),
+		strings.Join(filteredHeaders, ", "),
 		strings.Join(placeholders, ", "),
 	)
 
-	var values []interface{}
-	for _, field := range record {
-		values = append(values, field.Data)
-	}
-
-	//fmt.Println("Inserting record into table:", tableName)
 	_, err := tx.Exec(insertSQL, values...)
 	if err != nil {
 		log.Fatalf("Failed to insert record into table %s: %v", tableName, err)
