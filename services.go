@@ -31,18 +31,13 @@ Get all the services stopping at a given stop (child stop/parent with not childr
   - limit: the amount of services to get. REQUIRED
   - date: "20060102"
 */
-func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date string, limit int) ([]StopTimes, error) {
+func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.Time, limit int) ([]StopTimes, error) {
 	// Open the SQLite database
 	db := v.db // Assuming db is already connected, if not, you can open it here
 
-	now := time.Now().In(v.timeZone)
+	now := date
 	dayColumn := strings.ToLower(now.Weekday().String())
-	var dateString string
-	if date != "" {
-		dateString = date
-	} else {
-		dateString = now.Format("20060102")
-	}
+	dateString := now.Format("20060102")
 
 	// Base query with placeholders for the date and dynamic weekday column
 	query := fmt.Sprintf(`
@@ -126,9 +121,9 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date string
 	var err error
 	if departureTimeFilter != "" && stopID != "" {
 		rows, err = db.Query(query, dateString, dateString, dateString, dateString, departureTimeFilter, stopID)
-	} else if departureTimeFilter != "" {
+	} else if departureTimeFilter != "" && stopID == "" {
 		rows, err = db.Query(query, dateString, dateString, dateString, dateString, departureTimeFilter)
-	} else if stopID != "" {
+	} else if stopID != "" && departureTimeFilter == "" {
 		rows, err = db.Query(query, dateString, dateString, dateString, dateString, stopID)
 	} else {
 		rows, err = db.Query(query, dateString, dateString, dateString, dateString)
