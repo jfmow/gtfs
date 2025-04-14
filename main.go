@@ -14,18 +14,21 @@ type Database struct {
 	timeZone    *time.Location
 	mailToEmail string
 	apiKey      ApiKey
+	name        string
 }
 
 /*
 # Creates a new gtfs instance
 
-  - url: url to gtfs .zip
+  - url: url to gtfs .zip (e.g., "https://example.com/gtfs.zip")
 
-  - databaseName: the name for the .db file to be created with
+  - databaseName: the name for the .db file to be created with (e.g., "transit_data.db")
 
-  - tz: the timezone to process gtfs with
+  - tz: the timezone to process gtfs with (e.g., time.UTC)
 
-  - mailToEmail: the email to use with notifications (e.g hi@example.com (NOT: mailto:hi@example.com))
+  - mailToEmail: the email to use with notifications (e.g., "hi@example.com" (NOT: "mailto:hi@example.com"))
+
+  - **apiKey**: --optional field--, only required if the gtfs.zip file requires an API key in the request (e.g., "your-api-key").
 */
 func New(url string, apiKey ApiKey, databaseName string, tz *time.Location, mailToEmail string) (Database, error) {
 	database, err := newDatabase(url, apiKey, databaseName, tz, mailToEmail)
@@ -37,10 +40,10 @@ func New(url string, apiKey ApiKey, databaseName string, tz *time.Location, mail
 	isUpToDate, err := database.IsFeedDataUpToDate()
 
 	if !isUpToDate || err != nil {
-		fmt.Println("Feed data is not up to date.")
+		fmt.Println("Feed data is not up to date: " + databaseName)
 		database.refreshDatabaseData()
 	} else {
-		fmt.Println("Feed data is still up to date.")
+		fmt.Println("Feed data is still up to date: " + databaseName)
 		database.createIndexes()
 	}
 

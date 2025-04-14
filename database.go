@@ -21,6 +21,9 @@ func newDatabase(url string, apiKey ApiKey, databaseName string, tz *time.Locati
 	if len(databaseName) < 3 {
 		return Database{}, errors.New("database name to short >3")
 	}
+	if mailToEmail == "" {
+		return Database{}, errors.New("missing mailToEmail")
+	}
 
 	os.Mkdir(filepath.Join(GetWorkDir(), "gtfs"), os.ModePerm)
 
@@ -35,9 +38,8 @@ func newDatabase(url string, apiKey ApiKey, databaseName string, tz *time.Locati
 	if err != nil {
 		panic("Failed to set WAL mode")
 	}
-
 	// Initialize the Database struct
-	database := Database{db: db, url: url, timeZone: tz, mailToEmail: mailToEmail, apiKey: apiKey}
+	database := Database{db: db, url: url, timeZone: tz, mailToEmail: mailToEmail, apiKey: apiKey, name: databaseName}
 	return database, nil
 }
 
@@ -409,28 +411,37 @@ func (v Database) createTableIfNotExists(tableName string, headers []string) {
 	}
 }
 
-func (v Database) refreshDatabaseData() {
-	fmt.Println("Updating database data...")
+func (v Database) refreshDatabaseData() error {
+	log.Println("Updating database data: " + v.name)
 
-	err := v.deleteOldData()
+	log.Println("Fetching new gtfs data.")
+	// Fetch and write new data
+	data, err := fetchZip(v.url, v.apiKey)
 	if err != nil {
+		log.Printf("Failed to fetch new data: %v", err)
+		return err
+	}
+
+	log.Println("Downloaded new gtfs data.")
+
+	log.Println("Deleting old gtfs database")
+	if err := v.deleteOldData(); err != nil {
 		log.Printf("Failed to delete old data: %v \n(Old data may not exist yet)", err)
+		return err
 	}
 
 	v.createDefaultGTFSTables()
 	v.createIndexes()
 
-	// Fetch and write new data
-	data, err := fetchZip(v.url, v.apiKey)
-	if err != nil {
-		log.Fatalf("Failed to fetch new data: %v", err)
-	}
+	log.Println("Writing new data to database")
 	err = writeFilesToDB(data, v)
 	if err != nil {
-		log.Fatalf("Failed to write new data to the database: %v", err)
+		log.Printf("Failed to write new data to the database: %v", err)
+		return err
 	}
 
 	fmt.Println("Data updated successfully.")
+	return nil
 }
 
 func (v Database) createIndexes() {

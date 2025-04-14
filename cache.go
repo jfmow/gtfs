@@ -1,6 +1,7 @@
 package gtfs
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -13,7 +14,7 @@ func Identity[T any](x T) (T, error) {
 
 // Creates a cached value that is periodically refreshed using a
 // specified refresh function and interval.
-func GenerateACache[In any, Out any](refreshFunc func() (In, error), transform func(In) (Out, error), refreshInterval time.Duration) (func() Out, error) {
+func GenerateACache[In any, Out any](refreshFunc func() (In, error), transform func(In) (Out, error), refreshInterval time.Duration, emptyValue Out) (func() Out, error) {
 	var (
 		cache Out
 		mu    sync.RWMutex
@@ -22,12 +23,16 @@ func GenerateACache[In any, Out any](refreshFunc func() (In, error), transform f
 	refreshCache := func() error {
 		data, err := refreshFunc()
 		if err != nil {
-			return err
+			cache = emptyValue
+			log.Println(err)
+			return nil
 		}
 
 		processed, err := transform(data)
 		if err != nil {
-			return err
+			cache = emptyValue
+			log.Println(err)
+			return nil
 		}
 
 		mu.Lock()
