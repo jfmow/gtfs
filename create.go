@@ -15,7 +15,12 @@ import (
 	"strings"
 )
 
-func fetchZip(url string) ([]byte, error) {
+type ApiKey struct {
+	Header string
+	Value  string
+}
+
+func fetchZip(url string, apikey ApiKey) ([]byte, error) {
 	if url == "" {
 		return nil, errors.New("missing url")
 	}
@@ -26,6 +31,9 @@ func fetchZip(url string) ([]byte, error) {
 	}
 
 	req.Header.Set("Cache-Control", "no-cache")
+	if apikey.Header != "" && apikey.Value != "" {
+		req.Header.Set(apikey.Header, apikey.Value)
+	}
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {

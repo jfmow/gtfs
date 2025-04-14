@@ -16,6 +16,8 @@ type Trip struct {
 	WheelchairAccessible int    `json:"wheelchair_accessible"`
 }
 
+type TripId string
+
 /*
 Get a trip by it's trip id
 */
@@ -58,6 +60,62 @@ func (v Database) GetTripByID(tripID string) (Trip, error) {
 	}
 
 	return trip, nil
+}
+
+/*
+Get all stored trips, key'd by tripId
+*/
+func (v Database) GetAllTrips() (map[string]Trip, error) {
+	db := v.db
+
+	query := `
+		SELECT
+			trip_id,
+			route_id,
+			trip_headsign,
+			shape_id,
+			service_id,
+			direction_id,
+			wheelchair_accessible,
+			bikes_allowed
+		FROM 
+			trips
+	`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		fmt.Println(err)
+		return nil, errors.New("problem querying db")
+	}
+
+	defer rows.Close()
+
+	var trips map[string]Trip = make(map[string]Trip)
+
+	for rows.Next() {
+		var trip Trip
+		err := rows.Scan(
+			&trip.TripID,
+			&trip.RouteID,
+			&trip.TripHeadsign,
+			&trip.ShapeID,
+			&trip.ServiceID,
+			&trip.DirectionID,
+			&trip.WheelchairAccessible,
+			&trip.BikesAllowed,
+		)
+		if err != nil {
+			fmt.Println(err)
+			return nil, errors.New("unable to scan row")
+		}
+		trips[trip.TripID] = trip
+	}
+
+	if len(trips) == 0 {
+		return nil, errors.New("no trips found")
+	}
+
+	return trips, nil
 }
 
 /*

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/jfmow/gtfs/realtime/proto"
 )
 
 var (
@@ -15,7 +17,7 @@ var (
 	lastUpdatedTripUpdatesCache map[string]time.Time      = make(map[string]time.Time)
 )
 
-type TripUpdatesMap map[string]TripUpdate
+type TripUpdatesMap map[string]*proto.TripUpdate
 
 func (v Realtime) GetTripUpdates() (TripUpdatesMap, error) {
 	tripUpdateApiRequestMutex.Lock()
@@ -24,11 +26,7 @@ func (v Realtime) GetTripUpdates() (TripUpdatesMap, error) {
 		return cachedTripUpdatesData[v.uuid], nil
 	}
 
-	result, err := fetchData[[]struct {
-		ID         string     `json:"id"`
-		TripUpdate TripUpdate `json:"trip_update"`
-		IsDeleted  bool       `json:"is_deleted"`
-	}](v.tripUpdatesUrl, v.apiHeader, v.apiKey)
+	result, err := fetchProto(v.tripUpdatesUrl, v.apiHeader, v.apiKey)
 	if err != nil {
 		return nil, err
 	}
@@ -36,8 +34,8 @@ func (v Realtime) GetTripUpdates() (TripUpdatesMap, error) {
 	var updates = make(TripUpdatesMap)
 
 	for _, i := range result {
-		i.TripUpdate.ID = i.ID
-		updates[i.TripUpdate.Trip.TripID] = i.TripUpdate
+		tripId := i.GetTripUpdate().GetTrip().GetTripId()
+		updates[tripId] = i.GetTripUpdate()
 	}
 
 	cachedTripUpdatesData[v.uuid] = updates
@@ -46,46 +44,10 @@ func (v Realtime) GetTripUpdates() (TripUpdatesMap, error) {
 	return updates, nil
 }
 
-func (trips TripUpdatesMap) ByTripID(tripID string) (TripUpdate, error) {
+func (trips TripUpdatesMap) ByTripID(tripID string) (*proto.TripUpdate, error) {
 	trip, found := trips[tripID]
 	if !found {
-		return TripUpdate{}, errors.New("no trip update found for trip id")
+		return nil, errors.New("no trip update found for trip id")
 	}
 	return trip, nil
-}
-
-type TripUpdate struct {
-	Trip           Trip           `json:"trip"`
-	StopTimeUpdate StopTimeUpdate `json:"stop_time_update"`
-	Vehicle        struct {
-		ID           string `json:"id"`
-		Label        string `json:"label"`
-		LicensePlate string `json:"license_plate"`
-	} `json:"vehicle"`
-	Timestamp int64  `json:"timestamp"`
-	Delay     int64  `json:"delay"`
-	ID        string `json:"id"`
-}
-
-type StopTimeUpdate struct {
-	StopSequence         int64   `json:"stop_sequence"`
-	Arrival              Arrival `json:"arrival"`
-	Departure            Arrival `json:"departure"`
-	StopID               string  `json:"stop_id"`
-	ScheduleRelationship int64   `json:"schedule_relationship"`
-}
-
-type Arrival struct {
-	Delay       int64 `json:"delay"`
-	Time        int64 `json:"time"`
-	Uncertainty int64 `json:"uncertainty"`
-}
-
-type Trip struct {
-	TripID               string  `json:"trip_id"`
-	StartTime            string  `json:"start_time"`
-	StartDate            string  `json:"start_date"`
-	ScheduleRelationship int64   `json:"schedule_relationship"`
-	RouteID              RouteID `json:"route_id"`
-	DirectionID          int64   `json:"direction_id"`
 }

@@ -13,6 +13,7 @@ type Database struct {
 	url         string
 	timeZone    *time.Location
 	mailToEmail string
+	apiKey      ApiKey
 }
 
 /*
@@ -26,8 +27,8 @@ type Database struct {
 
   - mailToEmail: the email to use with notifications (e.g hi@example.com (NOT: mailto:hi@example.com))
 */
-func New(url string, databaseName string, tz *time.Location, mailToEmail string) (Database, error) {
-	database, err := newDatabase(url, databaseName, tz, mailToEmail)
+func New(url string, apiKey ApiKey, databaseName string, tz *time.Location, mailToEmail string) (Database, error) {
+	database, err := newDatabase(url, apiKey, databaseName, tz, mailToEmail)
 	if err != nil {
 		panic(err)
 	}

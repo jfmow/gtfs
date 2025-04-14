@@ -14,7 +14,7 @@ import (
 	"github.com/jmoiron/sqlx"
 )
 
-func newDatabase(url string, databaseName string, tz *time.Location, mailToEmail string) (Database, error) {
+func newDatabase(url string, apiKey ApiKey, databaseName string, tz *time.Location, mailToEmail string) (Database, error) {
 	if url == "" {
 		return Database{}, errors.New("missing url")
 	}
@@ -37,7 +37,7 @@ func newDatabase(url string, databaseName string, tz *time.Location, mailToEmail
 	}
 
 	// Initialize the Database struct
-	database := Database{db: db, url: url, timeZone: tz, mailToEmail: mailToEmail}
+	database := Database{db: db, url: url, timeZone: tz, mailToEmail: mailToEmail, apiKey: apiKey}
 	return database, nil
 }
 
@@ -421,7 +421,7 @@ func (v Database) refreshDatabaseData() {
 	v.createIndexes()
 
 	// Fetch and write new data
-	data, err := fetchZip(v.url)
+	data, err := fetchZip(v.url, v.apiKey)
 	if err != nil {
 		log.Fatalf("Failed to fetch new data: %v", err)
 	}

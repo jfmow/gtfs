@@ -14,6 +14,7 @@ type Route struct {
 	RouteColor     string `json:"route_color"`
 	VehicleType    string `json:"vehicle_type"`
 }
+type RouteId string
 
 /*
 Get all the stored routes
@@ -40,10 +41,9 @@ func (v Database) GetRoutes() ([]Route, error) {
 
 	defer rows.Close() // Ensure the rows are closed after usage
 
-	// Slice to hold all the trips
+	// Map to hold all routes, initialize as empty
 	var routes []Route
 
-	// Iterate over the rows
 	for rows.Next() {
 		var route Route
 		// Scan the row data into the trip struct
@@ -60,16 +60,14 @@ func (v Database) GetRoutes() ([]Route, error) {
 		}
 
 		route.VehicleType = getRouteVehicleType(route)
-		// Append each trip to the slice
+
 		routes = append(routes, route)
 	}
 
-	// Check for any error encountered during iteration
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}
 
-	// If no trips were found, return a custom error
 	if len(routes) == 0 {
 		return nil, errors.New("no routes found")
 	}

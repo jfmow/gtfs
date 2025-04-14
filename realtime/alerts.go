@@ -4,6 +4,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/jfmow/gtfs/realtime/proto"
 )
 
 var (
@@ -15,7 +17,9 @@ var (
 	lastUpdatedAlertsCache map[string]time.Time = make(map[string]time.Time)
 )
 
-type AlertMap []Alert
+type AlertMap map[string]*proto.Alert
+type AlertSlice []*proto.Alert
+type Alert *proto.Alert
 
 func (v Realtime) GetAlerts() (AlertMap, error) {
 	alertApiRequestMutex.Lock()
@@ -24,20 +28,15 @@ func (v Realtime) GetAlerts() (AlertMap, error) {
 		return cachedAlertsData[v.uuid], nil
 	}
 
-	result, err := fetchData[[]struct {
-		ID        string `json:"id"`
-		Alert     Alert  `json:"alert"`
-		Timestamp string `json:"timestamp"`
-	}](v.alertsUrl, v.apiHeader, v.apiKey)
+	result, err := fetchProto(v.alertsUrl, v.apiHeader, v.apiKey)
 	if err != nil {
 		return nil, err
 	}
 
-	var alerts AlertMap
+	var alerts AlertMap = make(AlertMap)
 
 	for _, i := range result {
-		i.Alert.ID = i.ID
-		alerts = append(alerts, i.Alert)
+		alerts[i.GetId()] = i.Alert
 	}
 
 	cachedAlertsData[v.uuid] = alerts
@@ -47,11 +46,11 @@ func (v Realtime) GetAlerts() (AlertMap, error) {
 }
 
 func (alerts AlertMap) FindAlertsByRouteId(routeId string) (AlertMap, error) {
-	var sorted AlertMap
-	for _, i := range alerts {
-		for _, b := range i.InformedEntity {
-			if (string)(b.RouteID) == routeId || b.StopID == routeId {
-				sorted = append(sorted, i)
+	var sorted AlertMap = make(AlertMap)
+	for alertId, i := range alerts {
+		for _, b := range i.GetInformedEntity() {
+			if (string)(b.GetRouteId()) == routeId || b.GetStopId() == routeId {
+				sorted[alertId] = i
 				break
 			}
 		}
@@ -60,33 +59,4 @@ func (alerts AlertMap) FindAlertsByRouteId(routeId string) (AlertMap, error) {
 		return AlertMap{}, errors.New("no alerts found for route/stop")
 	}
 	return sorted, nil
-}
-
-type Alert struct {
-	ActivePeriod    []ActivePeriod   `json:"active_period"`
-	InformedEntity  []InformedEntity `json:"informed_entity"`
-	Cause           string           `json:"cause"`
-	Effect          string           `json:"effect"`
-	HeaderText      Text             `json:"header_text"`
-	DescriptionText Text             `json:"description_text"`
-	ID              string           `json:"alert_id"`
-}
-
-type ActivePeriod struct {
-	Start int64 `json:"start"`
-	End   int64 `json:"end"`
-}
-
-type Text struct {
-	Translation []Translation `json:"translation"`
-}
-
-type Translation struct {
-	Text     string `json:"text"`
-	Language string `json:"language"`
-}
-
-type InformedEntity struct {
-	StopID  string  `json:"stop_id"`
-	RouteID RouteID `json:"route_id"`
 }

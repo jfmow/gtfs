@@ -1,6 +1,8 @@
 module github.com/jfmow/gtfs
 
-go 1.21.6
+go 1.22
+
+toolchain go1.23.4
 
 require (
 	github.com/jmoiron/sqlx v1.4.0
@@ -9,6 +11,7 @@ require (
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -26,4 +29,7 @@ require (
 	modernc.org/token v1.1.0 // indirect
 )
 
-require modernc.org/sqlite v1.33.1
+require (
+	google.golang.org/protobuf v1.36.6
+	modernc.org/sqlite v1.33.1
+)

@@ -2,25 +2,27 @@ package realtime
 
 import (
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"regexp"
 	"time"
+
+	"github.com/jfmow/gtfs/realtime/proto" // Replace with your actual module path
+	googleProto "google.golang.org/protobuf/proto"
 )
 
 func hashKey(data string) string {
-	hash := sha256.Sum256([]byte(data)) // Get the 32-byte hash
-	return fmt.Sprintf("%x", hash)      // Convert to hex string
+	hash := sha256.Sum256([]byte(data))
+	return fmt.Sprintf("%x", hash)
 }
 
-func NewClient(ApiKey string, ApiHeader string, refreshPeriod time.Duration, vehiclesUrl, tripUpdatesUrl, alertsUrl string) (Realtime, error) {
-	if ApiKey == "" {
+func NewClient(apiKey string, apiHeader string, refreshPeriod time.Duration, vehiclesUrl, tripUpdatesUrl, alertsUrl string) (Realtime, error) {
+	if apiKey == "" {
 		return Realtime{}, errors.New("missing api key")
 	}
-	if ApiHeader == "" {
+	if apiHeader == "" {
 		return Realtime{}, errors.New("missing api header")
 	}
 
@@ -37,8 +39,8 @@ func NewClient(ApiKey string, ApiHeader string, refreshPeriod time.Duration, veh
 	}
 
 	return Realtime{
-		apiKey:         ApiKey,
-		apiHeader:      ApiHeader,
+		apiKey:         apiKey,
+		apiHeader:      apiHeader,
 		refreshPeriod:  refreshPeriod,
 		vehiclesUrl:    vehiclesUrl,
 		tripUpdatesUrl: tripUpdatesUrl,
@@ -56,79 +58,54 @@ type Realtime struct {
 	alertsUrl      string
 
 	refreshPeriod time.Duration
-
-	uuid string
+	uuid          string
 }
 
-// Returns the entity(s) from the response
-func fetchData[EntityType any](url, apiHeader, apiKey string) (EntityType, error) {
-	var zeroValue EntityType
+// Fetches and parses protobuf GTFS-realtime data
+func fetchProto(url, apiHeader, apiKey string) ([]*proto.FeedEntity, error) {
 	if url == "" {
-		return zeroValue, fmt.Errorf("fetchData: missing URL")
+		return nil, fmt.Errorf("missing URL")
 	}
 	if apiKey == "" {
-		return zeroValue, fmt.Errorf("fetchData: missing API key")
+		return nil, fmt.Errorf("missing API key")
 	}
 	if apiHeader == "" {
-		apiHeader = "Authorization" // Default header
+		apiHeader = "Authorization"
 	}
 
-	httpClient := http.Client{Timeout: 10 * time.Second}
+	client := http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return zeroValue, fmt.Errorf("fetchData: error creating request: %w", err)
+		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
 	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Accept", "application/x-protobuf")
 	req.Header.Set(apiHeader, apiKey)
 
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return zeroValue, fmt.Errorf("fetchData: error making request: %w", err)
+		return nil, fmt.Errorf("error performing request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return zeroValue, fmt.Errorf("fetchData: unexpected status code: %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return zeroValue, fmt.Errorf("fetchData: error reading response body: %w", err)
+		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
 
-	var result RealtimeResponse[EntityType]
-	if err := json.Unmarshal(body, &result); err != nil {
-		return zeroValue, fmt.Errorf("fetchData: error parsing JSON: %w", err)
+	var feed proto.FeedMessage
+	if err := googleProto.Unmarshal(body, &feed); err != nil {
+		return nil, fmt.Errorf("error unmarshalling protobuf: %w", err)
 	}
 
-	if result.Status != nil {
-		// Handle case where Status and Response are present
-		if result.Response != nil {
-			return result.Response.Entity, nil
-		}
-	} else {
-		// Handle case where Status and Response are not present (use header and entity)
-		return result.Entity, nil
+	if len(feed.Entity) == 0 {
+		return nil, errors.New("no results returned from the api")
 	}
 
-	return zeroValue, nil
-}
-
-type RealtimeResponse[T any] struct {
-	Status   *string `json:"status,omitempty"`
-	Response *struct {
-		Header struct {
-			Timestamp           float64 `json:"timestamp"`
-			GtfsRealtimeVersion string  `json:"gtfs_realtime_version"`
-			Incrementality      int64   `json:"incrementality"`
-		} `json:"header"`
-		Entity T `json:"entity"`
-	} `json:"response,omitempty"`
-	Header struct {
-		Timestamp           float64 `json:"timestamp"`
-		GtfsRealtimeVersion string  `json:"gtfs_realtime_version"`
-		Incrementality      int64   `json:"incrementality"`
-	} `json:"header"`
-	Entity T `json:"entity"`
+	return feed.Entity, nil
 }

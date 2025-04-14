@@ -27,6 +27,8 @@ type StopSearch struct {
 	TypeOfStop string `json:"type_of_stop"`
 }
 
+type StopId string
+
 /*
 Get all the stored stops
 */
@@ -57,9 +59,8 @@ func (v Database) GetStops(includeChildStops bool) ([]Stop, error) {
 	}
 	defer rows.Close() // Ensure the rows are closed after usage
 
-	var stops Stops
+	var stops []Stop
 
-	// Iterate over the rows
 	for rows.Next() {
 		var stop Stop
 		err := rows.Scan(
@@ -80,7 +81,6 @@ func (v Database) GetStops(includeChildStops bool) ([]Stop, error) {
 		stops = append(stops, stop)
 	}
 
-	// Check for any error encountered during iteration
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}
@@ -157,8 +157,10 @@ func (v Database) GetChildStopsByParentStopID(stopID string) ([]Stop, error) {
 
 /*
 Get the stops for a trip
+
+returned int is the lowest sequence returned, if -1, then its unknown
 */
-func (v Database) GetStopsForTripID(tripID string) ([]Stop, error) {
+func (v Database) GetStopsForTripID(tripID string) ([]Stop, int, error) {
 	db := v.db
 
 	query := `
@@ -186,12 +188,13 @@ func (v Database) GetStopsForTripID(tripID string) ([]Stop, error) {
 	// Execute the query
 	rows, err := db.Query(query, tripID)
 	if err != nil {
-		return nil, err
+		return nil, -1, err
 	}
 	defer rows.Close()
 
 	// Slice to hold the stops
 	var stops Stops
+	var lowestSequence = -1
 
 	// Iterate over the rows
 	for rows.Next() {
@@ -210,24 +213,96 @@ func (v Database) GetStopsForTripID(tripID string) ([]Stop, error) {
 			&stop.Sequence,
 		)
 		if err != nil {
-			return nil, err
+			return nil, -1, err
 		}
 		stop.StopType = typeOfStop(stop.StopName)
 		// Append each stop to the slice
 		stops = append(stops, stop)
+		if stop.Sequence < lowestSequence || lowestSequence == -1 {
+			lowestSequence = stop.Sequence
+		}
 	}
 
 	// Check for any error encountered during iteration
 	if err = rows.Err(); err != nil {
-		return nil, err
+		return nil, -1, err
 	}
 
 	// If no stops were found, return a custom error
 	if len(stops) == 0 {
-		return nil, errors.New("no stops found for the given trip ID")
+		return nil, -1, errors.New("no stops found for the given trip ID")
 	}
 
-	return stops, nil
+	return stops, lowestSequence, nil
+}
+
+func (v Database) GetStopsForTrips() (map[string][]Stop, error) {
+	db := v.db
+
+	query := `
+		SELECT
+			st.trip_id,
+			s.stop_id,
+			s.stop_code,
+			s.stop_name,
+			s.stop_lat,
+			s.stop_lon,
+			s.location_type,
+			s.parent_station,
+			s.platform_code,
+			s.wheelchair_boarding,
+			st.stop_sequence
+		FROM
+			stop_times st
+		JOIN
+			stops s ON st.stop_id = s.stop_id
+		ORDER BY
+			st.trip_id,
+			st.stop_sequence
+	`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	trips := make(map[string][]Stop)
+
+	for rows.Next() {
+		var tripID string
+		var stop Stop
+
+		err := rows.Scan(
+			&tripID,
+			&stop.StopId,
+			&stop.StopCode,
+			&stop.StopName,
+			&stop.StopLat,
+			&stop.StopLon,
+			&stop.LocationType,
+			&stop.ParentStation,
+			&stop.PlatformNumber,
+			&stop.WheelChairBoarding,
+			&stop.Sequence,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		stop.StopType = typeOfStop(stop.StopName)
+		trips[tripID] = append(trips[tripID], stop)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(trips) == 0 {
+		return nil, errors.New("no stops found for any trips")
+	}
+
+	return trips, nil
 }
 
 /*
@@ -393,6 +468,70 @@ func (v Database) GetParentStopByChildStopID(childStopID string) (*Stop, error) 
 	stop.StopType = typeOfStop(stop.StopName)
 
 	return &stop, nil
+}
+
+func (v Database) GetAllParentStopsByChild() (map[string]Stop, error) {
+	db := v.db
+
+	query := `
+		SELECT
+			child.stop_id AS child_id,
+			COALESCE(NULLIF(child.parent_station, ''), child.stop_id) AS parent_id,
+			parent.stop_code,
+			parent.stop_name,
+			parent.stop_lat,
+			parent.stop_lon,
+			parent.location_type,
+			parent.parent_station,
+			parent.platform_code,
+			parent.wheelchair_boarding
+		FROM
+			stops child
+		LEFT JOIN
+			stops parent ON parent.stop_id = child.parent_station
+	`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]Stop)
+
+	for rows.Next() {
+		var childID string
+		var stop Stop
+
+		err := rows.Scan(
+			&childID,
+			&stop.StopId, // This will be the resolved parent ID or the same as childID
+			&stop.StopCode,
+			&stop.StopName,
+			&stop.StopLat,
+			&stop.StopLon,
+			&stop.LocationType,
+			&stop.ParentStation,
+			&stop.PlatformNumber,
+			&stop.WheelChairBoarding,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		stop.StopType = typeOfStop(stop.StopName)
+		result[childID] = stop
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(result) == 0 {
+		return nil, errors.New("no stops found")
+	}
+
+	return result, nil
 }
 
 /*
