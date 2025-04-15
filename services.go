@@ -1,7 +1,6 @@
 package gtfs
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"regexp"
@@ -32,41 +31,47 @@ Get all the services stopping at a given stop (child stop/parent with not childr
   - date: "20060102"
 */
 func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.Time, limit int) ([]StopTimes, error) {
-	// Open the SQLite database
-	db := v.db // Assuming db is already connected, if not, you can open it here
+	if departureTimeFilter != "" {
+		_, err := time.Parse("15:04:05", departureTimeFilter)
+		if err != nil {
+			return nil, fmt.Errorf("invalid departureTimeFilter format, expected HH:MM:SS: %v", err)
+		}
+	}
+
+	if limit < 0 {
+		return nil, errors.New("limit cannot be negative")
+	}
+
+	db := v.db
 
 	now := date
 	dayColumn := strings.ToLower(now.Weekday().String())
 	dateString := now.Format("20060102")
 
-	// Base query with placeholders for the date and dynamic weekday column
-	query := fmt.Sprintf(`
+	var queryBuilder strings.Builder
+
+	fmt.Fprintf(&queryBuilder, `
 	WITH active_services AS (
-		-- Select services from the calendar where today's date falls within start_date and end_date
 		SELECT service_id
 		FROM calendar
 		WHERE start_date <= ? 
 		  AND end_date >= ? 
-		  AND %s = 1 -- Ensure the service is active on the current day
+		  AND %s = 1
 		UNION ALL
-		-- Add services from calendar_dates where exception_type = 1 (added services)
 		SELECT service_id
 		FROM calendar_dates
 		WHERE date = ? AND exception_type = 1
 	),
 	removed_services AS (
-		-- Select services from calendar_dates where exception_type = 2 (removed services)
 		SELECT service_id
 		FROM calendar_dates
 		WHERE date = ? AND exception_type = 2
 	),
 	adjusted_services AS (
-		-- Remove services from active_services that are marked as removed
 		SELECT DISTINCT service_id
 		FROM active_services
 		WHERE service_id NOT IN (SELECT service_id FROM removed_services)
 	)
-	-- Select trip details for active service_ids from trips and stop_times
 	SELECT 
 		t.trip_id, 
 		t.service_id,
@@ -95,51 +100,45 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 	JOIN routes r ON t.route_id = r.route_id
 	`, dayColumn)
 
-	// Add the departure time filter if specified
 	if departureTimeFilter != "" {
-		query += " WHERE st.departure_time > ?"
+		queryBuilder.WriteString(" WHERE st.departure_time > ?")
 	}
 
-	// If a stop_id is provided, add a filter for stop_id
 	if stopID != "" {
 		if departureTimeFilter != "" {
-			query += " AND st.stop_id = ?"
+			queryBuilder.WriteString(" AND st.stop_id = ?")
 		} else {
-			query += " WHERE st.stop_id = ?"
+			queryBuilder.WriteString(" WHERE st.stop_id = ?")
 		}
 	}
 
-	query += " ORDER BY st.departure_time ASC"
+	queryBuilder.WriteString(" ORDER BY st.departure_time ASC")
 
-	// Add limit to the query if specified
 	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d", limit)
+		fmt.Fprintf(&queryBuilder, " LIMIT %d", limit)
 	}
 
-	// Execute the query with the variable date, departure time filter, and optionally the stop_id
-	var rows *sql.Rows
-	var err error
-	if departureTimeFilter != "" && stopID != "" {
-		rows, err = db.Query(query, dateString, dateString, dateString, dateString, departureTimeFilter, stopID)
-	} else if departureTimeFilter != "" && stopID == "" {
-		rows, err = db.Query(query, dateString, dateString, dateString, dateString, departureTimeFilter)
-	} else if stopID != "" && departureTimeFilter == "" {
-		rows, err = db.Query(query, dateString, dateString, dateString, dateString, stopID)
-	} else {
-		rows, err = db.Query(query, dateString, dateString, dateString, dateString)
+	query := queryBuilder.String()
+
+	// Prepare arguments in correct order
+	args := []interface{}{dateString, dateString, dateString, dateString}
+	if departureTimeFilter != "" {
+		args = append(args, departureTimeFilter)
+	}
+	if stopID != "" {
+		args = append(args, stopID)
 	}
 
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		fmt.Println(err)
 		return nil, errors.New("an error occurred querying for the data")
 	}
 	defer rows.Close()
 
-	// Regular expressions for platform determination
 	reStationPlatform := regexp.MustCompile(`Train Station (\d)$`)
 	reCapitalLetter := regexp.MustCompile(`[A-Z]$`)
 
-	// Iterate through the result set
 	var results []StopTimes
 	for rows.Next() {
 		var result struct {
@@ -165,7 +164,6 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 			RouteShortName      string
 		}
 
-		// Scan the results into StopTimes, Stop, and Trip
 		if err := rows.Scan(
 			&result.TripId,
 			&result.ServiceId,
@@ -195,7 +193,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 			result.Platform = determinePlatform(result.StopName, reStationPlatform, reCapitalLetter)
 		}
 
-		var stopData = Stop{
+		stopData := Stop{
 			LocationType:       result.StopLocationType,
 			ParentStation:      result.StopParentStationId,
 			StopCode:           result.StopCode,
@@ -208,7 +206,8 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 			StopType:           typeOfStop(result.StopName),
 			Sequence:           result.StopSequence,
 		}
-		var tripData = Trip{
+
+		tripData := Trip{
 			BikesAllowed:         0,
 			DirectionID:          result.DirectionId,
 			RouteID:              result.RouteId,
@@ -219,7 +218,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 			WheelchairAccessible: 0,
 		}
 
-		var stopTimeData StopTimes = StopTimes{
+		results = append(results, StopTimes{
 			TripID:         result.TripId,
 			ArrivalTime:    result.ArrivalTime,
 			DepartureTime:  result.DepartureTime,
@@ -231,17 +230,14 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 			TripData:       tripData,
 			RouteColor:     result.RouteColor,
 			RouteShortName: result.RouteShortName,
-		}
-
-		// Append the result
-		results = append(results, stopTimeData)
+		})
 	}
 
-	// Check for any error during iteration
 	if err := rows.Err(); err != nil {
 		fmt.Println(err)
 		return nil, errors.New("an error occurred going through the retrieved data")
 	}
+
 	return results, nil
 }
 
