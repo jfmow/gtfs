@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 )
 
 type Stop struct {
@@ -236,10 +237,33 @@ func (v Database) GetStopsForTripID(tripID string) ([]Stop, int, error) {
 	return stops, lowestSequence, nil
 }
 
-func (v Database) GetStopsForTrips() (map[string][]Stop, error) {
+func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 	db := v.db
 
+	// Calculate the date range for filtering
+	startDate := time.Now().In(v.timeZone).Format("20060102")
+	endDate := time.Now().In(v.timeZone).AddDate(0, 0, days).Format("20060102")
+
 	query := `
+		WITH active_services AS (
+			SELECT DISTINCT service_id
+			FROM calendar
+			WHERE start_date <= ? AND end_date >= ?
+			UNION ALL
+			SELECT service_id
+			FROM calendar_dates
+			WHERE date BETWEEN ? AND ? AND exception_type = 1
+		),
+		removed_services AS (
+			SELECT service_id
+			FROM calendar_dates
+			WHERE date BETWEEN ? AND ? AND exception_type = 2
+		),
+		adjusted_services AS (
+			SELECT service_id
+			FROM active_services
+			WHERE service_id NOT IN (SELECT service_id FROM removed_services)
+		)
 		SELECT
 			st.trip_id,
 			s.stop_id,
@@ -256,12 +280,16 @@ func (v Database) GetStopsForTrips() (map[string][]Stop, error) {
 			stop_times st
 		JOIN
 			stops s ON st.stop_id = s.stop_id
+		JOIN
+			trips t ON st.trip_id = t.trip_id
+		JOIN
+			adjusted_services a ON t.service_id = a.service_id
 		ORDER BY
 			st.trip_id,
 			st.stop_sequence
 	`
 
-	rows, err := db.Query(query)
+	rows, err := db.Query(query, startDate, endDate, startDate, endDate, startDate, endDate)
 	if err != nil {
 		return nil, err
 	}
