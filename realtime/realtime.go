@@ -19,10 +19,10 @@ func hashKey(data string) string {
 }
 
 func NewClient(apiKey string, apiHeader string, refreshPeriod time.Duration, vehiclesUrl, tripUpdatesUrl, alertsUrl string) (Realtime, error) {
-	if apiKey == "" {
+	if apiHeader != "" && apiKey == "" {
 		return Realtime{}, errors.New("missing api key")
 	}
-	if apiHeader == "" {
+	if apiHeader == "" && apiKey != "" {
 		return Realtime{}, errors.New("missing api header")
 	}
 
@@ -66,11 +66,11 @@ func fetchProto(url, apiHeader, apiKey string) ([]*proto.FeedEntity, error) {
 	if url == "" {
 		return nil, fmt.Errorf("missing URL")
 	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("missing API key")
+	if apiHeader != "" && apiKey == "" {
+		return nil, fmt.Errorf("missing api key")
 	}
-	if apiHeader == "" {
-		apiHeader = "Authorization"
+	if apiHeader == "" && apiKey != "" {
+		return nil, fmt.Errorf("missing api header")
 	}
 
 	client := http.Client{Timeout: 10 * time.Second}
@@ -81,7 +81,9 @@ func fetchProto(url, apiHeader, apiKey string) ([]*proto.FeedEntity, error) {
 
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Accept", "application/x-protobuf")
-	req.Header.Set(apiHeader, apiKey)
+	if apiHeader != "" && apiKey != "" {
+		req.Header.Set(apiHeader, apiKey)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
