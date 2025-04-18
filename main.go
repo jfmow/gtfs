@@ -9,12 +9,13 @@ import (
 )
 
 type Database struct {
-	db          *sqlx.DB
-	url         string
-	timeZone    *time.Location
-	mailToEmail string
-	apiKey      ApiKey
-	name        string
+	db              *sqlx.DB
+	url             string
+	timeZone        *time.Location
+	mailToEmail     string
+	apiKey          ApiKey
+	name            string
+	RefreshNotifier chan struct{}
 }
 
 /*
@@ -35,6 +36,8 @@ func New(url string, apiKey ApiKey, databaseName string, tz *time.Location, mail
 	if err != nil {
 		panic(err)
 	}
+
+	database.RefreshNotifier = make(chan struct{})
 
 	// Check if the feed data is still up to date
 	isUpToDate, err := database.IsFeedDataUpToDate()

@@ -264,7 +264,7 @@ func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 			FROM active_services
 			WHERE service_id NOT IN (SELECT service_id FROM removed_services)
 		)
-		SELECT
+		SELECT DISTINCT
 			st.trip_id,
 			s.stop_id,
 			s.stop_code,
@@ -560,6 +560,70 @@ func (v Database) GetAllParentStopsByChild() (map[string]Stop, error) {
 	}
 
 	return result, nil
+}
+
+func (v Database) GetParentStopsByRouteId(routeId string) ([]Stop, error) {
+	query := `
+    SELECT DISTINCT 
+        COALESCE(NULLIF(s.parent_station, ''), s.stop_id) AS parent_stop_id,
+        ps.stop_code,
+        ps.stop_name,
+        ps.stop_lat,
+        ps.stop_lon,
+        ps.location_type,
+        ps.parent_station,
+        ps.platform_code,
+        ps.wheelchair_boarding
+    FROM routes r
+    JOIN trips t ON r.route_id = t.route_id
+    JOIN stop_times st ON t.trip_id = st.trip_id
+    JOIN stops s ON st.stop_id = s.stop_id
+    LEFT JOIN stops ps ON ps.stop_id = COALESCE(NULLIF(s.parent_station, ''), s.stop_id)
+    WHERE r.route_id = ?
+      AND (ps.location_type = 1 OR (ps.location_type = 0 AND (ps.parent_station IS NULL OR ps.parent_station = '')))
+    ORDER BY ps.stop_id;
+    `
+
+	rows, err := v.db.Query(query, routeId)
+	if err != nil {
+		return nil, errors.New("no parent stops found for route")
+	}
+	defer rows.Close()
+
+	// Slice to hold the parent stops
+	var parentStops []Stop
+
+	// Iterate over the rows
+	for rows.Next() {
+		var stop Stop
+		err := rows.Scan(
+			&stop.StopId,
+			&stop.StopCode,
+			&stop.StopName,
+			&stop.StopLat,
+			&stop.StopLon,
+			&stop.LocationType,
+			&stop.ParentStation,
+			&stop.PlatformNumber,
+			&stop.WheelChairBoarding,
+		)
+		if err != nil {
+			return nil, err
+		}
+		parentStops = append(parentStops, stop)
+	}
+
+	// Check for any error encountered during iteration
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// If no parent stops were found, return a custom error
+	if len(parentStops) == 0 {
+		return nil, errors.New("no parent stops found for the given route ID")
+	}
+
+	return parentStops, nil
 }
 
 /*

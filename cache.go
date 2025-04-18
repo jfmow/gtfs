@@ -3,7 +3,6 @@ package gtfs
 import (
 	"log"
 	"sync"
-	"time"
 )
 
 // The `Identity` function in Go returns the input value along with a nil error.
@@ -12,9 +11,13 @@ func Identity[T any](x T) (T, error) {
 	return x, nil
 }
 
-// Creates a cached value that is periodically refreshed using a
-// specified refresh function and interval.
-func GenerateACache[In any, Out any](refreshFunc func() (In, error), transform func(In) (Out, error), refreshInterval time.Duration, emptyValue Out) (func() Out, error) {
+// Creates a cached value that is refreshed when the database's RefreshNotifier channel is triggered.
+func GenerateACache[In any, Out any](
+	refreshFunc func() (In, error),
+	transform func(In) (Out, error),
+	emptyValue Out,
+	v Database,
+) (func() Out, error) {
 	var (
 		cache Out
 		mu    sync.RWMutex
@@ -46,10 +49,7 @@ func GenerateACache[In any, Out any](refreshFunc func() (In, error), transform f
 	}
 
 	go func() {
-		ticker := time.NewTicker(refreshInterval)
-		defer ticker.Stop()
-
-		for range ticker.C {
+		for range v.RefreshNotifier {
 			_ = refreshCache()
 		}
 	}()

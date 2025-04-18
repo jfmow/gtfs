@@ -441,6 +441,11 @@ func (v Database) refreshDatabaseData() error {
 	}
 
 	fmt.Println("Data updated successfully.")
+	select {
+	case v.RefreshNotifier <- struct{}{}:
+	default:
+		// Non-blocking send to avoid deadlocks if no listeners are present
+	}
 	return nil
 }
 
