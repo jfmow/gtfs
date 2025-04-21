@@ -80,7 +80,7 @@ func writeFilesToDB(zipData []byte, v Database) error {
 	}
 
 	for _, file := range reader.File {
-		fmt.Println("Processing file:", file.Name)
+		//fmt.Println("Processing file:", file.Name)
 
 		if file.FileInfo().IsDir() || !isCSVFile(file.Name) {
 			fmt.Println("Skipping non-CSV or directory file:", file.Name)
@@ -89,14 +89,14 @@ func writeFilesToDB(zipData []byte, v Database) error {
 
 		var tableName = strings.ToLower(strings.TrimSuffix(filepath.Base(file.Name), ".txt"))
 
-		fmt.Println("Opening file:", file.Name)
+		//fmt.Println("Opening file:", file.Name)
 		f, err := file.Open()
 		if err != nil {
 			return fmt.Errorf("error opening file %s: %v", file.Name, err)
 		}
 		defer f.Close()
 
-		fmt.Println("Reading CSV content from file:", file.Name)
+		//fmt.Println("Reading CSV content from file:", file.Name)
 		csvReader := csv.NewReader(f)
 
 		tx, err := db.Begin() // Start transaction for better performance
@@ -110,7 +110,7 @@ func writeFilesToDB(zipData []byte, v Database) error {
 			return fmt.Errorf("error reading csv headers from %s: %v", file.Name, err)
 		}
 
-		fmt.Println("Headers from file:", headers)
+		//fmt.Println("Headers from file:", headers)
 
 		if !contains(defaultTableNames, tableName) {
 			v.createTableIfNotExists(tableName, headers)
@@ -152,7 +152,7 @@ func writeFilesToDB(zipData []byte, v Database) error {
 			return fmt.Errorf("error committing transaction: %v", err)
 		}
 
-		fmt.Println("Finished processing file:", file.Name)
+		//fmt.Println("Finished processing file:", file.Name)
 	}
 
 	return nil

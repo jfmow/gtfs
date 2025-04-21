@@ -79,6 +79,8 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 		t.direction_id,
 		t.shape_id,
 		t.trip_headsign,
+		t.wheelchair_accessible,
+		t.bikes_allowed,
 		st.arrival_time, 
 		st.departure_time, 
 		st.stop_id, 
@@ -142,26 +144,28 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 	var results []StopTimes
 	for rows.Next() {
 		var result struct {
-			TripId              string
-			ServiceId           string
-			RouteId             string
-			DirectionId         int
-			ShapeId             string
-			TripHeadsign        string
-			ArrivalTime         string
-			DepartureTime       string
-			StopId              string
-			StopSequence        int
-			StopHeadsign        string
-			RouteColor          string
-			StopName            string
-			StopLat             float64
-			StopLon             float64
-			StopCode            string
-			StopLocationType    int
-			StopParentStationId string
-			Platform            string
-			RouteShortName      string
+			TripId               string
+			ServiceId            string
+			RouteId              string
+			DirectionId          int
+			ShapeId              string
+			TripHeadsign         string
+			ArrivalTime          string
+			DepartureTime        string
+			StopId               string
+			StopSequence         int
+			StopHeadsign         string
+			RouteColor           string
+			StopName             string
+			StopLat              float64
+			StopLon              float64
+			StopCode             string
+			StopLocationType     int
+			StopParentStationId  string
+			Platform             string
+			RouteShortName       string
+			WheelchairAccessible int
+			BikesAllowed         int
 		}
 
 		if err := rows.Scan(
@@ -171,6 +175,8 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 			&result.DirectionId,
 			&result.ShapeId,
 			&result.TripHeadsign,
+			&result.WheelchairAccessible,
+			&result.BikesAllowed,
 			&result.ArrivalTime,
 			&result.DepartureTime,
 			&result.StopId,
@@ -208,14 +214,14 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 		}
 
 		tripData := Trip{
-			BikesAllowed:         0,
+			BikesAllowed:         result.BikesAllowed,
 			DirectionID:          result.DirectionId,
 			RouteID:              result.RouteId,
 			ServiceID:            result.ServiceId,
 			ShapeID:              result.ShapeId,
 			TripHeadsign:         result.TripHeadsign,
 			TripID:               result.TripId,
-			WheelchairAccessible: 0,
+			WheelchairAccessible: result.WheelchairAccessible,
 		}
 
 		results = append(results, StopTimes{

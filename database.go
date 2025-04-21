@@ -40,6 +40,7 @@ func newDatabase(url string, apiKey ApiKey, databaseName string, tz *time.Locati
 	}
 	// Initialize the Database struct
 	database := Database{db: db, url: url, timeZone: tz, mailToEmail: mailToEmail, apiKey: apiKey, name: databaseName}
+	database.RefreshNotifier = make(chan struct{}, 1) // Add a buffer to prevent blocking
 	return database, nil
 }
 
@@ -292,7 +293,7 @@ func (v Database) deleteOldData() error {
 		}
 	}
 
-	fmt.Println("Old data deleted successfully")
+	log.Println("Old data deleted successfully")
 	return nil
 }
 
@@ -349,7 +350,7 @@ func (v Database) createExtraColumn(tableName string, columnName string) error {
 
 	// Construct the SQL query with sanitized table and column names
 	alterTableSQL := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT;`, tableName, columnName)
-	fmt.Println("Executing SQL:", alterTableSQL)
+	//fmt.Println("Executing SQL:", alterTableSQL)
 
 	// Execute the query using sqlx
 	_, err := db.Exec(alterTableSQL)
@@ -384,7 +385,7 @@ func (v Database) createTableIfNotExists(tableName string, headers []string) {
 
 	// Construct the CREATE TABLE SQL with sanitized table and column names
 	createTableSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (%s);`, tableName, strings.Join(columns, ", "))
-	fmt.Println("Executing SQL:", createTableSQL)
+	//fmt.Println("Executing SQL:", createTableSQL)
 
 	// Execute the table creation SQL
 	_, err := db.Exec(createTableSQL)
@@ -443,8 +444,9 @@ func (v Database) refreshDatabaseData() error {
 	fmt.Println("Data updated successfully.")
 	select {
 	case v.RefreshNotifier <- struct{}{}:
+		fmt.Println("RefreshNotifier triggered")
 	default:
-		// Non-blocking send to avoid deadlocks if no listeners are present
+		fmt.Println("RefreshNotifier skipped to avoid blocking")
 	}
 	return nil
 }
