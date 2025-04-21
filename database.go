@@ -63,6 +63,7 @@ func (v Database) createDefaultGTFSTables() {
 			stop_id TEXT PRIMARY KEY,
 			stop_code TEXT DEFAULT '',
 			stop_name TEXT NOT NULL DEFAULT '',
+			stop_headsign TEXT NOT NULL DEFAULT '',
 			stop_desc TEXT DEFAULT '',
 			stop_lat REAL NOT NULL DEFAULT 0.0,
 			stop_lon REAL NOT NULL DEFAULT 0.0,

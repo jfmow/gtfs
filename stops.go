@@ -17,6 +17,7 @@ type Stop struct {
 	StopLat            float64 `json:"stop_lat"`
 	StopLon            float64 `json:"stop_lon"`
 	StopName           string  `json:"stop_name"`
+	StopHeadsign       string  `json:"stop_headsign"`
 	WheelChairBoarding int     `json:"wheelchair_boarding"`
 	PlatformNumber     string  `json:"platform_number"`
 	StopType           string  `json:"stop_type"`
@@ -40,6 +41,7 @@ func (v Database) GetStops(includeChildStops bool) ([]Stop, error) {
 			stop_id,
 			stop_code,
 			stop_name,
+			stop_headsign,
 			stop_lat,
 			stop_lon,
 			location_type,
@@ -68,6 +70,7 @@ func (v Database) GetStops(includeChildStops bool) ([]Stop, error) {
 			&stop.StopId,
 			&stop.StopCode,
 			&stop.StopName,
+			&stop.StopHeadsign,
 			&stop.StopLat,
 			&stop.StopLon,
 			&stop.LocationType,
@@ -105,6 +108,7 @@ func (v Database) GetChildStopsByParentStopID(stopID string) ([]Stop, error) {
 			stop_id,
 			stop_code,
 			stop_name,
+			stop_headsign,
 			stop_lat,
 			stop_lon,
 			location_type,
@@ -131,6 +135,7 @@ func (v Database) GetChildStopsByParentStopID(stopID string) ([]Stop, error) {
 			&stop.StopId,
 			&stop.StopCode,
 			&stop.StopName,
+			&stop.StopHeadsign,
 			&stop.StopLat,
 			&stop.StopLon,
 			&stop.LocationType,
@@ -269,6 +274,7 @@ func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 			s.stop_id,
 			s.stop_code,
 			s.stop_name,
+			s.stop_headsign,
 			s.stop_lat,
 			s.stop_lon,
 			s.location_type,
@@ -306,6 +312,7 @@ func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 			&stop.StopId,
 			&stop.StopCode,
 			&stop.StopName,
+			&stop.StopHeadsign,
 			&stop.StopLat,
 			&stop.StopLon,
 			&stop.LocationType,
@@ -344,6 +351,7 @@ func (v Database) GetStopByNameOrCode(nameOrCode string) (*Stop, error) {
 			stop_id,
 			stop_code,
 			stop_name,
+			stop_headsign,
 			stop_lat,
 			stop_lon,
 			location_type,
@@ -370,6 +378,7 @@ func (v Database) GetStopByNameOrCode(nameOrCode string) (*Stop, error) {
 		&stop.StopId,
 		&stop.StopCode,
 		&stop.StopName,
+		&stop.StopHeadsign,
 		&stop.StopLat,
 		&stop.StopLon,
 		&stop.LocationType,
@@ -400,6 +409,7 @@ func (v Database) GetStopByStopID(stopID string) (*Stop, error) {
 			stop_id,
 			stop_code,
 			stop_name,
+			stop_headsign,
 			stop_lat,
 			stop_lon,
 			location_type,
@@ -421,6 +431,7 @@ func (v Database) GetStopByStopID(stopID string) (*Stop, error) {
 		&stop.StopId,
 		&stop.StopCode,
 		&stop.StopName,
+		&stop.StopHeadsign,
 		&stop.StopLat,
 		&stop.StopLon,
 		&stop.LocationType,
@@ -448,6 +459,7 @@ func (v Database) GetParentStopByChildStopID(childStopID string) (*Stop, error) 
 			stop_id,
 			stop_code,
 			stop_name,
+			stop_headsign,
 			stop_lat,
 			stop_lon,
 			location_type,
@@ -478,6 +490,7 @@ func (v Database) GetParentStopByChildStopID(childStopID string) (*Stop, error) 
 		&stop.StopId,
 		&stop.StopCode,
 		&stop.StopName,
+		&stop.StopHeadsign,
 		&stop.StopLat,
 		&stop.StopLon,
 		&stop.LocationType,
@@ -507,6 +520,7 @@ func (v Database) GetAllParentStopsByChild() (map[string]Stop, error) {
 			COALESCE(NULLIF(child.parent_station, ''), child.stop_id) AS parent_id,
 			parent.stop_code,
 			parent.stop_name,
+			child.stop_headsign,
 			parent.stop_lat,
 			parent.stop_lon,
 			parent.location_type,
@@ -536,6 +550,7 @@ func (v Database) GetAllParentStopsByChild() (map[string]Stop, error) {
 			&stop.StopId, // This will be the resolved parent ID or the same as childID
 			&stop.StopCode,
 			&stop.StopName,
+			&stop.StopHeadsign,
 			&stop.StopLat,
 			&stop.StopLon,
 			&stop.LocationType,
@@ -631,7 +646,7 @@ Get the stops for a given route
 */
 func (v Database) GetStopsByRouteId(routeId string) ([]Stop, error) {
 	query := `
-	SELECT DISTINCT s.stop_id, s.stop_code, s.stop_name, s.stop_lat, s.stop_lon, s.location_type, s.parent_station, s.platform_code, s.wheelchair_boarding, st.stop_sequence
+	SELECT DISTINCT s.stop_id, s.stop_code, s.stop_name, s.stop_headsign, s.stop_lat, s.stop_lon, s.location_type, s.parent_station, s.platform_code, s.wheelchair_boarding, st.stop_sequence
 	FROM routes r
 	JOIN trips t ON r.route_id = t.route_id
 	JOIN stop_times st ON t.trip_id = st.trip_id
@@ -657,6 +672,7 @@ func (v Database) GetStopsByRouteId(routeId string) ([]Stop, error) {
 			&stop.StopId,
 			&stop.StopCode,
 			&stop.StopName,
+			&stop.StopHeadsign,
 			&stop.StopLat,
 			&stop.StopLon,
 			&stop.LocationType,
@@ -749,6 +765,7 @@ func (v Database) SearchForStopsByNameOrCode(searchText string, includeChildStop
 /*
 Try to figure out the type of stop based on name
 */
+//TODO: fix
 func typeOfStop(stopName string) string {
 	isFerryTerminal := strings.Contains(stopName, "Ferry Terminal")
 	isTrainStation := strings.Contains(stopName, "Train Station")
