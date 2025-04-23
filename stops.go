@@ -270,7 +270,7 @@ func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 			s.stop_id,
 			s.stop_code,
 			s.stop_name,
-			s.stop_headsign,
+			st.stop_headsign,
 			s.stop_lat,
 			s.stop_lon,
 			s.location_type,
@@ -634,7 +634,7 @@ Get the stops for a given route
 */
 func (v Database) GetStopsByRouteId(routeId string) ([]Stop, error) {
 	query := `
-	SELECT DISTINCT s.stop_id, s.stop_code, s.stop_name, st.stop_headsign, s.stop_lat, s.stop_lon, s.location_type, s.parent_station, s.platform_code, s.wheelchair_boarding, st.stop_sequence
+	SELECT DISTINCT s.stop_id, s.stop_code, s.stop_name, s.stop_lat, s.stop_lon, s.location_type, s.parent_station, s.platform_code, s.wheelchair_boarding, st.stop_sequence
 	FROM routes r
 	JOIN trips t ON r.route_id = t.route_id
 	JOIN stop_times st ON t.trip_id = st.trip_id
@@ -660,7 +660,6 @@ func (v Database) GetStopsByRouteId(routeId string) ([]Stop, error) {
 			&stop.StopId,
 			&stop.StopCode,
 			&stop.StopName,
-			&stop.StopHeadsign,
 			&stop.StopLat,
 			&stop.StopLon,
 			&stop.LocationType,
