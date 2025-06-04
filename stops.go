@@ -22,6 +22,7 @@ type Stop struct {
 	PlatformNumber     string  `json:"platform_number"`
 	StopType           string  `json:"stop_type"`
 	Sequence           int     `json:"stop_sequence"`
+	IsChildStop        bool    `json:"is_child_stop"`
 }
 
 type StopSearch struct {
@@ -81,6 +82,72 @@ func (v Database) GetStops(includeChildStops bool) ([]Stop, error) {
 		}
 		stop.StopType = typeOfStop(stop.StopName)
 		stops = append(stops, stop)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(stops) == 0 {
+		return nil, errors.New("no stops found")
+	}
+
+	return stops, nil
+}
+
+/*
+Get all the stored stops mapped by their id
+*/
+func (v Database) GetStopsMap(includeChildStops bool) (map[string]Stop, error) {
+	db := v.db
+	query := `
+		SELECT
+			stop_id,
+			stop_code,
+			stop_name,
+			stop_lat,
+			stop_lon,
+			location_type,
+			parent_station,
+			platform_code,
+			wheelchair_boarding
+		FROM
+			stops
+	`
+	if !includeChildStops {
+		// Add filtering to exclude child stops
+		query += ` WHERE (location_type == 1 OR parent_station = '')`
+	}
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() // Ensure the rows are closed after usage
+
+	var stops map[string]Stop = make(map[string]Stop)
+
+	for rows.Next() {
+		var stop Stop
+		err := rows.Scan(
+			&stop.StopId,
+			&stop.StopCode,
+			&stop.StopName,
+			&stop.StopLat,
+			&stop.StopLon,
+			&stop.LocationType,
+			&stop.ParentStation,
+			&stop.PlatformNumber,
+			&stop.WheelChairBoarding,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if stop.LocationType == 0 {
+			stop.IsChildStop = true
+		}
+		stop.StopType = typeOfStop(stop.StopName)
+		stops[stop.StopId] = stop
 	}
 
 	if err = rows.Err(); err != nil {
@@ -238,6 +305,9 @@ func (v Database) GetStopsForTripID(tripID string) ([]Stop, int, error) {
 	return stops, lowestSequence, nil
 }
 
+/*
+Returns the child stops for a trip
+*/
 func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 	db := v.db
 
