@@ -316,50 +316,51 @@ func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 	endDate := time.Now().In(v.timeZone).AddDate(0, 0, days).Format("20060102")
 
 	query := `
-		WITH active_services AS (
-			SELECT DISTINCT service_id
-			FROM calendar
-			WHERE start_date <= ? AND end_date >= ?
-			UNION ALL
-			SELECT service_id
-			FROM calendar_dates
-			WHERE date BETWEEN ? AND ? AND exception_type = 1
-		),
-		removed_services AS (
-			SELECT service_id
-			FROM calendar_dates
-			WHERE date BETWEEN ? AND ? AND exception_type = 2
-		),
-		adjusted_services AS (
-			SELECT service_id
-			FROM active_services
-			WHERE service_id NOT IN (SELECT service_id FROM removed_services)
-		)
-		SELECT DISTINCT
-			st.trip_id,
-			s.stop_id,
-			s.stop_code,
-			s.stop_name,
-			st.stop_headsign,
-			s.stop_lat,
-			s.stop_lon,
-			s.location_type,
-			s.parent_station,
-			s.platform_code,
-			s.wheelchair_boarding,
-			st.stop_sequence
-		FROM
-			stop_times st
-		JOIN
-			stops s ON st.stop_id = s.stop_id
-		JOIN
-			trips t ON st.trip_id = t.trip_id
-		JOIN
-			adjusted_services a ON t.service_id = a.service_id
-		ORDER BY
-			st.trip_id,
-			st.stop_sequence
-	`
+	WITH active_services AS (
+		SELECT DISTINCT service_id
+		FROM calendar
+		WHERE start_date <= ? AND end_date >= ?
+		UNION ALL
+		SELECT service_id
+		FROM calendar_dates
+		WHERE date = ? AND exception_type = 1
+	),
+	removed_services AS (
+		SELECT service_id
+		FROM calendar_dates
+		WHERE date = ? AND exception_type = 2
+	),
+	adjusted_services AS (
+		SELECT service_id
+		FROM active_services
+		WHERE service_id NOT IN (SELECT service_id FROM removed_services)
+	)
+	SELECT DISTINCT
+		st.trip_id,
+		s.stop_id,
+		s.stop_code,
+		s.stop_name,
+		st.stop_headsign,
+		s.stop_lat,
+		s.stop_lon,
+		s.location_type,
+		s.parent_station,
+		s.platform_code,
+		s.wheelchair_boarding,
+		st.stop_sequence
+	FROM
+		stop_times st
+	JOIN
+		stops s ON st.stop_id = s.stop_id
+	JOIN
+		trips t ON st.trip_id = t.trip_id
+	JOIN
+		adjusted_services a ON t.service_id = a.service_id
+	ORDER BY
+		st.trip_id,
+		st.stop_sequence
+`
+
 
 	rows, err := db.Query(query, startDate, endDate, startDate, endDate, startDate, endDate)
 	if err != nil {
