@@ -87,3 +87,43 @@ See [LICENSE](LICENSE) for details.
 ---
 
 For questions or support, contact [@jfmow](https://github.com/jfmow).
+
+---
+
+### Generating gtfs caches
+
+When using the gtfs data it can be really in effecent to hit the database everytime you want to find a stop or route or combonation. So instead you can use this cache function to request the data at startup from the database, which then stores it in memory and on the refresh period defined will refresh the data. You can then call the function returned to get the cached data.
+
+```go
+getRouteCache, err := gtfs.GenerateACache(gtfsData.GetRoutes, func(routes []gtfs.Route) (map[string]gtfs.Route, error) {
+  newCache := make(map[string]gtfs.Route)
+  for _, route := range routes {
+    newCache[route.RouteId] = route
+  }
+  return newCache, nil
+}, make(map[string]gtfs.Route, 0), gtfsData)
+if err != nil {
+  log.Printf("Failed to init routes cache: %v", err)
+}
+```
+Using the cached data in a http route:
+```go
+routesRoute.GET("/:routeId", func(c echo.Context) error {
+  routeIdEncoded := c.PathParam("routeId")
+  routeId, err := url.PathUnescape(routeIdEncoded)
+  if err != nil {
+    return JsonApiResponse(c, http.StatusBadRequest, "invalid route id", nil, ResponseDetails("routeId", routeIdEncoded, "details", "Invalid route ID format", "error", err.Error()))
+  }
+
+  //Get the data from memory 
+  cachedRoutes := getRouteCache()
+  //Find the route
+  route, ok := cachedRoutes[routeId]
+
+  if !ok {
+    return JsonApiResponse(c, http.StatusNotFound, "", nil, ResponseDetails("routeId", routeId, "details", "No route found for the given route ID in the cache"))
+  }
+
+  return JsonApiResponse(c, http.StatusOK, "", route)
+})
+```
