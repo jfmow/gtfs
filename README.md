@@ -40,7 +40,7 @@ if err != nil {
 AucklandTransportRealtimeData, err := rt.NewClient(
     atApiKey,                                       // Your API key value
     "Ocp-Apim-Subscription-Key",                    // API key header name
-    10*time.Second,                                 // HTTP timeout
+    10*time.Second,                                 // Realtime data refresh period
     "https://api.at.govt.nz/realtime/legacy/vehiclelocations", // Vehicle positions feed URL
     "https://api.at.govt.nz/realtime/legacy/tripupdates",      // Trip updates feed URL
     "https://api.at.govt.nz/realtime/legacy/servicealerts",    // Service alerts feed URL
