@@ -305,6 +305,97 @@ func (v Database) GetStopsForTripID(tripID string) ([]Stop, int, error) {
 	return stops, lowestSequence, nil
 }
 
+// GetStopTimesForTripID returns the stop times (arrival and departure) for all stops in a given trip.
+func (v Database) GetStopTimesForTripID(tripID string) (map[string]struct {
+	Stop
+	ArrivalTime   string
+	DepartureTime string
+}, error) {
+	db := v.db
+
+	query := `
+		SELECT
+			s.stop_id,
+			s.stop_code,
+			s.stop_name,
+			s.stop_lat,
+			s.stop_lon,
+			s.location_type,
+			s.parent_station,
+			s.platform_code,
+			s.wheelchair_boarding,
+			st.stop_sequence,
+			st.arrival_time,
+			st.departure_time
+		FROM
+			stop_times st
+		JOIN
+			stops s ON st.stop_id = s.stop_id
+		WHERE
+			st.trip_id = ?
+		ORDER BY
+			st.stop_sequence
+	`
+
+	rows, err := db.Query(query, tripID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results map[string]struct {
+		Stop
+		ArrivalTime   string
+		DepartureTime string
+	} = make(map[string]struct {
+		Stop
+		ArrivalTime   string
+		DepartureTime string
+	})
+
+	for rows.Next() {
+		var stop Stop
+		var arrival, departure string
+		err := rows.Scan(
+			&stop.StopId,
+			&stop.StopCode,
+			&stop.StopName,
+			&stop.StopLat,
+			&stop.StopLon,
+			&stop.LocationType,
+			&stop.ParentStation,
+			&stop.PlatformNumber,
+			&stop.WheelChairBoarding,
+			&stop.Sequence,
+			&arrival,
+			&departure,
+		)
+		if err != nil {
+			return nil, err
+		}
+		stop.StopType = typeOfStop(stop.StopName)
+		results[stop.StopId] = struct {
+			Stop
+			ArrivalTime   string
+			DepartureTime string
+		}{
+			Stop:          stop,
+			ArrivalTime:   arrival,
+			DepartureTime: departure,
+		}
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(results) == 0 {
+		return nil, errors.New("no stop times found for the given trip ID")
+	}
+
+	return results, nil
+}
+
 /*
 Returns the child stops for a trip
 */
@@ -360,7 +451,6 @@ func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 		st.trip_id,
 		st.stop_sequence
 `
-
 
 	rows, err := db.Query(query, startDate, endDate, startDate, endDate, startDate, endDate)
 	if err != nil {

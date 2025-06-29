@@ -12,8 +12,8 @@ type Shape struct {
 
 // Point represents a single latitude/longitude coordinate
 type Point struct {
-	Lat float64 `json:"lat"`
-	Lon float64 `json:"lon"`
+	Lat, Lon     float64
+	DistTraveled float64
 }
 
 // GetShapeByID retrieves the shape points for a given trip_id
@@ -21,7 +21,7 @@ func (v Database) GetShapeByTripID(tripID string) (Shape, error) {
 	db := v.db
 
 	query := `
-		SELECT s.shape_id, s.shape_pt_lat, s.shape_pt_lon
+		SELECT s.shape_id, s.shape_pt_lat, s.shape_pt_lon, s.shape_dist_traveled
 		FROM shapes s
 		INNER JOIN trips t ON s.shape_id = t.shape_id
 		WHERE t.trip_id = ?
@@ -39,7 +39,7 @@ func (v Database) GetShapeByTripID(tripID string) (Shape, error) {
 
 	for rows.Next() {
 		var point Point
-		err := rows.Scan(&shape.ShapeID, &point.Lat, &point.Lon)
+		err := rows.Scan(&shape.ShapeID, &point.Lat, &point.Lon, &point.DistTraveled)
 		if err != nil {
 			return Shape{}, err
 		}
@@ -92,11 +92,17 @@ func (v Database) GetShapeByID(shapeID string) (Shape, error) {
 
 // ToGeoJSON converts a Shape to a GeoJSON LineString
 func (s Shape) ToGeoJSON() (map[string]interface{}, error) {
+	// Build the 3‑dimensional coordinate array.
+	coords := make([][]float64, len(s.Coordinates))
+	for i, p := range s.Coordinates {
+		coords[i] = []float64{p.Lon, p.Lat, p.DistTraveled}
+	}
+
 	geoJSON := map[string]interface{}{
 		"type": "Feature",
 		"geometry": map[string]interface{}{
 			"type":        "LineString",
-			"coordinates": s.toCoordinatesArray(),
+			"coordinates": coords,
 		},
 		"properties": map[string]interface{}{
 			"shape_id": s.ShapeID,
