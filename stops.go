@@ -143,7 +143,7 @@ func (v Database) GetStopsMap(includeChildStops bool) (map[string]Stop, error) {
 		if err != nil {
 			return nil, err
 		}
-		if stop.LocationType == 0 {
+		if stop.LocationType == 0 && stop.ParentStation != "" {
 			stop.IsChildStop = true
 		}
 		stop.StopType = typeOfStop(stop.StopName)
