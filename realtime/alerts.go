@@ -8,24 +8,22 @@ import (
 	"github.com/jfmow/gtfs/realtime/proto"
 )
 
-var (
-	alertApiRequestMutex sync.Mutex
-)
-
-var (
-	cachedAlertsData       map[string]AlertMap  = make(map[string]AlertMap)
-	lastUpdatedAlertsCache map[string]time.Time = make(map[string]time.Time)
-)
+type alertsCache struct {
+	mu          sync.Mutex
+	data        AlertMap
+	lastUpdated time.Time
+}
 
 type AlertMap map[string]*proto.Alert
 type AlertSlice []*proto.Alert
 type Alert *proto.Alert
 
 func (v Realtime) GetAlerts() (AlertMap, error) {
-	alertApiRequestMutex.Lock()
-	defer alertApiRequestMutex.Unlock()
-	if cachedAlertsData[v.uuid] != nil && len(cachedAlertsData[v.uuid]) >= 1 && lastUpdatedAlertsCache[v.uuid].Add(v.refreshPeriod).After(time.Now()) {
-		return cachedAlertsData[v.uuid], nil
+	v.alertsCache.mu.Lock()
+	defer v.alertsCache.mu.Unlock()
+
+	if len(v.alertsCache.data) >= 1 && v.alertsCache.lastUpdated.Add(v.refreshPeriod).After(time.Now()) {
+		return v.alertsCache.data, nil
 	}
 
 	result, err := fetchProto(v.alertsUrl, v.apiHeader, v.apiKey)
@@ -39,8 +37,8 @@ func (v Realtime) GetAlerts() (AlertMap, error) {
 		alerts[i.GetId()] = i.Alert
 	}
 
-	cachedAlertsData[v.uuid] = alerts
-	lastUpdatedAlertsCache[v.uuid] = time.Now()
+	v.alertsCache.data = alerts
+	v.alertsCache.lastUpdated = time.Now()
 
 	return alerts, nil
 }

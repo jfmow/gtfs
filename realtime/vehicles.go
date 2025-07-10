@@ -8,22 +8,21 @@ import (
 	"github.com/jfmow/gtfs/realtime/proto"
 )
 
-var (
-	vehiclesApiRequestMutex sync.Mutex
-)
-
-var (
-	cachedVehiclesData       map[string]VehiclesMap = make(map[string]VehiclesMap)
-	lastUpdatedVehiclesCache map[string]time.Time   = make(map[string]time.Time)
-)
+type vehiclesCache struct {
+	mu          sync.Mutex
+	data        VehiclesMap
+	lastUpdated time.Time
+}
 
 type VehiclesMap map[string]*proto.VehiclePosition
 
 func (v Realtime) GetVehicles() (VehiclesMap, error) {
-	vehiclesApiRequestMutex.Lock()
-	defer vehiclesApiRequestMutex.Unlock()
-	if cachedVehiclesData[v.uuid] != nil && len(cachedVehiclesData[v.uuid]) >= 1 && lastUpdatedVehiclesCache[v.uuid].Add(v.refreshPeriod).After(time.Now()) {
-		return cachedVehiclesData[v.uuid], nil
+
+	v.vehiclesCache.mu.Lock()
+	defer v.vehiclesCache.mu.Unlock()
+
+	if len(v.vehiclesCache.data) >= 1 && v.vehiclesCache.lastUpdated.Add(v.refreshPeriod).After(time.Now()) {
+		return v.vehiclesCache.data, nil
 	}
 
 	result, err := fetchProto(v.vehiclesUrl, v.apiHeader, v.apiKey)
@@ -38,8 +37,8 @@ func (v Realtime) GetVehicles() (VehiclesMap, error) {
 		vehicles[tripId] = i.GetVehicle()
 	}
 
-	cachedVehiclesData[v.uuid] = vehicles
-	lastUpdatedVehiclesCache[v.uuid] = time.Now()
+	v.vehiclesCache.data = vehicles
+	v.vehiclesCache.lastUpdated = time.Now()
 
 	return vehicles, nil
 }

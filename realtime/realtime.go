@@ -39,13 +39,14 @@ func NewClient(apiKey string, apiHeader string, refreshPeriod time.Duration, veh
 	}
 
 	return Realtime{
-		apiKey:         apiKey,
-		apiHeader:      apiHeader,
-		refreshPeriod:  refreshPeriod,
-		vehiclesUrl:    vehiclesUrl,
-		tripUpdatesUrl: tripUpdatesUrl,
-		alertsUrl:      alertsUrl,
-		uuid:           hashKey(vehiclesUrl + tripUpdatesUrl + alertsUrl),
+		apiKey:           apiKey,
+		apiHeader:        apiHeader,
+		refreshPeriod:    refreshPeriod,
+		vehiclesUrl:      vehiclesUrl,
+		tripUpdatesUrl:   tripUpdatesUrl,
+		alertsUrl:        alertsUrl,
+		uuid:             hashKey(vehiclesUrl + tripUpdatesUrl + alertsUrl),
+		tripUpdatesCache: &tripUpdateCache{},
 	}, nil
 }
 
@@ -59,6 +60,10 @@ type Realtime struct {
 
 	refreshPeriod time.Duration
 	uuid          string
+
+	tripUpdatesCache *tripUpdateCache
+	vehiclesCache    *vehiclesCache
+	alertsCache      *alertsCache
 }
 
 // Fetches and parses protobuf GTFS-realtime data
