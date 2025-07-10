@@ -47,6 +47,8 @@ func NewClient(apiKey string, apiHeader string, refreshPeriod time.Duration, veh
 		alertsUrl:        alertsUrl,
 		uuid:             hashKey(vehiclesUrl + tripUpdatesUrl + alertsUrl),
 		tripUpdatesCache: &tripUpdateCache{},
+		alertsCache:      &alertsCache{},
+		vehiclesCache:    &vehiclesCache{},
 	}, nil
 }
 
