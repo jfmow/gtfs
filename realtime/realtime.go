@@ -18,7 +18,7 @@ func hashKey(data string) string {
 	return fmt.Sprintf("%x", hash)
 }
 
-func NewClient(apiKey string, apiHeader string, refreshPeriod time.Duration, vehiclesUrl, tripUpdatesUrl, alertsUrl string) (Realtime, error) {
+func NewClient(apiKey string, apiHeader string, refreshPeriod time.Duration, vehiclesUrl, tripUpdatesUrl, alertsUrl string, localTimeZone time.Location) (Realtime, error) {
 	if apiHeader != "" && apiKey == "" {
 		return Realtime{}, errors.New("missing api key")
 	}
@@ -49,6 +49,7 @@ func NewClient(apiKey string, apiHeader string, refreshPeriod time.Duration, veh
 		tripUpdatesCache: &tripUpdateCache{},
 		alertsCache:      &alertsCache{},
 		vehiclesCache:    &vehiclesCache{},
+		localTimeZone:    &localTimeZone,
 	}, nil
 }
 
@@ -66,6 +67,8 @@ type Realtime struct {
 	tripUpdatesCache *tripUpdateCache
 	vehiclesCache    *vehiclesCache
 	alertsCache      *alertsCache
+
+	localTimeZone *time.Location
 }
 
 // Fetches and parses protobuf GTFS-realtime data
