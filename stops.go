@@ -790,29 +790,30 @@ func (v Database) GetStopsByRouteId(routeId string) ([]Stop, error) {
 Search the db of stops for a partial name match of a stop
 */
 func (v Database) SearchForStopsByNameOrCode(searchText string, includeChildStops bool) ([]StopSearch, error) {
-	// Normalize the input search text and make it lowercase
 	normalizedSearchText := strings.ToLower(searchText)
 
+	// We'll join stops with stop_ngrams on stop_id, filtering ngram LIKE %searchText%
+	// Also include search on stop_code and stop_id directly for exact or partial matches
+	// Use DISTINCT to avoid duplicates from multiple ngrams per stop
 	query := `
-		SELECT
-			stop_id,
-			stop_code,
-			stop_name,
-			parent_station,
-			location_type
+		SELECT DISTINCT
+			s.stop_id,
+			s.stop_code,
+			s.stop_name,
+			s.parent_station,
+			s.location_type
 		FROM
-			stops
+			stops s
+		LEFT JOIN
+			stop_ngrams n ON s.stop_id = n.stop_id
 		WHERE
-			LOWER(stop_name) LIKE ?
-		OR
-			stop_code LIKE ?
-		OR
-			stop_name || ' ' || stop_code LIKE ?
+			n.ngram LIKE '%' || ? || '%'
+			OR s.stop_code LIKE '%' || ? || '%'
+			OR s.stop_id LIKE '%' || ? || '%'
+		LIMIT 100;
 	`
 
-	// Run the query
-	parametrizedString := "%" + normalizedSearchText + "%"
-	rows, err := v.db.Query(query, parametrizedString, parametrizedString, parametrizedString)
+	rows, err := v.db.Query(query, normalizedSearchText, normalizedSearchText, normalizedSearchText)
 	if err != nil {
 		return nil, err
 	}
@@ -820,7 +821,6 @@ func (v Database) SearchForStopsByNameOrCode(searchText string, includeChildStop
 
 	var stopSearchResults []StopSearch
 
-	// Iterate over the rows
 	for rows.Next() {
 		var stop Stop
 		err := rows.Scan(&stop.StopId, &stop.StopCode, &stop.StopName, &stop.ParentStation, &stop.LocationType)
@@ -830,11 +830,13 @@ func (v Database) SearchForStopsByNameOrCode(searchText string, includeChildStop
 		if stop.LocationType == 0 && stop.ParentStation != "" && !includeChildStops {
 			continue
 		}
-		stop.StopType = typeOfStop(stop.StopName) // Set the stop type
-		stopSearchResults = append(stopSearchResults, StopSearch{Name: stop.StopName + " " + stop.StopCode, TypeOfStop: stop.StopType})
+		stop.StopType = typeOfStop(stop.StopName) // assuming you have this func
+		stopSearchResults = append(stopSearchResults, StopSearch{
+			Name:       stop.StopName + " " + stop.StopCode,
+			TypeOfStop: stop.StopType,
+		})
 	}
 
-	// Check for any error encountered during iteration
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}

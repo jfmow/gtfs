@@ -256,6 +256,13 @@ func (v Database) createDefaultGTFSTables() {
 			CONSTRAINT unique_notification UNIQUE (endpoint, p256dh, auth, stop)  -- Composite unique constraint
 		);
 
+		CREATE VIRTUAL TABLE stop_search USING fts5(stop_id, stop_name, stop_code, parent_station, location_type, content='stops', content_rowid='rowid', prefix='2 3 4 5 6 7 8 9 10');
+		CREATE TABLE stop_ngrams (
+			stop_id TEXT NOT NULL,
+			ngram TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_stop_ngrams_stop_id ON stop_ngrams(stop_id);
+		CREATE INDEX IF NOT EXISTS idx_stop_ngrams_ngram ON stop_ngrams(ngram);
 	`
 
 	_, err := v.db.Exec(query)
@@ -442,6 +449,15 @@ func (v Database) refreshDatabaseData() error {
 	}
 
 	fmt.Println("Data updated successfully.")
+	fmt.Println("Repopulating FTS5 table...")
+
+	if err := v.populateFTS5StopSearch(); err != nil {
+		log.Printf("Failed to populate FTS5: %v", err)
+		return err
+	}
+
+	fmt.Println("Repopulated FTS5 table.")
+
 	select {
 	case v.RefreshNotifier <- struct{}{}:
 		fmt.Println("RefreshNotifier triggered")
@@ -521,4 +537,78 @@ func (v Database) createIndexes() {
 	if err != nil {
 		log.Panicf("%s", err.Error())
 	}
+}
+
+func (v Database) populateFTS5StopSearch() error {
+	_, _ = v.db.Exec("DELETE FROM stop_search;")
+
+	query := `
+		INSERT INTO stop_search (rowid, stop_id, stop_code, stop_name, parent_station, location_type)
+		SELECT rowid, stop_id, stop_name, stop_code, parent_station, location_type FROM stops;
+	`
+	_, err := v.db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("failed to populate stop_search FTS5 table: %w", err)
+	}
+	log.Println("FTS5 stop_search table populated successfully")
+
+	v.populateStopNgrams()
+
+	return nil
+}
+
+func (v Database) populateStopNgrams() error {
+	// Clear old data
+	if _, err := v.db.Exec("DELETE FROM stop_ngrams"); err != nil {
+		return fmt.Errorf("failed to clear stop_ngrams: %w", err)
+	}
+
+	// Query all stops with id and stop_name
+	type Stop struct {
+		StopID   string `db:"stop_id"`
+		StopName string `db:"stop_name"`
+	}
+
+	var stops []Stop
+	err := v.db.Select(&stops, "SELECT stop_id, stop_name FROM stops")
+	if err != nil {
+		return fmt.Errorf("failed to select stops: %w", err)
+	}
+
+	tx, err := v.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	stmt, err := tx.Prepare("INSERT INTO stop_ngrams(stop_id, ngram) VALUES (?, ?)")
+	if err != nil {
+		return fmt.Errorf("failed to prepare insert statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, stop := range stops {
+		// Split stop_name into words (simple space split, adjust if needed)
+		words := strings.Fields(strings.ToLower(stop.StopName))
+
+		for _, word := range words {
+			wordLen := len(word)
+			// Generate all substrings length >= 2
+			for start := 0; start < wordLen; start++ {
+				for end := start + 2; end <= wordLen; end++ {
+					substr := word[start:end]
+					if _, err := stmt.Exec(stop.StopID, substr); err != nil {
+						tx.Rollback()
+						return fmt.Errorf("failed to insert ngram: %w", err)
+					}
+				}
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit ngrams transaction: %w", err)
+	}
+
+	log.Println("stop_ngrams table populated successfully")
+	return nil
 }
