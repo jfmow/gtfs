@@ -257,7 +257,7 @@ func (v Database) createDefaultGTFSTables() {
 		);
 
 		CREATE VIRTUAL TABLE stop_search USING fts5(stop_id, stop_name, stop_code, parent_station, location_type, content='stops', content_rowid='rowid', prefix='2 3 4 5 6 7 8 9 10');
-		CREATE TABLE stop_ngrams (
+		CREATE TABLE IF NOT EXISTS stop_ngrams (
 			stop_id TEXT NOT NULL,
 			ngram TEXT NOT NULL
 		);
