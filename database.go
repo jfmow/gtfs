@@ -255,8 +255,6 @@ func (v Database) createDefaultGTFSTables() {
 			created INTEGER NOT NULL DEFAULT '',
 			CONSTRAINT unique_notification UNIQUE (endpoint, p256dh, auth, stop)  -- Composite unique constraint
 		);
-
-		CREATE VIRTUAL TABLE stop_search USING fts5(stop_id, stop_name, stop_code, parent_station, location_type, content='stops', content_rowid='rowid', prefix='2 3 4 5 6 7 8 9 10');
 		CREATE TABLE IF NOT EXISTS stop_ngrams (
 			stop_id TEXT NOT NULL,
 			ngram TEXT NOT NULL
@@ -449,14 +447,10 @@ func (v Database) refreshDatabaseData() error {
 	}
 
 	fmt.Println("Data updated successfully.")
-	fmt.Println("Repopulating FTS5 table...")
 
-	if err := v.populateFTS5StopSearch(); err != nil {
-		log.Printf("Failed to populate FTS5: %v", err)
+	if err := v.populateStopNgrams(); err != nil {
 		return err
 	}
-
-	fmt.Println("Repopulated FTS5 table.")
 
 	select {
 	case v.RefreshNotifier <- struct{}{}:
@@ -537,24 +531,6 @@ func (v Database) createIndexes() {
 	if err != nil {
 		log.Panicf("%s", err.Error())
 	}
-}
-
-func (v Database) populateFTS5StopSearch() error {
-	_, _ = v.db.Exec("DELETE FROM stop_search;")
-
-	query := `
-		INSERT INTO stop_search (rowid, stop_id, stop_code, stop_name, parent_station, location_type)
-		SELECT rowid, stop_id, stop_name, stop_code, parent_station, location_type FROM stops;
-	`
-	_, err := v.db.Exec(query)
-	if err != nil {
-		return fmt.Errorf("failed to populate stop_search FTS5 table: %w", err)
-	}
-	log.Println("FTS5 stop_search table populated successfully")
-
-	v.populateStopNgrams()
-
-	return nil
 }
 
 func (v Database) populateStopNgrams() error {
