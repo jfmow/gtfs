@@ -376,11 +376,15 @@ func (v Database) createTableIfNotExists(tableName string, headers []string) {
 	}
 
 	// Validate and sanitize the headers (column names)
-	for _, header := range headers {
+	sanitizedHeaders := make([]string, len(headers))
+	for i, header := range headers {
 		if !validName.MatchString(header) {
-			log.Fatalf("Invalid column name: %s", header)
+			sanitizedHeaders[i] = regexp.MustCompile(`[^a-zA-Z0-9_]`).ReplaceAllString(header, "_")
+		} else {
+			sanitizedHeaders[i] = header
 		}
 	}
+	headers = sanitizedHeaders
 
 	// Construct columns part of the CREATE TABLE statement
 	var columns []string
