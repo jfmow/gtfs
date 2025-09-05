@@ -3,6 +3,7 @@ package gtfs
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -790,30 +791,63 @@ func (v Database) GetStopsByRouteId(routeId string) ([]Stop, error) {
 Search the db of stops for a partial name match of a stop
 */
 func (v Database) SearchForStopsByNameOrCode(searchText string, includeChildStops bool) ([]StopSearch, error) {
-	normalizedSearchText := strings.ToLower(searchText)
+	normalizedSearchText := strings.ToLower(strings.TrimSpace(searchText))
+	if normalizedSearchText == "" {
+		return nil, errors.New("empty search text")
+	}
 
-	// We'll join stops with stop_ngrams on stop_id, filtering ngram LIKE %searchText%
-	// Also include search on stop_code and stop_id directly for exact or partial matches
-	// Use DISTINCT to avoid duplicates from multiple ngrams per stop
-	query := `
+	words := strings.Fields(normalizedSearchText)
+
+	// Build scoring expression
+	scoreExprs := []string{}
+	args := []interface{}{}
+	for _, w := range words {
+		// exact word match (word boundaries using spaces)
+		scoreExprs = append(scoreExprs, fmt.Sprintf(`
+			(CASE 
+				WHEN LOWER(s.stop_name) LIKE '%% ' || ? || ' %%' THEN 3
+				WHEN LOWER(s.stop_name) LIKE ? || '%%' THEN 2
+				WHEN LOWER(s.stop_name) LIKE '%%' || ? || '%%' THEN 1
+				ELSE 0
+			END)
+		`))
+		// arguments for the three checks
+		args = append(args, w, w, w)
+	}
+
+	scoreExpr := strings.Join(scoreExprs, " + ")
+
+	// Base WHERE clause: require all words appear somewhere
+	conditions := []string{}
+	for _, w := range words {
+		cond := `(LOWER(s.stop_name) LIKE '%' || ? || '%'
+		          OR LOWER(s.stop_code) LIKE '%' || ? || '%'
+		          OR LOWER(s.stop_id) LIKE '%' || ? || '%'
+		          OR LOWER(n.ngram) LIKE '%' || ? || '%')`
+		conditions = append(conditions, cond)
+		args = append(args, w, w, w, w)
+	}
+
+	whereClause := strings.Join(conditions, " AND ")
+
+	query := fmt.Sprintf(`
 		SELECT DISTINCT
 			s.stop_id,
 			s.stop_code,
 			s.stop_name,
 			s.parent_station,
-			s.location_type
+			s.location_type,
+			(%s) AS score
 		FROM
 			stops s
 		LEFT JOIN
 			stop_ngrams n ON s.stop_id = n.stop_id
-		WHERE
-			n.ngram LIKE '%' || ? || '%'
-			OR s.stop_code LIKE '%' || ? || '%'
-			OR s.stop_id LIKE '%' || ? || '%'
+		WHERE %s
+		ORDER BY score DESC, s.stop_name ASC
 		LIMIT 100;
-	`
+	`, scoreExpr, whereClause)
 
-	rows, err := v.db.Query(query, normalizedSearchText, normalizedSearchText, normalizedSearchText)
+	rows, err := v.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -823,14 +857,17 @@ func (v Database) SearchForStopsByNameOrCode(searchText string, includeChildStop
 
 	for rows.Next() {
 		var stop Stop
-		err := rows.Scan(&stop.StopId, &stop.StopCode, &stop.StopName, &stop.ParentStation, &stop.LocationType)
+		var score int
+		err := rows.Scan(&stop.StopId, &stop.StopCode, &stop.StopName, &stop.ParentStation, &stop.LocationType, &score)
 		if err != nil {
 			return nil, err
 		}
+
 		if stop.LocationType == 0 && stop.ParentStation != "" && !includeChildStops {
 			continue
 		}
-		stop.StopType = typeOfStop(stop.StopName) // assuming you have this func
+
+		stop.StopType = typeOfStop(stop.StopName)
 		stopSearchResults = append(stopSearchResults, StopSearch{
 			Name:       stop.StopName + " " + stop.StopCode,
 			TypeOfStop: stop.StopType,
