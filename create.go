@@ -109,6 +109,10 @@ func writeFilesToDB(zipData []byte, v Database) error {
 		if err != nil {
 			return fmt.Errorf("error reading csv headers from %s: %v", file.Name, err)
 		}
+		// Trim spaces from headers
+		for i := range headers {
+			headers[i] = strings.TrimSpace(headers[i])
+		}
 
 		//fmt.Println("Headers from file:", headers)
 
