@@ -504,6 +504,10 @@ Get a stop by its name or its stop code
 func (v Database) GetStopByNameOrCode(nameOrCode string) (*Stop, error) {
 	db := v.db
 
+	// Format current date as YYYYMMDD
+	now := time.Now().In(v.timeZone).Format("20060102")
+
+	// Query only active stops
 	query := `
 		SELECT
 			stop_id,
@@ -516,22 +520,24 @@ func (v Database) GetStopByNameOrCode(nameOrCode string) (*Stop, error) {
 			platform_code,
 			wheelchair_boarding
 		FROM
-			STOPS
+			stops
 		WHERE
-			stop_name = ?
-		OR
-			stop_code = ?
-		OR
-			stop_name || ' ' || stop_code = ?
+			(stop_name = ? OR stop_code = ? OR stop_name || ' ' || stop_code = ?)
+			AND (
+				(
+					(start_date IS NULL OR start_date = '' OR start_date <= ?)
+					AND
+					(end_date IS NULL OR end_date = '' OR end_date >= ?)
+				)
+				OR (start_date IS NULL AND end_date IS NULL)
+			)
+		LIMIT 1
 	`
 
-	// Execute the query
-	rows := db.QueryRow(query, nameOrCode, nameOrCode, nameOrCode)
+	row := db.QueryRow(query, nameOrCode, nameOrCode, nameOrCode, now, now)
 
-	// Slice to hold all the stops
 	var stop Stop
-	// Scan the row data into the Stop struct
-	err := rows.Scan(
+	err := row.Scan(
 		&stop.StopId,
 		&stop.StopCode,
 		&stop.StopName,
@@ -544,7 +550,7 @@ func (v Database) GetStopByNameOrCode(nameOrCode string) (*Stop, error) {
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil, errors.New("no stop found")
+			return nil, errors.New("no active stop found")
 		}
 		return nil, err
 	}
