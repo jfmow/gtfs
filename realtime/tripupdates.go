@@ -165,17 +165,32 @@ func mergeTripUpdates(existing, fetched *proto.TripUpdate) *proto.TripUpdate {
 
 	// Build stop map starting from existing (so we preserve historical stops),
 	// then overlay fetched entries (fresh values win for the same stop key).
+	// When preserving an entry from `existing` that is not present in `fetched`,
+	// mark its StopTimeProperties.Historic = true. For fetched entries, ensure
+	// Historic = false (or unset) so consumers can find the latest non-historic
+	// update.
 	stopMap := make(map[string]*proto.TripUpdate_StopTimeUpdate)
 
 	for _, stu := range existing.GetStopTimeUpdate() {
 		if key := stopKey(stu); key != "" {
+			// clone or use as-is; ensure StopTimeProperties exists and historic=true
+			if stu.StopTimeProperties == nil {
+				stu.StopTimeProperties = &proto.TripUpdate_StopTimeUpdate_StopTimeProperties{}
+			}
+			trueVal := true
+			stu.StopTimeProperties.Historic = &trueVal
 			stopMap[key] = stu
 		}
 	}
 
 	for _, stu := range fetched.GetStopTimeUpdate() {
 		if key := stopKey(stu); key != "" {
-			// overlay/replace with fetched
+			// overlay/replace with fetched; fetched entries are considered current
+			// so mark historic = false (unset) to indicate freshness.
+			if stu.StopTimeProperties != nil {
+				falseVal := false
+				stu.StopTimeProperties.Historic = &falseVal
+			}
 			stopMap[key] = stu
 		}
 	}
