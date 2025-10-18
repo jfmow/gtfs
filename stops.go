@@ -507,37 +507,88 @@ func (v Database) GetStopByNameOrCode(nameOrCode string) (*Stop, error) {
 	// Format current date as YYYYMMDD
 	now := time.Now().In(v.timeZone).Format("20060102")
 
-	// Query only active stops
-	query := `
-		SELECT
-			stop_id,
-			stop_code,
-			stop_name,
-			stop_lat,
-			stop_lon,
-			location_type,
-			parent_station,
-			platform_code,
-			wheelchair_boarding
-		FROM
-			stops
-		WHERE
-			(stop_name = ? OR stop_code = ? OR stop_name || ' ' || stop_code = ?)
-			AND (
-				(
-					(start_date IS NULL OR start_date = '' OR start_date <= ?)
-					AND
-					(end_date IS NULL OR end_date = '' OR end_date >= ?)
-				)
-				OR (start_date IS NULL AND end_date IS NULL)
-			)
-		LIMIT 1
-	`
+	// Check if columns exist
+	hasStartDate, hasEndDate := false, false
+	rows, err := db.Query(`PRAGMA table_info(stops)`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get table info: %w", err)
+	}
+	defer rows.Close()
 
-	row := db.QueryRow(query, nameOrCode, nameOrCode, nameOrCode, now, now)
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dfltValue interface{}
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+			return nil, err
+		}
+		if name == "start_date" {
+			hasStartDate = true
+		}
+		if name == "end_date" {
+			hasEndDate = true
+		}
+	}
+
+	// Build query conditionally
+	var query string
+	if hasStartDate && hasEndDate {
+		query = `
+			SELECT
+				stop_id,
+				stop_code,
+				stop_name,
+				stop_lat,
+				stop_lon,
+				location_type,
+				parent_station,
+				platform_code,
+				wheelchair_boarding
+			FROM
+				stops
+			WHERE
+				(stop_name = ? OR stop_code = ? OR stop_name || ' ' || stop_code = ?)
+				AND (
+					(
+						(start_date IS NULL OR start_date = '' OR start_date <= ?)
+						AND
+						(end_date IS NULL OR end_date = '' OR end_date >= ?)
+					)
+					OR (start_date IS NULL AND end_date IS NULL)
+				)
+			LIMIT 1
+		`
+	} else {
+		// Simplified query when those columns don't exist
+		query = `
+			SELECT
+				stop_id,
+				stop_code,
+				stop_name,
+				stop_lat,
+				stop_lon,
+				location_type,
+				parent_station,
+				platform_code,
+				wheelchair_boarding
+			FROM
+				stops
+			WHERE
+				(stop_name = ? OR stop_code = ? OR stop_name || ' ' || stop_code = ?)
+			LIMIT 1
+		`
+	}
+
+	var row *sql.Row
+	if hasStartDate && hasEndDate {
+		row = db.QueryRow(query, nameOrCode, nameOrCode, nameOrCode, now, now)
+	} else {
+		row = db.QueryRow(query, nameOrCode, nameOrCode, nameOrCode)
+	}
 
 	var stop Stop
-	err := row.Scan(
+	err = row.Scan(
 		&stop.StopId,
 		&stop.StopCode,
 		&stop.StopName,
@@ -556,7 +607,6 @@ func (v Database) GetStopByNameOrCode(nameOrCode string) (*Stop, error) {
 	}
 
 	stop.StopType = typeOfStop(stop.StopName)
-
 	return &stop, nil
 }
 
