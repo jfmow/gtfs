@@ -2,6 +2,7 @@ package gtfs
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -275,4 +276,53 @@ func (v Database) SearchForRouteByID(searchText string) ([]Route, error) {
 	}
 
 	return routeSearchResults, nil
+}
+
+func (v Database) GetRouteByTripID(tripId string) (map[string]Route, error) {
+	query := `
+		SELECT 
+			r.route_id, r.route_short_name, r.route_long_name, r.route_type, r.route_color
+		FROM
+			trips t
+		JOIN
+			routes r ON t.route_id = r.route_id
+		WHERE
+			t.trip_id = ?
+	`
+
+	rows, err := v.db.Query(query, tripId)
+	if err != nil {
+		fmt.Println(err)
+		return nil, errors.New("problem querying db")
+	}
+
+	defer rows.Close()
+
+	var routes map[string]Route = make(map[string]Route)
+
+	for rows.Next() {
+		var route Route
+
+		err := rows.Scan(
+			&route.RouteId,
+			&route.RouteShortName,
+			&route.RouteLongName,
+			&route.RouteType,
+			&route.RouteColor,
+		)
+
+		if err != nil {
+			fmt.Println(err)
+			return nil, errors.New("unable to scan row")
+		}
+
+		routes[route.RouteId] = route
+
+	}
+
+	if len(routes) == 0 {
+		return nil, errors.New("no routes found")
+	}
+
+	return routes, nil
 }
