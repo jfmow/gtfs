@@ -100,6 +100,8 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 	JOIN stop_times st ON t.trip_id = st.trip_id
 	JOIN stops s ON st.stop_id = s.stop_id
 	JOIN routes r ON t.route_id = r.route_id
+	WHERE st.pickup_type != 1 -- Exclude drop_off_only stops
+	AND st.drop_off_type != 1 -- Exclude pick_up_only stops
 	`, dayColumn)
 
 	if departureTimeFilter != "" {
@@ -289,6 +291,8 @@ func (v Database) GetServiceByTripAndStop(tripID, stopId, departureTimeFilter st
 		JOIN routes r ON t.route_id = r.route_id
 		WHERE t.trip_id = ? -- Filter by trip_id
 		AND st.stop_id = ? -- Filter by stop_id
+		AND st.pickup_type != 1 -- Exclude drop_off_only stops
+		AND st.drop_off_type != 1 -- Exclude pick_up_only stops
 	`
 
 	if departureTimeFilter != "" {
