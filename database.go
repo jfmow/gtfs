@@ -261,6 +261,12 @@ func (v Database) createDefaultGTFSTables() {
 		);
 		CREATE INDEX IF NOT EXISTS idx_stop_ngrams_stop_id ON stop_ngrams(stop_id);
 		CREATE INDEX IF NOT EXISTS idx_stop_ngrams_ngram ON stop_ngrams(ngram);
+		CREATE TABLE IF NOT EXISTS route_ngrams (
+			route_id TEXT NOT NULL,
+			ngram TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_route_ngrams_route_id ON route_ngrams(route_id);
+		CREATE INDEX IF NOT EXISTS idx_route_ngrams_ngram ON route_ngrams(ngram);
 	`
 
 	_, err := v.db.Exec(query)
@@ -455,6 +461,9 @@ func (v Database) refreshDatabaseData() error {
 	if err := v.populateStopNgrams(); err != nil {
 		return err
 	}
+	if err := v.populateRouteNgrams(); err != nil {
+		return err
+	}
 
 	select {
 	case v.RefreshNotifier <- struct{}{}:
@@ -590,5 +599,63 @@ func (v Database) populateStopNgrams() error {
 	}
 
 	log.Println("stop_ngrams table populated successfully")
+	return nil
+}
+func (v Database) populateRouteNgrams() error {
+	// Clear old data
+	if _, err := v.db.Exec("DELETE FROM route_ngrams"); err != nil {
+		return fmt.Errorf("failed to clear route_ngrams: %w", err)
+	}
+
+	// Query all stops with id and stop_name
+	type Route struct {
+		RouteID        string `db:"route_id"`
+		RouteLongName  string `db:"route_long_name"`
+		RouteShortName string `db:"route_short_name"`
+	}
+
+	var routes []Route
+	err := v.db.Select(&routes, "SELECT route_id, route_long_name, route_short_name FROM routes")
+	if err != nil {
+		return fmt.Errorf("failed to select routes: %w", err)
+	}
+
+	tx, err := v.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	stmt, err := tx.Prepare("INSERT INTO route_ngrams(route_id, ngram) VALUES (?, ?)")
+	if err != nil {
+		return fmt.Errorf("failed to prepare insert statement: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, route := range routes {
+		// Split route_long_name, route_id, and route_short_name into words (simple space split, adjust if needed)
+		words := strings.Fields(strings.ToLower(route.RouteLongName))
+		words = append(words, strings.Fields(strings.ToLower(route.RouteID))...)
+		words = append(words, strings.Fields(strings.ToLower(route.RouteShortName))...)
+
+		for _, word := range words {
+			wordLen := len(word)
+			// Generate all substrings length >= 2
+			for start := 0; start < wordLen; start++ {
+				for end := start + 2; end <= wordLen; end++ {
+					substr := word[start:end]
+					if _, err := stmt.Exec(route.RouteID, substr); err != nil {
+						tx.Rollback()
+						return fmt.Errorf("failed to insert ngram: %w", err)
+					}
+				}
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit ngrams transaction: %w", err)
+	}
+
+	log.Println("route_ngrams table populated successfully")
 	return nil
 }

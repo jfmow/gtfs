@@ -3,6 +3,7 @@ package gtfs
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 type Trip struct {
@@ -60,6 +61,74 @@ func (v Database) GetTripByID(tripID string) (Trip, error) {
 	}
 
 	return trip, nil
+}
+
+func (v Database) GetTripsByIDs(tripIDs []string) ([]Trip, error) {
+	db := v.db
+
+	if len(tripIDs) == 0 {
+		return nil, errors.New("no trip IDs provided")
+	}
+
+	// Build placeholders (?, ?, ?, ...)
+	placeholders := make([]string, len(tripIDs))
+	args := make([]interface{}, len(tripIDs))
+	for i, id := range tripIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			trip_id,
+			route_id,
+			trip_headsign,
+			shape_id,
+			service_id,
+			direction_id,
+			wheelchair_accessible,
+			bikes_allowed
+		FROM 
+			trips
+		WHERE
+			trip_id IN (%s)
+	`, strings.Join(placeholders, ","))
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var trips []Trip
+
+	for rows.Next() {
+		var trip Trip
+		err := rows.Scan(
+			&trip.TripID,
+			&trip.RouteID,
+			&trip.TripHeadsign,
+			&trip.ShapeID,
+			&trip.ServiceID,
+			&trip.DirectionID,
+			&trip.WheelchairAccessible,
+			&trip.BikesAllowed,
+		)
+		if err != nil {
+			return nil, err
+		}
+		trips = append(trips, trip)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(trips) == 0 {
+		return nil, errors.New("no trips found for given IDs")
+	}
+
+	return trips, nil
 }
 
 /*

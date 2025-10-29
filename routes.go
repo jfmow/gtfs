@@ -326,3 +326,98 @@ func (v Database) GetRouteByTripID(tripId string) (map[string]Route, error) {
 
 	return routes, nil
 }
+
+type RouteSearch struct {
+	Name    string `json:"name"`
+	RouteId string `json:"route_id"`
+}
+
+func (v Database) SearchForRouteByNameOrID(searchText string) ([]RouteSearch, error) {
+	normalizedSearchText := strings.ToLower(strings.TrimSpace(searchText))
+	if normalizedSearchText == "" {
+		return nil, errors.New("empty search text")
+	}
+
+	words := strings.Fields(normalizedSearchText)
+
+	// Build scoring expression
+	scoreExprs := []string{}
+	args := []interface{}{}
+	for _, w := range words {
+		// exact word match (word boundaries using spaces)
+		scoreExprs = append(scoreExprs, fmt.Sprintf(`
+			(CASE 
+				WHEN LOWER(r.route_long_name) LIKE '%% ' || ? || ' %%' THEN 3
+				WHEN LOWER(r.route_long_name) LIKE ? || '%%' THEN 2
+				WHEN LOWER(r.route_long_name) LIKE '%%' || ? || '%%' THEN 1
+				ELSE 0
+			END)
+		`))
+		// arguments for the three checks
+		args = append(args, w, w, w)
+	}
+
+	scoreExpr := strings.Join(scoreExprs, " + ")
+
+	// Base WHERE clause: require all words appear somewhere
+	conditions := []string{}
+	for _, w := range words {
+		cond := `(LOWER(r.route_long_name) LIKE '%' || ? || '%'
+		          OR LOWER(r.route_short_name) LIKE '%' || ? || '%'
+		          OR LOWER(r.route_id) LIKE '%' || ? || '%'
+		          OR LOWER(n.ngram) LIKE '%' || ? || '%')`
+		conditions = append(conditions, cond)
+		args = append(args, w, w, w, w)
+	}
+
+	whereClause := strings.Join(conditions, " AND ")
+
+	query := fmt.Sprintf(`
+		SELECT DISTINCT
+			r.route_id,
+			r.route_short_name,
+			r.route_long_name,
+			r.route_type,
+			(%s) AS score
+		FROM
+			routes r
+		LEFT JOIN
+			route_ngrams n ON r.route_id = n.route_id
+		WHERE %s
+		ORDER BY score DESC, r.route_long_name ASC
+		LIMIT 100;
+	`, scoreExpr, whereClause)
+
+	rows, err := v.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var routeSearchResults []RouteSearch
+
+	for rows.Next() {
+		var route Route
+		var score int
+		err := rows.Scan(&route.RouteId, &route.RouteShortName, &route.RouteLongName, &route.RouteType, &score)
+		if err != nil {
+			return nil, err
+		}
+
+		routeSearchResults = append(routeSearchResults, RouteSearch{
+			Name:    route.RouteLongName,
+			RouteId: route.RouteId,
+		})
+
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(routeSearchResults) == 0 {
+		return nil, errors.New("no routes found for search")
+	}
+
+	return routeSearchResults, nil
+}
