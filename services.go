@@ -112,7 +112,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 		if departureTimeFilter != "" {
 			queryBuilder.WriteString(" AND st.stop_id = ?")
 		} else {
-			queryBuilder.WriteString(" WHERE st.stop_id = ?")
+			queryBuilder.WriteString(" AND st.stop_id = ?")
 		}
 	}
 
