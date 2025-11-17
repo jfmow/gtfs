@@ -100,8 +100,8 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 	JOIN stop_times st ON t.trip_id = st.trip_id
 	JOIN stops s ON st.stop_id = s.stop_id
 	JOIN routes r ON t.route_id = r.route_id
-	WHERE (st.pickup_type IS NULL OR st.pickup_type = 0)
-    AND (st.drop_off_type IS NULL OR st.drop_off_type = 0)
+	WHERE (st.drop_off_type = 0 OR st.drop_off_type IS NULL)
+  	AND (st.pickup_type = 0 OR st.pickup_type IS NULL)
 	`, dayColumn)
 
 	if departureTimeFilter != "" {
