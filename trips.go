@@ -199,7 +199,9 @@ func (v Database) GetServicesStopsByTrip(tripId string) ([]string, error) {
 		FROM 
 			stop_times 
 		WHERE 
-			trip_id = ?
+			trip_id = ?	
+		AND (pickup_type IS NULL OR pickup_type = 0)
+    	AND (drop_off_type IS NULL OR drop_off_type = 0)
 	`
 
 	rows, err := v.db.Query(query, tripId)

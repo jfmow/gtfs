@@ -251,6 +251,8 @@ func (v Database) GetStopsForTripID(tripID string) ([]Stop, int, error) {
 			stops s ON st.stop_id = s.stop_id
 		WHERE
 			st.trip_id = ?
+		AND (st.pickup_type IS NULL OR st.pickup_type = 0)
+		AND (st.drop_off_type IS NULL OR st.drop_off_type = 0)
 		ORDER BY
 			st.stop_sequence
 	`
@@ -334,6 +336,8 @@ func (v Database) GetStopTimesForTripID(tripID string) (map[string]struct {
 			stops s ON st.stop_id = s.stop_id
 		WHERE
 			st.trip_id = ?
+		AND (st.pickup_type IS NULL OR st.pickup_type = 0)
+		AND (st.drop_off_type IS NULL OR st.drop_off_type = 0)
 		ORDER BY
 			st.stop_sequence
 	`
@@ -448,6 +452,8 @@ func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 		trips t ON st.trip_id = t.trip_id
 	JOIN
 		adjusted_services a ON t.service_id = a.service_id
+	WHERE (st.pickup_type IS NULL OR st.pickup_type = 0)
+    AND (st.drop_off_type IS NULL OR st.drop_off_type = 0)
 	ORDER BY
 		st.trip_id,
 		st.stop_sequence
