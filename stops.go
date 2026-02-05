@@ -308,12 +308,135 @@ func (v Database) GetStopsForTripID(tripID string) ([]Stop, int, error) {
 	return stops, lowestSequence, nil
 }
 
-// GetStopTimesForTripID returns the stop times (arrival and departure) for all stops in a given trip.
-func (v Database) GetStopTimesForTripID(tripID string) (map[string]struct {
+/*
+Get the stops for x trips
+
+returned int is the lowest sequence returned, if -1, then its unknown
+*/
+func (v Database) GetStopsForTripIDs(tripIDs []string) (map[string]struct {
+	Stops          Stops
+	LowestSequence int
+}, error) {
+	db := v.db
+
+	if len(tripIDs) == 0 {
+		return nil, errors.New("tripIDs cannot be empty")
+	}
+
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(tripIDs)), ",")
+
+	query := `
+		SELECT
+			st.trip_id,
+			s.stop_id,
+			s.stop_code,
+			s.stop_name,
+			s.stop_lat,
+			s.stop_lon,
+			s.location_type,
+			s.parent_station,
+			s.platform_code,
+			s.wheelchair_boarding,
+			st.stop_sequence
+		FROM stop_times st
+		JOIN stops s ON st.stop_id = s.stop_id
+		WHERE st.trip_id IN (` + placeholders + `)
+		  AND (st.drop_off_type = 0 OR st.drop_off_type IS NULL)
+		  AND (st.pickup_type IN (0, 1) OR st.pickup_type IS NULL)
+		ORDER BY st.trip_id, st.stop_sequence
+	`
+
+	args := make([]interface{}, len(tripIDs))
+	for i, id := range tripIDs {
+		args[i] = id
+	}
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type tripResult struct {
+		Stops          Stops
+		LowestSequence int
+	}
+
+	results := make(map[string]tripResult)
+
+	for rows.Next() {
+		var tripID string
+		var stop Stop
+
+		if err := rows.Scan(
+			&tripID,
+			&stop.StopId,
+			&stop.StopCode,
+			&stop.StopName,
+			&stop.StopLat,
+			&stop.StopLon,
+			&stop.LocationType,
+			&stop.ParentStation,
+			&stop.PlatformNumber,
+			&stop.WheelChairBoarding,
+			&stop.Sequence,
+		); err != nil {
+			return nil, err
+		}
+
+		stop.StopType = typeOfStop(stop.StopName)
+
+		entry, exists := results[tripID]
+		if !exists {
+			entry = tripResult{
+				Stops:          Stops{},
+				LowestSequence: stop.Sequence, // safe initialization
+			}
+		}
+
+		if stop.Sequence < entry.LowestSequence {
+			entry.LowestSequence = stop.Sequence
+		}
+
+		entry.Stops = append(entry.Stops, stop)
+		results[tripID] = entry
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(results) == 0 {
+		return nil, errors.New("no stops found for provided trip IDs")
+	}
+
+	// Convert to requested anonymous struct map
+	out := make(map[string]struct {
+		Stops          Stops
+		LowestSequence int
+	})
+
+	for k, v := range results {
+		out[k] = struct {
+			Stops          Stops
+			LowestSequence int
+		}{
+			Stops:          v.Stops,
+			LowestSequence: v.LowestSequence,
+		}
+	}
+
+	return out, nil
+}
+
+type StopTime struct {
 	Stop
 	ArrivalTime   string
 	DepartureTime string
-}, error) {
+}
+
+// GetStopTimesForTripID returns the stop times (arrival and departure) for all stops in a given trip.
+func (v Database) GetStopTimesForTripID(tripID string) (map[string]StopTime, error) {
 	db := v.db
 
 	query := `
@@ -348,15 +471,7 @@ func (v Database) GetStopTimesForTripID(tripID string) (map[string]struct {
 	}
 	defer rows.Close()
 
-	var results map[string]struct {
-		Stop
-		ArrivalTime   string
-		DepartureTime string
-	} = make(map[string]struct {
-		Stop
-		ArrivalTime   string
-		DepartureTime string
-	})
+	var results map[string]StopTime = make(map[string]StopTime)
 
 	for rows.Next() {
 		var stop Stop
@@ -379,11 +494,7 @@ func (v Database) GetStopTimesForTripID(tripID string) (map[string]struct {
 			return nil, err
 		}
 		stop.StopType = typeOfStop(stop.StopName)
-		results[stop.StopId] = struct {
-			Stop
-			ArrivalTime   string
-			DepartureTime string
-		}{
+		results[stop.StopId] = StopTime{
 			Stop:          stop,
 			ArrivalTime:   arrival,
 			DepartureTime: departure,
