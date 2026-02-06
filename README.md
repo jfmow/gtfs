@@ -127,3 +127,12 @@ routesRoute.GET("/:routeId", func(c echo.Context) error {
   return JsonApiResponse(c, http.StatusOK, "", route)
 })
 ```
+
+### OSRM
+
+```bash
+docker run -t -v "${PWD}:/data" ghcr.io/project-osrm/osrm-backend osrm-extract -p /opt/car.lua /data/new-zealand-latest.osm.pbf || echo "osrm-extract failed"
+
+docker run -t -v "${PWD}:/data" ghcr.io/project-osrm/osrm-backend osrm-partition /data/new-zealand-latest.osrm || echo "osrm-partition failed"
+docker run -t -v "${PWD}:/data" ghcr.io/project-osrm/osrm-backend osrm-customize /data/new-zealand-latest.osrm || echo "osrm-customize failed"
+```
