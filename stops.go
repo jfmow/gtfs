@@ -27,8 +27,10 @@ type Stop struct {
 }
 
 type StopSearch struct {
-	Name       string `json:"name"`
-	TypeOfStop string `json:"type_of_stop"`
+	Name       string  `json:"name"`
+	TypeOfStop string  `json:"type_of_stop"`
+	Lat        float64 `json:"stop_lat"`
+	Lon        float64 `json:"stop_lon"`
 }
 
 type StopId string
@@ -1010,6 +1012,8 @@ func (v Database) SearchForStopsByNameOrCode(searchText string, includeChildStop
 			s.stop_name,
 			s.parent_station,
 			s.location_type,
+			s.stop_lat,
+			s.stop_lon,
 			(%s) AS score
 		FROM
 			stops s
@@ -1031,7 +1035,7 @@ func (v Database) SearchForStopsByNameOrCode(searchText string, includeChildStop
 	for rows.Next() {
 		var stop Stop
 		var score int
-		err := rows.Scan(&stop.StopId, &stop.StopCode, &stop.StopName, &stop.ParentStation, &stop.LocationType, &score)
+		err := rows.Scan(&stop.StopId, &stop.StopCode, &stop.StopName, &stop.ParentStation, &stop.LocationType, &stop.StopLat, &stop.StopLon, &score)
 		if err != nil {
 			return nil, err
 		}
@@ -1044,6 +1048,8 @@ func (v Database) SearchForStopsByNameOrCode(searchText string, includeChildStop
 		stopSearchResults = append(stopSearchResults, StopSearch{
 			Name:       stop.StopName + " " + stop.StopCode,
 			TypeOfStop: stop.StopType,
+			Lat:        stop.StopLat,
+			Lon:        stop.StopLon,
 		})
 	}
 
