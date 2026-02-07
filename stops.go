@@ -31,6 +31,8 @@ type StopSearch struct {
 	TypeOfStop string  `json:"type_of_stop"`
 	Lat        float64 `json:"stop_lat"`
 	Lon        float64 `json:"stop_lon"`
+	StopCode   string  `json:"stop_code"`
+	StopId     string  `json:"stop_id"`
 }
 
 type StopId string
@@ -1050,6 +1052,8 @@ func (v Database) SearchForStopsByNameOrCode(searchText string, includeChildStop
 			TypeOfStop: stop.StopType,
 			Lat:        stop.StopLat,
 			Lon:        stop.StopLon,
+			StopCode:   stop.StopCode,
+			StopId:     stop.StopId,
 		})
 	}
 
