@@ -150,17 +150,13 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 	dayStart := time.Date(departAt.Year(), departAt.Month(), departAt.Day(), 0, 0, 0, 0, v.timeZone)
 	departSec := int(departAt.Sub(dayStart).Seconds())
 
-	stops, err := v.GetStops(req.IncludeChildren)
+	stopMap, err := v.GetStopsMap(req.IncludeChildren)
 	if err != nil {
 		return nil, err
 	}
-	stopMap := make(map[string]Stop, len(stops))
-	for _, stop := range stops {
-		stopMap[stop.StopId] = stop
-	}
 
-	nearbyStartStops := filterNearbyStops(stops, req.StartLat, req.StartLon, req.MaxWalkKm, req.MaxNearbyStops)
-	nearbyEndStops := filterNearbyStops(stops, req.EndLat, req.EndLon, req.MaxWalkKm, req.MaxNearbyStops)
+	nearbyStartStops := filterNearbyStops(stopMap, req.StartLat, req.StartLon, req.MaxWalkKm, req.MaxNearbyStops)
+	nearbyEndStops := filterNearbyStops(stopMap, req.EndLat, req.EndLon, req.MaxWalkKm, req.MaxNearbyStops)
 
 	if len(nearbyStartStops) == 0 || len(nearbyEndStops) == 0 {
 		return nil, errors.New("no nearby stops found for start or end")
@@ -282,17 +278,13 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 	dayStart := time.Date(arriveAt.Year(), arriveAt.Month(), arriveAt.Day(), 0, 0, 0, 0, v.timeZone)
 	arriveSec := int(arriveAt.Sub(dayStart).Seconds())
 
-	stops, err := v.GetStops(req.IncludeChildren)
+	stopMap, err := v.GetStopsMap(req.IncludeChildren)
 	if err != nil {
 		return nil, err
 	}
-	stopMap := make(map[string]Stop, len(stops))
-	for _, stop := range stops {
-		stopMap[stop.StopId] = stop
-	}
 
-	nearbyStartStops := filterNearbyStops(stops, req.StartLat, req.StartLon, req.MaxWalkKm, req.MaxNearbyStops)
-	nearbyEndStops := filterNearbyStops(stops, req.EndLat, req.EndLon, req.MaxWalkKm, req.MaxNearbyStops)
+	nearbyStartStops := filterNearbyStops(stopMap, req.StartLat, req.StartLon, req.MaxWalkKm, req.MaxNearbyStops)
+	nearbyEndStops := filterNearbyStops(stopMap, req.EndLat, req.EndLon, req.MaxWalkKm, req.MaxNearbyStops)
 
 	if len(nearbyStartStops) == 0 || len(nearbyEndStops) == 0 {
 		return nil, errors.New("no nearby stops found for start or end")
@@ -522,11 +514,17 @@ func (v Database) loadTripStopTimes(dayStart time.Time) (map[string][]tripStopTi
 	return trips, nil
 }
 
-func filterNearbyStops(stops []Stop, lat, lon, maxDistanceKm float64, maxStops int) []StopWithDistance {
+func filterNearbyStops(stops map[string]Stop, lat, lon, maxDistanceKm float64, maxStops int) []StopWithDistance {
 	var stopDistances []StopWithDistance
-	for _, stop := range stops {
+	for key, stop := range stops {
 		distance := calculateDistance(lat, lon, stop.StopLat, stop.StopLon)
 		if distance <= maxDistanceKm {
+			if stop.ParentStation != "" {
+				if parentStop, found := stops[stop.ParentStation]; found {
+					stop.StopName = parentStop.StopName
+				}
+			}
+			stops[key] = stop // reassign to map!
 			stopDistances = append(stopDistances, StopWithDistance{Stop: stop, Distance: distance})
 		}
 	}
