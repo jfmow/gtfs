@@ -257,25 +257,35 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 }
 
 func (v Database) loadTripStopTimes(dayStart time.Time) (map[string][]tripStopTime, error) {
-	query := `
+	weekday := strings.ToLower(dayStart.Weekday().String()) // "monday", "tuesday", etc.
+
+	query := fmt.Sprintf(`
 	WITH active_services AS (
-		SELECT DISTINCT service_id
+		SELECT service_id
 		FROM calendar
-		WHERE start_date <= ? AND end_date >= ?
+		WHERE start_date <= ?
+		  AND end_date >= ?
+		  AND %s = 1
+
 		UNION ALL
+
 		SELECT service_id
 		FROM calendar_dates
-		WHERE date = ? AND exception_type = 1
+		WHERE date = ?
+		  AND exception_type = 1
 	),
 	removed_services AS (
 		SELECT service_id
 		FROM calendar_dates
-		WHERE date = ? AND exception_type = 2
+		WHERE date = ?
+		  AND exception_type = 2
 	),
 	adjusted_services AS (
-		SELECT service_id
+		SELECT DISTINCT service_id
 		FROM active_services
-		WHERE service_id NOT IN (SELECT service_id FROM removed_services)
+		WHERE service_id NOT IN (
+			SELECT service_id FROM removed_services
+		)
 	)
 	SELECT
 		st.trip_id,
@@ -288,11 +298,12 @@ func (v Database) loadTripStopTimes(dayStart time.Time) (map[string][]tripStopTi
 	JOIN trips t ON st.trip_id = t.trip_id
 	JOIN adjusted_services a ON t.service_id = a.service_id
 	WHERE (st.drop_off_type = 0 OR st.drop_off_type IS NULL)
-	  AND (st.pickup_type = 1 OR st.pickup_type = 0 OR st.pickup_type IS NULL)
+	  AND (st.pickup_type = 0 OR st.pickup_type IS NULL)
 	ORDER BY st.trip_id, st.stop_sequence
-`
+	`, weekday)
 
 	day := dayStart.Format("20060102")
+
 	rows, err := v.db.Query(query, day, day, day, day)
 	if err != nil {
 		return nil, err
@@ -304,7 +315,15 @@ func (v Database) loadTripStopTimes(dayStart time.Time) (map[string][]tripStopTi
 	for rows.Next() {
 		var tripID, routeID, stopID, arrivalTime, departureTime string
 		var sequence int
-		if err := rows.Scan(&tripID, &routeID, &stopID, &sequence, &arrivalTime, &departureTime); err != nil {
+
+		if err := rows.Scan(
+			&tripID,
+			&routeID,
+			&stopID,
+			&sequence,
+			&arrivalTime,
+			&departureTime,
+		); err != nil {
 			return nil, err
 		}
 
@@ -312,6 +331,7 @@ func (v Database) loadTripStopTimes(dayStart time.Time) (map[string][]tripStopTi
 		if err != nil {
 			arrivalSec = 0
 		}
+
 		departureSec, err := parseTimeToSeconds(departureTime)
 		if err != nil {
 			departureSec = arrivalSec

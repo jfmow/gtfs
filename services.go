@@ -38,8 +38,8 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 		}
 	}
 
-	if limit < 0 {
-		return nil, errors.New("limit cannot be negative")
+	if limit < -1 || limit == 0 {
+		return nil, errors.New("limit cannot be < -1 or 0")
 	}
 
 	db := v.db
