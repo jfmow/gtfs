@@ -22,6 +22,7 @@ type JourneyRequest struct {
 	EndLat          float64
 	EndLon          float64
 	DepartAt        time.Time
+	ArriveAt        time.Time
 	MaxWalkKm       float64
 	WalkSpeedKmph   float64
 	MaxTransfers    int
@@ -81,9 +82,23 @@ type stopPredecessor struct {
 	Mode       string
 }
 
+type stopSuccessor struct {
+	ToStopID  string
+	TripID    string
+	RouteID   string
+	DepartSec int
+	ArriveSec int
+	Mode      string
+}
+
 type journeyCandidate struct {
 	Stop       StopWithDistance
 	ArrivalSec int
+}
+
+type journeyOriginCandidate struct {
+	Stop      StopWithDistance
+	DepartSec int
 }
 
 // PlanJourneyRaptor computes a basic journey plan between two coordinates using a RAPTOR-style scan.
@@ -121,8 +136,14 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 	if req.MinResults > 0 && req.MaxResults < req.MinResults {
 		req.MaxResults = req.MinResults
 	}
-	if req.DepartAt.IsZero() {
-		return nil, errors.New("depart time required")
+	if req.DepartAt.IsZero() && req.ArriveAt.IsZero() {
+		return nil, errors.New("depart time or arrive time required")
+	}
+	if !req.DepartAt.IsZero() && !req.ArriveAt.IsZero() {
+		return nil, errors.New("provide either depart time or arrive time, not both")
+	}
+	if !req.ArriveAt.IsZero() {
+		return v.planJourneysRaptorArriveAt(req)
 	}
 
 	departAt := req.DepartAt.In(v.timeZone)
@@ -232,6 +253,147 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			continue
 		}
 		arrivalTime := dayStart.Add(time.Duration(candidate.ArrivalSec) * time.Second)
+		plan := JourneyPlan{
+			StartLat:      req.StartLat,
+			StartLon:      req.StartLon,
+			EndLat:        req.EndLat,
+			EndLon:        req.EndLon,
+			DepartureTime: departAt,
+			ArrivalTime:   arrivalTime,
+			TotalDuration: arrivalTime.Sub(departAt),
+			Transfers:     transfers,
+			TransferStops: transferStops,
+			Legs:          legs,
+			RouteGeoJSON:  buildJourneyGeoJSON(v, req, legs),
+			ID:            uuid.NewString(),
+		}
+		plans = append(plans, plan)
+	}
+
+	if len(plans) == 0 {
+		return nil, errors.New("no journey legs available")
+	}
+
+	return plans, nil
+}
+
+func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan, error) {
+	arriveAt := req.ArriveAt.In(v.timeZone)
+	dayStart := time.Date(arriveAt.Year(), arriveAt.Month(), arriveAt.Day(), 0, 0, 0, 0, v.timeZone)
+	arriveSec := int(arriveAt.Sub(dayStart).Seconds())
+
+	stops, err := v.GetStops(req.IncludeChildren)
+	if err != nil {
+		return nil, err
+	}
+	stopMap := make(map[string]Stop, len(stops))
+	for _, stop := range stops {
+		stopMap[stop.StopId] = stop
+	}
+
+	nearbyStartStops := filterNearbyStops(stops, req.StartLat, req.StartLon, req.MaxWalkKm, req.MaxNearbyStops)
+	nearbyEndStops := filterNearbyStops(stops, req.EndLat, req.EndLon, req.MaxWalkKm, req.MaxNearbyStops)
+
+	if len(nearbyStartStops) == 0 || len(nearbyEndStops) == 0 {
+		return nil, errors.New("no nearby stops found for start or end")
+	}
+
+	trips, err := v.loadTripStopTimes(dayStart)
+	if err != nil {
+		return nil, err
+	}
+	routes, err := v.GetRoutes()
+	if err != nil {
+		return nil, err
+	}
+	routeMap := make(map[string]Route, len(routes))
+	for _, route := range routes {
+		routeMap[route.RouteId] = route
+	}
+
+	latest := make(map[string]int, len(stopMap))
+	successor := make(map[string]stopSuccessor, len(stopMap))
+	updated := make(map[string]bool, len(stopMap))
+	endStopDistances := make(map[string]float64, len(nearbyEndStops))
+	const negInf = -1
+	for stopID := range stopMap {
+		latest[stopID] = negInf
+	}
+
+	for _, candidate := range nearbyEndStops {
+		walkSeconds := walkDurationSeconds(candidate.Distance, req.WalkSpeedKmph)
+		timeAtStop := arriveSec - walkSeconds
+		if timeAtStop < 0 {
+			continue
+		}
+		if timeAtStop > latest[candidate.Stop.StopId] {
+			latest[candidate.Stop.StopId] = timeAtStop
+			updated[candidate.Stop.StopId] = true
+			endStopDistances[candidate.Stop.StopId] = candidate.Distance
+			successor[candidate.Stop.StopId] = stopSuccessor{
+				ToStopID:  "",
+				TripID:    "",
+				RouteID:   "",
+				DepartSec: timeAtStop,
+				ArriveSec: arriveSec,
+				Mode:      "walk-destination",
+			}
+		}
+	}
+
+	for round := 0; round <= req.MaxTransfers; round++ {
+		nextUpdated := make(map[string]bool)
+		for _, tripTimes := range trips {
+			alightPossible := false
+			downstreamStopID := ""
+			downstreamArriveSec := 0
+			for i := len(tripTimes) - 1; i >= 0; i-- {
+				stopTime := tripTimes[i]
+				if !alightPossible {
+					if updated[stopTime.StopID] && latest[stopTime.StopID] >= stopTime.ArrivalSec {
+						alightPossible = true
+						downstreamStopID = stopTime.StopID
+						downstreamArriveSec = stopTime.ArrivalSec
+					}
+					continue
+				}
+
+				if stopTime.DepartureSec <= downstreamArriveSec && stopTime.DepartureSec > latest[stopTime.StopID] {
+					latest[stopTime.StopID] = stopTime.DepartureSec
+					successor[stopTime.StopID] = stopSuccessor{
+						ToStopID:  downstreamStopID,
+						TripID:    stopTime.TripID,
+						RouteID:   stopTime.RouteID,
+						DepartSec: stopTime.DepartureSec,
+						ArriveSec: downstreamArriveSec,
+						Mode:      "transit",
+					}
+					nextUpdated[stopTime.StopID] = true
+				}
+
+			}
+		}
+
+		if len(nextUpdated) == 0 {
+			break
+		}
+		updated = nextUpdated
+	}
+
+	candidates := selectBestOriginsArriveAt(nearbyStartStops, latest, req.WalkSpeedKmph, req.MaxResults)
+	if len(candidates) == 0 {
+		return nil, errors.New("no journey found between the given coordinates")
+	}
+
+	var plans []JourneyPlan
+	for _, candidate := range candidates {
+		startTimeAtStop := latest[candidate.Stop.Stop.StopId]
+		legs, transfers, transferStops := buildJourneyLegsArriveAt(candidate.Stop, candidate.DepartSec, startTimeAtStop, successor, stopMap, routeMap, dayStart, req.WalkSpeedKmph, req.StartLat, req.StartLon, req.EndLat, req.EndLon, endStopDistances)
+		if len(legs) == 0 {
+			continue
+		}
+		departAt := dayStart.Add(time.Duration(candidate.DepartSec) * time.Second)
+		arrivalTime := legs[len(legs)-1].ArrivalTime
 		plan := JourneyPlan{
 			StartLat:      req.StartLat,
 			StartLon:      req.StartLon,
@@ -437,6 +599,32 @@ func selectBestDestinations(candidates []StopWithDistance, arrival map[string]in
 	return results
 }
 
+func selectBestOriginsArriveAt(candidates []StopWithDistance, latest map[string]int, walkSpeedKmph float64, maxResults int) []journeyOriginCandidate {
+	var results []journeyOriginCandidate
+	for _, candidate := range candidates {
+		latestAtStop := latest[candidate.Stop.StopId]
+		if latestAtStop < 0 {
+			continue
+		}
+		walkSeconds := walkDurationSeconds(candidate.Distance, walkSpeedKmph)
+		departSec := latestAtStop - walkSeconds
+		if departSec < 0 {
+			continue
+		}
+		results = append(results, journeyOriginCandidate{
+			Stop:      candidate,
+			DepartSec: departSec,
+		})
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].DepartSec > results[j].DepartSec
+	})
+	if maxResults > 0 && len(results) > maxResults {
+		results = results[:maxResults]
+	}
+	return results
+}
+
 func buildJourneyLegs(endStop StopWithDistance, endArrivalSec int, predecessor map[string]stopPredecessor, stopMap map[string]Stop, routeMap map[string]Route, departAt time.Time, dayStart time.Time, walkSpeedKmph float64, startLat, startLon float64) ([]JourneyLeg, int, []Stop) {
 	var legs []JourneyLeg
 	transfers := 0
@@ -517,6 +705,99 @@ func buildJourneyLegs(endStop StopWithDistance, endArrivalSec int, predecessor m
 	}
 
 	reverseLegs(legs)
+
+	return legs, transfers, transferStops
+}
+
+func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startStopTimeSec int, successor map[string]stopSuccessor, stopMap map[string]Stop, routeMap map[string]Route, dayStart time.Time, walkSpeedKmph float64, startLat, startLon, endLat, endLon float64, endStopDistances map[string]float64) ([]JourneyLeg, int, []Stop) {
+	var legs []JourneyLeg
+	transfers := 0
+	var transferStops []Stop
+	currentStopID := startStop.Stop.StopId
+	lastTripID := ""
+	var lastStop *Stop
+
+	if currentStopID == "" {
+		return nil, 0, nil
+	}
+
+	departAt := dayStart.Add(time.Duration(departSec) * time.Second)
+	startStopTime := dayStart.Add(time.Duration(startStopTimeSec) * time.Second)
+
+	walkLeg := JourneyLeg{
+		Mode:          "walk",
+		FromStop:      nil,
+		ToStop:        &startStop.Stop,
+		TripID:        "",
+		RouteID:       "",
+		DepartureTime: departAt,
+		ArrivalTime:   startStopTime,
+		Duration:      startStopTime.Sub(departAt),
+		DistanceKm:    calculateDistance(startLat, startLon, startStop.Stop.StopLat, startStop.Stop.StopLon),
+	}
+	legs = append(legs, walkLeg)
+	lastStop = &startStop.Stop
+
+	for currentStopID != "" {
+		next, ok := successor[currentStopID]
+		if !ok {
+			break
+		}
+		if next.Mode == "walk-destination" {
+			stop := stopMap[currentStopID]
+			distance := endStopDistances[currentStopID]
+			if distance == 0 {
+				distance = calculateDistance(stop.StopLat, stop.StopLon, endLat, endLon)
+			}
+			departTime := dayStart.Add(time.Duration(next.DepartSec) * time.Second)
+			arriveTime := dayStart.Add(time.Duration(next.ArriveSec) * time.Second)
+			walkToDestination := JourneyLeg{
+				Mode:          "walk",
+				FromStop:      &stop,
+				ToStop:        nil,
+				TripID:        "",
+				RouteID:       "",
+				DepartureTime: departTime,
+				ArrivalTime:   arriveTime,
+				Duration:      arriveTime.Sub(departTime),
+				DistanceKm:    distance,
+			}
+			legs = append(legs, walkToDestination)
+			break
+		}
+		if next.Mode != "transit" {
+			break
+		}
+
+		fromStop := stopMap[currentStopID]
+		toStop := stopMap[next.ToStopID]
+		var routePtr *Route
+		if route, ok := routeMap[next.RouteID]; ok {
+			routeCopy := route
+			routePtr = &routeCopy
+		}
+		leg := JourneyLeg{
+			Mode:          "transit",
+			FromStop:      &fromStop,
+			ToStop:        &toStop,
+			TripID:        next.TripID,
+			RouteID:       next.RouteID,
+			Route:         routePtr,
+			DepartureTime: dayStart.Add(time.Duration(next.DepartSec) * time.Second),
+			ArrivalTime:   dayStart.Add(time.Duration(next.ArriveSec) * time.Second),
+			Duration:      time.Duration(next.ArriveSec-next.DepartSec) * time.Second,
+		}
+		if lastTripID != "" && lastTripID != next.TripID {
+			transfers++
+			if lastStop != nil {
+				transferStops = append(transferStops, *lastStop)
+			}
+		}
+		lastTripID = next.TripID
+		legs = append(legs, leg)
+		lastStop = &fromStop
+		currentStopID = next.ToStopID
+	}
 
 	return legs, transfers, transferStops
 }
