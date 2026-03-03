@@ -122,8 +122,11 @@ type realtimeTripAdjustment struct {
 	tripCanceled bool
 	stopBySeq    map[int]realtimeStopAdjustment
 	stopByID     map[string]realtimeStopAdjustment
-}
+	hasRealtime  bool
 
+	// NEW
+	startDate string
+}
 type journeyCandidate struct {
 	Stop       StopWithDistance
 	ArrivalSec int
@@ -233,18 +236,21 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		}
 	}
 
+	// inside PlanJourneysRaptor (depart-after scan)
 	for round := 0; round <= req.MaxTransfers; round++ {
 		nextUpdated := make(map[string]bool)
 		for _, tripTimes := range trips {
 			boarded := false
 			boardStopID := ""
 			boardDepartSec := 0
+			boardScheduledDepartSec := 0
 			for _, stopTime := range tripTimes {
 				if !boarded {
 					if stopTime.TripUsable && updated[stopTime.StopID] && arrival[stopTime.StopID] <= stopTime.DepartureSec {
 						boarded = true
 						boardStopID = stopTime.StopID
 						boardDepartSec = stopTime.DepartureSec
+						boardScheduledDepartSec = stopTime.ScheduledDepartureSec
 					}
 					continue
 				}
@@ -257,7 +263,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 						RouteID:            stopTime.RouteID,
 						DepartSec:          boardDepartSec,
 						ArriveSec:          stopTime.ArrivalSec,
-						ScheduledDepartSec: boardDepartSec,
+						ScheduledDepartSec: boardScheduledDepartSec,
 						ScheduledArriveSec: stopTime.ScheduledArrivalSec,
 						RealtimeStatus:     stopTime.RealtimeStatus,
 						TripUsable:         stopTime.TripUsable,
@@ -376,12 +382,14 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		}
 	}
 
+	// inside planJourneysRaptorArriveAt (arrive-by reverse scan)
 	for round := 0; round <= req.MaxTransfers; round++ {
 		nextUpdated := make(map[string]bool)
 		for _, tripTimes := range trips {
 			alightPossible := false
 			downstreamStopID := ""
 			downstreamArriveSec := 0
+			downstreamScheduledArriveSec := 0
 			for i := len(tripTimes) - 1; i >= 0; i-- {
 				stopTime := tripTimes[i]
 				if !alightPossible {
@@ -389,6 +397,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 						alightPossible = true
 						downstreamStopID = stopTime.StopID
 						downstreamArriveSec = stopTime.ArrivalSec
+						downstreamScheduledArriveSec = stopTime.ScheduledArrivalSec
 					}
 					continue
 				}
@@ -402,14 +411,13 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 						DepartSec:          stopTime.DepartureSec,
 						ArriveSec:          downstreamArriveSec,
 						ScheduledDepartSec: stopTime.ScheduledDepartureSec,
-						ScheduledArriveSec: stopTime.ScheduledArrivalSec,
+						ScheduledArriveSec: downstreamScheduledArriveSec,
 						RealtimeStatus:     stopTime.RealtimeStatus,
 						TripUsable:         stopTime.TripUsable,
 						Mode:               "transit",
 					}
 					nextUpdated[stopTime.StopID] = true
 				}
-
 			}
 		}
 
@@ -560,23 +568,29 @@ func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsreal
 		scheduledArrivalSec := arrivalSec
 		scheduledDepartureSec := departureSec
 
-		if adj, ok := realtimeAdjustments[tripID]; ok {
+		if adj, ok := realtimeAdjustments[tripID]; ok &&
+			adj.hasRealtime &&
+			(adj.startDate == "" || adj.startDate == day) {
+
+			// Apply trip-level delay first
 			arrivalSec += adj.tripDelay
 			departureSec += adj.tripDelay
-			if adj.tripDelay > 0 {
+
+			if adj.tripCanceled {
+				tripUsable = false
+				realtimeStatus = "canceled"
+			} else if adj.tripDelay > 0 {
 				realtimeStatus = "delayed"
 			} else if adj.tripDelay < 0 {
 				realtimeStatus = "early"
 			} else {
 				realtimeStatus = "on_time"
 			}
-			if adj.tripCanceled {
-				tripUsable = false
-				realtimeStatus = "canceled"
-			}
 
+			// Stop-specific overrides
 			stopAdj := realtimeStopAdjustment{}
 			hasStopAdj := false
+
 			if specific, found := adj.stopBySeq[sequence]; found {
 				stopAdj = specific
 				hasStopAdj = true
@@ -584,19 +598,20 @@ func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsreal
 				stopAdj = specific
 				hasStopAdj = true
 			}
+
 			if hasStopAdj {
 				arrivalSec = scheduledArrivalSec + stopAdj.arrivalDelay
 				departureSec = scheduledDepartureSec + stopAdj.departureDelay
-				if stopAdj.departureDelay > 0 || stopAdj.arrivalDelay > 0 {
-					realtimeStatus = "delayed"
-				} else if stopAdj.departureDelay < 0 || stopAdj.arrivalDelay < 0 {
-					realtimeStatus = "early"
-				} else {
-					realtimeStatus = "on_time"
-				}
+
 				if stopAdj.skipped {
 					tripUsable = false
 					realtimeStatus = "skipped"
+				} else if stopAdj.arrivalDelay > 0 || stopAdj.departureDelay > 0 {
+					realtimeStatus = "delayed"
+				} else if stopAdj.arrivalDelay < 0 || stopAdj.departureDelay < 0 {
+					realtimeStatus = "early"
+				} else {
+					realtimeStatus = "on_time"
 				}
 			}
 		}
@@ -642,15 +657,19 @@ func loadRealtimeTripAdjustments(client *gtfsrealtime.Realtime) map[string]realt
 	}
 
 	result := make(map[string]realtimeTripAdjustment, len(updates))
+
 	for tripID, update := range updates {
 		if update == nil {
 			continue
 		}
+
 		adj := realtimeTripAdjustment{
 			tripDelay:    int(update.GetDelay()),
 			tripCanceled: update.GetTrip().GetScheduleRelationship() == proto.TripDescriptor_CANCELED,
 			stopBySeq:    map[int]realtimeStopAdjustment{},
 			stopByID:     map[string]realtimeStopAdjustment{},
+			hasRealtime:  true,
+			startDate:    update.GetTrip().GetStartDate(), // NEW
 		}
 
 		for _, stu := range update.GetStopTimeUpdate() {
@@ -658,6 +677,12 @@ func loadRealtimeTripAdjustments(client *gtfsrealtime.Realtime) map[string]realt
 				arrivalDelay:   stopTimeEventDelay(stu.GetArrival(), adj.tripDelay),
 				departureDelay: stopTimeEventDelay(stu.GetDeparture(), adj.tripDelay),
 				skipped:        stu.GetScheduleRelationship() == proto.TripUpdate_StopTimeUpdate_SKIPPED,
+			}
+
+			if stopAdj.arrivalDelay != 0 ||
+				stopAdj.departureDelay != 0 ||
+				stopAdj.skipped {
+				adj.hasRealtime = true
 			}
 
 			if seq := int(stu.GetStopSequence()); seq > 0 {
@@ -668,7 +693,10 @@ func loadRealtimeTripAdjustments(client *gtfsrealtime.Realtime) map[string]realt
 			}
 		}
 
-		result[tripID] = adj
+		// Only store trips that actually have meaningful realtime changes
+		if adj.hasRealtime {
+			result[tripID] = adj
+		}
 	}
 
 	return result
@@ -1010,8 +1038,23 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 			if distance == 0 {
 				distance = calculateDistance(stop.StopLat, stop.StopLon, endLat, endLon)
 			}
+			walkSeconds := walkDurationSeconds(distance, walkSpeedKmph)
 			departTime := dayStart.Add(time.Duration(next.DepartSec) * time.Second)
-			arriveTime := dayStart.Add(time.Duration(next.ArriveSec) * time.Second)
+
+			// In arrive-by mode, `next.DepartSec` is only the latest feasible time to
+			// leave this stop and still meet the requested arrival. We should not force
+			// the rider to wait at the stop before beginning the final walk.
+			//
+			// Always start the final walk at the actual time we reach this stop from the
+			// previous leg (when known). This removes synthetic wait time and keeps leg
+			// timings contiguous. If realtime delays mean the request can no longer be
+			// met, this naturally surfaces as a later-than-requested arrival instead of
+			// impossible overlapping times.
+			if len(legs) > 0 {
+				departTime = legs[len(legs)-1].ArrivalTime
+			}
+
+			arriveTime := departTime.Add(time.Duration(walkSeconds) * time.Second)
 			walkToDestination := JourneyLeg{
 				Mode:          "walk",
 				FromStop:      &stop,
@@ -1020,7 +1063,7 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 				RouteID:       "",
 				DepartureTime: departTime,
 				ArrivalTime:   arriveTime,
-				Duration:      arriveTime.Sub(departTime),
+				Duration:      time.Duration(walkSeconds) * time.Second,
 				DistanceKm:    distance,
 				TripUsable:    true,
 			}
