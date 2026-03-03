@@ -237,7 +237,8 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		updated = nextUpdated
 	}
 
-	bestCandidates := selectBestDestinations(nearbyEndStops, arrival, departSec, req.WalkSpeedKmph, req.MaxResults)
+	candidateLimit := expandedCandidateLimit(req.MaxResults)
+	bestCandidates := selectBestDestinations(nearbyEndStops, arrival, departSec, req.WalkSpeedKmph, candidateLimit)
 	if len(bestCandidates) == 0 {
 		return nil, errors.New("no journey found between the given coordinates")
 	}
@@ -266,6 +267,11 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		plans = append(plans, plan)
 	}
 
+	if len(plans) == 0 {
+		return nil, errors.New("no journey legs available")
+	}
+
+	plans = dedupePlansByTransitService(plans, req.MaxResults)
 	if len(plans) == 0 {
 		return nil, errors.New("no journey legs available")
 	}
@@ -372,7 +378,8 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		updated = nextUpdated
 	}
 
-	candidates := selectBestOriginsArriveAt(nearbyStartStops, latest, req.WalkSpeedKmph, req.MaxResults)
+	candidateLimit := expandedCandidateLimit(req.MaxResults)
+	candidates := selectBestOriginsArriveAt(nearbyStartStops, latest, req.WalkSpeedKmph, candidateLimit)
 	if len(candidates) == 0 {
 		return nil, errors.New("no journey found between the given coordinates")
 	}
@@ -407,7 +414,19 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		return nil, errors.New("no journey legs available")
 	}
 
+	plans = dedupePlansByTransitService(plans, req.MaxResults)
+	if len(plans) == 0 {
+		return nil, errors.New("no journey legs available")
+	}
+
 	return plans, nil
+}
+
+func expandedCandidateLimit(maxResults int) int {
+	if maxResults <= 0 {
+		return 0
+	}
+	return maxResults * 3
 }
 
 func (v Database) loadTripStopTimes(dayStart time.Time) (map[string][]tripStopTime, error) {
@@ -621,6 +640,91 @@ func selectBestOriginsArriveAt(candidates []StopWithDistance, latest map[string]
 		results = results[:maxResults]
 	}
 	return results
+}
+
+func dedupePlansByTransitService(plans []JourneyPlan, maxResults int) []JourneyPlan {
+	if len(plans) <= 1 {
+		return plans
+	}
+
+	sort.SliceStable(plans, func(i, j int) bool {
+		if plans[i].TotalDuration != plans[j].TotalDuration {
+			return plans[i].TotalDuration < plans[j].TotalDuration
+		}
+		if plans[i].Transfers != plans[j].Transfers {
+			return plans[i].Transfers < plans[j].Transfers
+		}
+		walkI := totalWalkDistance(plans[i])
+		walkJ := totalWalkDistance(plans[j])
+		if walkI != walkJ {
+			return walkI < walkJ
+		}
+		return plans[i].ArrivalTime.Before(plans[j].ArrivalTime)
+	})
+
+	byService := make(map[string]JourneyPlan, len(plans))
+	for _, plan := range plans {
+		signature := transitServiceSignature(plan)
+		if _, exists := byService[signature]; !exists {
+			byService[signature] = plan
+		}
+	}
+
+	result := make([]JourneyPlan, 0, len(byService))
+	for _, plan := range byService {
+		result = append(result, plan)
+	}
+
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].TotalDuration != result[j].TotalDuration {
+			return result[i].TotalDuration < result[j].TotalDuration
+		}
+		if result[i].Transfers != result[j].Transfers {
+			return result[i].Transfers < result[j].Transfers
+		}
+		walkI := totalWalkDistance(result[i])
+		walkJ := totalWalkDistance(result[j])
+		if walkI != walkJ {
+			return walkI < walkJ
+		}
+		return result[i].ArrivalTime.Before(result[j].ArrivalTime)
+	})
+
+	if maxResults > 0 && len(result) > maxResults {
+		result = result[:maxResults]
+	}
+
+	return result
+}
+
+func transitServiceSignature(plan JourneyPlan) string {
+	var services []string
+	for _, leg := range plan.Legs {
+		if leg.Mode != "transit" {
+			continue
+		}
+		if leg.TripID != "" {
+			services = append(services, leg.TripID)
+			continue
+		}
+		if leg.RouteID != "" {
+			services = append(services, leg.RouteID)
+		}
+	}
+	if len(services) == 0 {
+		return "walk-only"
+	}
+	return strings.Join(services, "|")
+}
+
+func totalWalkDistance(plan JourneyPlan) float64 {
+	total := 0.0
+	for _, leg := range plan.Legs {
+		if leg.Mode == "walk" {
+			total += leg.DistanceKm
+		}
+	}
+	return total
 }
 
 func buildJourneyLegs(endStop StopWithDistance, endArrivalSec int, predecessor map[string]stopPredecessor, stopMap map[string]Stop, routeMap map[string]Route, departAt time.Time, dayStart time.Time, walkSpeedKmph float64, startLat, startLon float64) ([]JourneyLeg, int, []Stop) {
