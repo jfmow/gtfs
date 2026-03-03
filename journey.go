@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	gtfsrealtime "github.com/jfmow/gtfs/realtime"
+	"github.com/jfmow/gtfs/realtime/proto"
 )
 
 type JourneyRequest struct {
@@ -31,20 +33,26 @@ type JourneyRequest struct {
 	MaxResults      int
 	IncludeChildren bool
 	OsrmURL         string
+	Realtime        *gtfsrealtime.Realtime `json:"-"`
 }
 
 type JourneyLeg struct {
-	Mode           string
-	FromStop       *Stop
-	ToStop         *Stop
-	TripID         string
-	RouteID        string
-	Route          *Route
-	DepartureTime  time.Time
-	ArrivalTime    time.Time
-	Duration       time.Duration
-	DistanceKm     float64
-	StopSequenceID int
+	Mode                   string
+	FromStop               *Stop
+	ToStop                 *Stop
+	TripID                 string
+	RouteID                string
+	Route                  *Route
+	DepartureTime          time.Time
+	ArrivalTime            time.Time
+	Duration               time.Duration
+	DistanceKm             float64
+	StopSequenceID         int
+	ScheduledDepartureTime time.Time `json:"scheduled_departure_time,omitempty"`
+	ScheduledArrivalTime   time.Time `json:"scheduled_arrival_time,omitempty"`
+	RealtimeStatus         string    `json:"realtime_status,omitempty"`
+	DelaySeconds           int       `json:"delay_seconds,omitempty"`
+	TripUsable             bool      `json:"trip_usable"`
 }
 
 type JourneyPlan struct {
@@ -63,32 +71,57 @@ type JourneyPlan struct {
 }
 
 type tripStopTime struct {
-	StopID        string
-	StopSequence  int
-	ArrivalSec    int
-	DepartureSec  int
-	RouteID       string
-	TripID        string
-	ArrivalTime   string
-	DepartureTime string
+	StopID                string
+	StopSequence          int
+	ArrivalSec            int
+	DepartureSec          int
+	RouteID               string
+	TripID                string
+	ArrivalTime           string
+	DepartureTime         string
+	ScheduledArrivalSec   int
+	ScheduledDepartureSec int
+	RealtimeStatus        string
+	TripUsable            bool
 }
 
 type stopPredecessor struct {
-	FromStopID string
-	TripID     string
-	RouteID    string
-	DepartSec  int
-	ArriveSec  int
-	Mode       string
+	FromStopID         string
+	TripID             string
+	RouteID            string
+	DepartSec          int
+	ArriveSec          int
+	ScheduledDepartSec int
+	ScheduledArriveSec int
+	RealtimeStatus     string
+	TripUsable         bool
+	Mode               string
 }
 
 type stopSuccessor struct {
-	ToStopID  string
-	TripID    string
-	RouteID   string
-	DepartSec int
-	ArriveSec int
-	Mode      string
+	ToStopID           string
+	TripID             string
+	RouteID            string
+	DepartSec          int
+	ArriveSec          int
+	ScheduledDepartSec int
+	ScheduledArriveSec int
+	RealtimeStatus     string
+	TripUsable         bool
+	Mode               string
+}
+
+type realtimeStopAdjustment struct {
+	arrivalDelay   int
+	departureDelay int
+	skipped        bool
+}
+
+type realtimeTripAdjustment struct {
+	tripDelay    int
+	tripCanceled bool
+	stopBySeq    map[int]realtimeStopAdjustment
+	stopByID     map[string]realtimeStopAdjustment
 }
 
 type journeyCandidate struct {
@@ -162,7 +195,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		return nil, errors.New("no nearby stops found for start or end")
 	}
 
-	trips, err := v.loadTripStopTimes(dayStart)
+	trips, err := v.loadTripStopTimes(dayStart, req.Realtime)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +241,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			boardDepartSec := 0
 			for _, stopTime := range tripTimes {
 				if !boarded {
-					if updated[stopTime.StopID] && arrival[stopTime.StopID] <= stopTime.DepartureSec {
+					if stopTime.TripUsable && updated[stopTime.StopID] && arrival[stopTime.StopID] <= stopTime.DepartureSec {
 						boarded = true
 						boardStopID = stopTime.StopID
 						boardDepartSec = stopTime.DepartureSec
@@ -216,15 +249,19 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 					continue
 				}
 
-				if stopTime.ArrivalSec < arrival[stopTime.StopID] {
+				if stopTime.TripUsable && stopTime.ArrivalSec < arrival[stopTime.StopID] {
 					arrival[stopTime.StopID] = stopTime.ArrivalSec
 					predecessor[stopTime.StopID] = stopPredecessor{
-						FromStopID: boardStopID,
-						TripID:     stopTime.TripID,
-						RouteID:    stopTime.RouteID,
-						DepartSec:  boardDepartSec,
-						ArriveSec:  stopTime.ArrivalSec,
-						Mode:       "transit",
+						FromStopID:         boardStopID,
+						TripID:             stopTime.TripID,
+						RouteID:            stopTime.RouteID,
+						DepartSec:          boardDepartSec,
+						ArriveSec:          stopTime.ArrivalSec,
+						ScheduledDepartSec: boardDepartSec,
+						ScheduledArriveSec: stopTime.ScheduledArrivalSec,
+						RealtimeStatus:     stopTime.RealtimeStatus,
+						TripUsable:         stopTime.TripUsable,
+						Mode:               "transit",
 					}
 					nextUpdated[stopTime.StopID] = true
 				}
@@ -296,7 +333,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		return nil, errors.New("no nearby stops found for start or end")
 	}
 
-	trips, err := v.loadTripStopTimes(dayStart)
+	trips, err := v.loadTripStopTimes(dayStart, req.Realtime)
 	if err != nil {
 		return nil, err
 	}
@@ -348,7 +385,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 			for i := len(tripTimes) - 1; i >= 0; i-- {
 				stopTime := tripTimes[i]
 				if !alightPossible {
-					if updated[stopTime.StopID] && latest[stopTime.StopID] >= stopTime.ArrivalSec {
+					if stopTime.TripUsable && updated[stopTime.StopID] && latest[stopTime.StopID] >= stopTime.ArrivalSec {
 						alightPossible = true
 						downstreamStopID = stopTime.StopID
 						downstreamArriveSec = stopTime.ArrivalSec
@@ -356,15 +393,19 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 					continue
 				}
 
-				if stopTime.DepartureSec <= downstreamArriveSec && stopTime.DepartureSec > latest[stopTime.StopID] {
+				if stopTime.TripUsable && stopTime.DepartureSec <= downstreamArriveSec && stopTime.DepartureSec > latest[stopTime.StopID] {
 					latest[stopTime.StopID] = stopTime.DepartureSec
 					successor[stopTime.StopID] = stopSuccessor{
-						ToStopID:  downstreamStopID,
-						TripID:    stopTime.TripID,
-						RouteID:   stopTime.RouteID,
-						DepartSec: stopTime.DepartureSec,
-						ArriveSec: downstreamArriveSec,
-						Mode:      "transit",
+						ToStopID:           downstreamStopID,
+						TripID:             stopTime.TripID,
+						RouteID:            stopTime.RouteID,
+						DepartSec:          stopTime.DepartureSec,
+						ArriveSec:          downstreamArriveSec,
+						ScheduledDepartSec: stopTime.ScheduledDepartureSec,
+						ScheduledArriveSec: stopTime.ScheduledArrivalSec,
+						RealtimeStatus:     stopTime.RealtimeStatus,
+						TripUsable:         stopTime.TripUsable,
+						Mode:               "transit",
 					}
 					nextUpdated[stopTime.StopID] = true
 				}
@@ -429,7 +470,7 @@ func expandedCandidateLimit(maxResults int) int {
 	return maxResults * 3
 }
 
-func (v Database) loadTripStopTimes(dayStart time.Time) (map[string][]tripStopTime, error) {
+func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsrealtime.Realtime) (map[string][]tripStopTime, error) {
 	weekday := strings.ToLower(dayStart.Weekday().String()) // "monday", "tuesday", etc.
 
 	query := fmt.Sprintf(`
@@ -484,6 +525,10 @@ func (v Database) loadTripStopTimes(dayStart time.Time) (map[string][]tripStopTi
 	defer rows.Close()
 
 	trips := make(map[string][]tripStopTime)
+	realtimeAdjustments := map[string]realtimeTripAdjustment{}
+	if realtimeClient != nil {
+		realtimeAdjustments = loadRealtimeTripAdjustments(realtimeClient)
+	}
 
 	for rows.Next() {
 		var tripID, routeID, stopID, arrivalTime, departureTime string
@@ -510,15 +555,65 @@ func (v Database) loadTripStopTimes(dayStart time.Time) (map[string][]tripStopTi
 			departureSec = arrivalSec
 		}
 
+		realtimeStatus := "scheduled"
+		tripUsable := true
+		scheduledArrivalSec := arrivalSec
+		scheduledDepartureSec := departureSec
+
+		if adj, ok := realtimeAdjustments[tripID]; ok {
+			arrivalSec += adj.tripDelay
+			departureSec += adj.tripDelay
+			if adj.tripDelay > 0 {
+				realtimeStatus = "delayed"
+			} else if adj.tripDelay < 0 {
+				realtimeStatus = "early"
+			} else {
+				realtimeStatus = "on_time"
+			}
+			if adj.tripCanceled {
+				tripUsable = false
+				realtimeStatus = "canceled"
+			}
+
+			stopAdj := realtimeStopAdjustment{}
+			hasStopAdj := false
+			if specific, found := adj.stopBySeq[sequence]; found {
+				stopAdj = specific
+				hasStopAdj = true
+			} else if specific, found := adj.stopByID[stopID]; found {
+				stopAdj = specific
+				hasStopAdj = true
+			}
+			if hasStopAdj {
+				arrivalSec = scheduledArrivalSec + stopAdj.arrivalDelay
+				departureSec = scheduledDepartureSec + stopAdj.departureDelay
+				if stopAdj.departureDelay > 0 || stopAdj.arrivalDelay > 0 {
+					realtimeStatus = "delayed"
+				} else if stopAdj.departureDelay < 0 || stopAdj.arrivalDelay < 0 {
+					realtimeStatus = "early"
+				} else {
+					realtimeStatus = "on_time"
+				}
+				if stopAdj.skipped {
+					tripUsable = false
+					realtimeStatus = "skipped"
+				}
+			}
+		}
+
 		trips[tripID] = append(trips[tripID], tripStopTime{
-			StopID:        stopID,
-			StopSequence:  sequence,
-			ArrivalSec:    arrivalSec,
-			DepartureSec:  departureSec,
-			RouteID:       routeID,
-			TripID:        tripID,
-			ArrivalTime:   arrivalTime,
-			DepartureTime: departureTime,
+			StopID:                stopID,
+			StopSequence:          sequence,
+			ArrivalSec:            clampNonNegative(arrivalSec),
+			DepartureSec:          clampNonNegative(departureSec),
+			RouteID:               routeID,
+			TripID:                tripID,
+			ArrivalTime:           arrivalTime,
+			DepartureTime:         departureTime,
+			ScheduledArrivalSec:   scheduledArrivalSec,
+			ScheduledDepartureSec: scheduledDepartureSec,
+			RealtimeStatus:        realtimeStatus,
+			TripUsable:            tripUsable,
 		})
 	}
 
@@ -531,6 +626,62 @@ func (v Database) loadTripStopTimes(dayStart time.Time) (map[string][]tripStopTi
 	}
 
 	return trips, nil
+}
+
+func clampNonNegative(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func loadRealtimeTripAdjustments(client *gtfsrealtime.Realtime) map[string]realtimeTripAdjustment {
+	updates, err := client.GetTripUpdates()
+	if err != nil {
+		return map[string]realtimeTripAdjustment{}
+	}
+
+	result := make(map[string]realtimeTripAdjustment, len(updates))
+	for tripID, update := range updates {
+		if update == nil {
+			continue
+		}
+		adj := realtimeTripAdjustment{
+			tripDelay:    int(update.GetDelay()),
+			tripCanceled: update.GetTrip().GetScheduleRelationship() == proto.TripDescriptor_CANCELED,
+			stopBySeq:    map[int]realtimeStopAdjustment{},
+			stopByID:     map[string]realtimeStopAdjustment{},
+		}
+
+		for _, stu := range update.GetStopTimeUpdate() {
+			stopAdj := realtimeStopAdjustment{
+				arrivalDelay:   stopTimeEventDelay(stu.GetArrival(), adj.tripDelay),
+				departureDelay: stopTimeEventDelay(stu.GetDeparture(), adj.tripDelay),
+				skipped:        stu.GetScheduleRelationship() == proto.TripUpdate_StopTimeUpdate_SKIPPED,
+			}
+
+			if seq := int(stu.GetStopSequence()); seq > 0 {
+				adj.stopBySeq[seq] = stopAdj
+			}
+			if sid := stu.GetStopId(); sid != "" {
+				adj.stopByID[sid] = stopAdj
+			}
+		}
+
+		result[tripID] = adj
+	}
+
+	return result
+}
+
+func stopTimeEventDelay(event *proto.TripUpdate_StopTimeEvent, fallback int) int {
+	if event == nil {
+		return fallback
+	}
+	if event.Delay != nil {
+		return int(event.GetDelay())
+	}
+	return fallback
 }
 
 func filterNearbyStops(stops map[string]Stop, lat, lon, maxDistanceKm float64, maxStops int) []StopWithDistance {
@@ -749,6 +900,7 @@ func buildJourneyLegs(endStop StopWithDistance, endArrivalSec int, predecessor m
 		ArrivalTime:   dayStart.Add(time.Duration(endArrivalSec) * time.Second),
 		Duration:      time.Duration(walkDurationSeconds(endStop.Distance, walkSpeedKmph)) * time.Second,
 		DistanceKm:    endStop.Distance,
+		TripUsable:    true,
 	}
 	legs = append(legs, walkToDestination)
 	lastStop = &endStop.Stop
@@ -770,6 +922,7 @@ func buildJourneyLegs(endStop StopWithDistance, endArrivalSec int, predecessor m
 				ArrivalTime:   dayStart.Add(time.Duration(pred.ArriveSec) * time.Second),
 				Duration:      time.Duration(pred.ArriveSec-int(departAt.Sub(dayStart).Seconds())) * time.Second,
 				DistanceKm:    calculateDistance(startLat, startLon, stop.StopLat, stop.StopLon),
+				TripUsable:    true,
 			}
 			legs = append(legs, walkLeg)
 			lastStop = &stop
@@ -784,15 +937,20 @@ func buildJourneyLegs(endStop StopWithDistance, endArrivalSec int, predecessor m
 			routePtr = &routeCopy
 		}
 		leg := JourneyLeg{
-			Mode:          "transit",
-			FromStop:      &fromStop,
-			ToStop:        &toStop,
-			TripID:        pred.TripID,
-			RouteID:       pred.RouteID,
-			Route:         routePtr,
-			DepartureTime: dayStart.Add(time.Duration(pred.DepartSec) * time.Second),
-			ArrivalTime:   dayStart.Add(time.Duration(pred.ArriveSec) * time.Second),
-			Duration:      time.Duration(pred.ArriveSec-pred.DepartSec) * time.Second,
+			Mode:                   "transit",
+			FromStop:               &fromStop,
+			ToStop:                 &toStop,
+			TripID:                 pred.TripID,
+			RouteID:                pred.RouteID,
+			Route:                  routePtr,
+			DepartureTime:          dayStart.Add(time.Duration(pred.DepartSec) * time.Second),
+			ArrivalTime:            dayStart.Add(time.Duration(pred.ArriveSec) * time.Second),
+			Duration:               time.Duration(pred.ArriveSec-pred.DepartSec) * time.Second,
+			ScheduledDepartureTime: dayStart.Add(time.Duration(pred.ScheduledDepartSec) * time.Second),
+			ScheduledArrivalTime:   dayStart.Add(time.Duration(pred.ScheduledArriveSec) * time.Second),
+			RealtimeStatus:         pred.RealtimeStatus,
+			DelaySeconds:           pred.ArriveSec - pred.ScheduledArriveSec,
+			TripUsable:             pred.TripUsable,
 		}
 		if lastTripID != "" && lastTripID != pred.TripID {
 			transfers++
@@ -836,6 +994,7 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 		ArrivalTime:   startStopTime,
 		Duration:      startStopTime.Sub(departAt),
 		DistanceKm:    calculateDistance(startLat, startLon, startStop.Stop.StopLat, startStop.Stop.StopLon),
+		TripUsable:    true,
 	}
 	legs = append(legs, walkLeg)
 	lastStop = &startStop.Stop
@@ -863,6 +1022,7 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 				ArrivalTime:   arriveTime,
 				Duration:      arriveTime.Sub(departTime),
 				DistanceKm:    distance,
+				TripUsable:    true,
 			}
 			legs = append(legs, walkToDestination)
 			break
@@ -879,15 +1039,20 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 			routePtr = &routeCopy
 		}
 		leg := JourneyLeg{
-			Mode:          "transit",
-			FromStop:      &fromStop,
-			ToStop:        &toStop,
-			TripID:        next.TripID,
-			RouteID:       next.RouteID,
-			Route:         routePtr,
-			DepartureTime: dayStart.Add(time.Duration(next.DepartSec) * time.Second),
-			ArrivalTime:   dayStart.Add(time.Duration(next.ArriveSec) * time.Second),
-			Duration:      time.Duration(next.ArriveSec-next.DepartSec) * time.Second,
+			Mode:                   "transit",
+			FromStop:               &fromStop,
+			ToStop:                 &toStop,
+			TripID:                 next.TripID,
+			RouteID:                next.RouteID,
+			Route:                  routePtr,
+			DepartureTime:          dayStart.Add(time.Duration(next.DepartSec) * time.Second),
+			ArrivalTime:            dayStart.Add(time.Duration(next.ArriveSec) * time.Second),
+			Duration:               time.Duration(next.ArriveSec-next.DepartSec) * time.Second,
+			ScheduledDepartureTime: dayStart.Add(time.Duration(next.ScheduledDepartSec) * time.Second),
+			ScheduledArrivalTime:   dayStart.Add(time.Duration(next.ScheduledArriveSec) * time.Second),
+			RealtimeStatus:         next.RealtimeStatus,
+			DelaySeconds:           next.ArriveSec - next.ScheduledArriveSec,
+			TripUsable:             next.TripUsable,
 		}
 		if lastTripID != "" && lastTripID != next.TripID {
 			transfers++
