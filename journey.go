@@ -525,6 +525,7 @@ func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsreal
 	`, weekday)
 
 	day := dayStart.Format("20060102")
+	today := time.Now().In(v.timeZone).Format("20060102")
 
 	rows, err := v.db.Query(query, day, day, day, day)
 	if err != nil {
@@ -568,9 +569,7 @@ func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsreal
 		scheduledArrivalSec := arrivalSec
 		scheduledDepartureSec := departureSec
 
-		if adj, ok := realtimeAdjustments[tripID]; ok &&
-			adj.hasRealtime &&
-			(adj.startDate == "" || adj.startDate == day) {
+		if adj, ok := realtimeAdjustments[tripID]; ok && shouldApplyRealtimeAdjustment(adj, day, today) {
 
 			// Apply trip-level delay first
 			arrivalSec += adj.tripDelay
@@ -648,6 +647,21 @@ func clampNonNegative(value int) int {
 		return 0
 	}
 	return value
+}
+
+func shouldApplyRealtimeAdjustment(adj realtimeTripAdjustment, serviceDay, today string) bool {
+	if !adj.hasRealtime {
+		return false
+	}
+
+	if adj.startDate != "" {
+		return adj.startDate == serviceDay
+	}
+
+	// Some feeds omit TripDescriptor.start_date and only describe the currently running
+	// trip instance. To avoid leaking those updates onto reused trip IDs for future
+	// planning days, only apply date-less updates for today's service day.
+	return serviceDay == today
 }
 
 func loadRealtimeTripAdjustments(client *gtfsrealtime.Realtime) map[string]realtimeTripAdjustment {
