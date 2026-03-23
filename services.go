@@ -20,6 +20,7 @@ type StopTimes struct {
 	TripData       Trip   `json:"trip_data"`
 	RouteColor     string `json:"route_color"`
 	RouteShortName string `json:"route_short_name"`
+	RouteLongName  string `json:"route_long_name"`
 }
 
 /*
@@ -88,6 +89,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 		st.stop_headsign, 
 		r.route_color, 
 		r.route_short_name,
+		r.route_long_name,
 		s.stop_name, 
 		s.stop_lat, 
 		s.stop_lon, 
@@ -166,6 +168,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 			StopParentStationId  string
 			Platform             string
 			RouteShortName       string
+			RouteLongName        string
 			WheelchairAccessible int
 			BikesAllowed         int
 		}
@@ -185,6 +188,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 			&result.StopSequence,
 			&result.StopHeadsign,
 			&result.RouteColor,
+			&result.RouteShortName,
 			&result.RouteShortName,
 			&result.StopName,
 			&result.StopLat,
