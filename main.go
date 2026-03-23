@@ -89,3 +89,7 @@ func (v Database) FeedEndDate() (time.Time, error) {
 
 	return feedEndTime, nil
 }
+
+func (v Database) LocalTimeZone() *time.Location {
+	return v.timeZone
+}
