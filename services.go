@@ -189,7 +189,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 			&result.StopHeadsign,
 			&result.RouteColor,
 			&result.RouteShortName,
-			&result.RouteShortName,
+			&result.RouteLongName,
 			&result.StopName,
 			&result.StopLat,
 			&result.StopLon,
