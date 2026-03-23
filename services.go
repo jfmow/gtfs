@@ -242,6 +242,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 			TripData:       tripData,
 			RouteColor:     result.RouteColor,
 			RouteShortName: result.RouteShortName,
+			RouteLongName:  result.RouteLongName,
 		})
 	}
 
