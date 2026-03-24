@@ -128,3 +128,25 @@ func TestPreferCloserOriginStopOnSameTripKeepsOriginalWhenLaterStopUnreachable(t
 		t.Fatalf("expected original boarding stop to remain, got %q", got)
 	}
 }
+
+func TestNormalizeJourneyRequestKeepsExplicitZeroTransfers(t *testing.T) {
+	req := normalizeJourneyRequest(JourneyRequest{
+		MaxTransfers: 0,
+		MaxResults:   1,
+	})
+
+	if req.MaxTransfers != 0 {
+		t.Fatalf("expected explicit zero transfers to be preserved, got %d", req.MaxTransfers)
+	}
+}
+
+func TestNormalizeJourneyRequestUsesDefaultTransfersForNegativeValue(t *testing.T) {
+	req := normalizeJourneyRequest(JourneyRequest{
+		MaxTransfers: -1,
+		MaxResults:   1,
+	})
+
+	if req.MaxTransfers != 2 {
+		t.Fatalf("expected negative max transfers to default to 2, got %d", req.MaxTransfers)
+	}
+}

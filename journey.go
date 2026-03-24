@@ -151,27 +151,8 @@ func (v Database) PlanJourneyRaptor(req JourneyRequest) (*[]JourneyPlan, error) 
 
 // PlanJourneysRaptor computes multiple journey options between two coordinates using a RAPTOR-style scan.
 func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) {
-	if req.MaxWalkKm <= 0 {
-		req.MaxWalkKm = 1.0
-	}
-	if req.WalkSpeedKmph <= 0 {
-		req.WalkSpeedKmph = 4.8
-	}
-	if req.MaxTransfers <= 0 {
-		req.MaxTransfers = 2
-	}
-	if req.MaxNearbyStops <= 0 {
-		req.MaxNearbyStops = 50
-	}
-	if req.MinResults < 0 {
-		req.MinResults = 0
-	}
-	if req.MaxResults <= 0 {
-		req.MaxResults = 1
-	}
-	if req.MinResults > 0 && req.MaxResults < req.MinResults {
-		req.MaxResults = req.MinResults
-	}
+	req = normalizeJourneyRequest(req)
+
 	if req.DepartAt.IsZero() && req.ArriveAt.IsZero() {
 		return nil, errors.New("depart time or arrive time required")
 	}
@@ -321,6 +302,32 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 	}
 
 	return plans, nil
+}
+
+func normalizeJourneyRequest(req JourneyRequest) JourneyRequest {
+	if req.MaxWalkKm <= 0 {
+		req.MaxWalkKm = 1.0
+	}
+	if req.WalkSpeedKmph <= 0 {
+		req.WalkSpeedKmph = 4.8
+	}
+	// Keep an explicit zero transfer request ("direct service only") intact.
+	if req.MaxTransfers < 0 {
+		req.MaxTransfers = 2
+	}
+	if req.MaxNearbyStops <= 0 {
+		req.MaxNearbyStops = 50
+	}
+	if req.MinResults < 0 {
+		req.MinResults = 0
+	}
+	if req.MaxResults <= 0 {
+		req.MaxResults = 1
+	}
+	if req.MinResults > 0 && req.MaxResults < req.MinResults {
+		req.MaxResults = req.MinResults
+	}
+	return req
 }
 
 func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan, error) {
