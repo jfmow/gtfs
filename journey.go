@@ -292,6 +292,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		if len(legs) == 0 {
 			continue
 		}
+		legs = preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, departAt, dayStart, req.WalkSpeedKmph)
 		arrivalTime := dayStart.Add(time.Duration(candidate.ArrivalSec) * time.Second)
 		plan := JourneyPlan{
 			StartLat:      req.StartLat,
@@ -757,6 +758,109 @@ func walkDurationSeconds(distanceKm, speedKmph float64) int {
 		speedKmph = 4.8
 	}
 	return int(math.Round((distanceKm / speedKmph) * 3600))
+}
+
+func preferCloserOriginStopOnSameTrip(legs []JourneyLeg, nearbyStartStops []StopWithDistance, trips map[string][]tripStopTime, stopMap map[string]Stop, departAt, dayStart time.Time, walkSpeedKmph float64) []JourneyLeg {
+	if len(legs) < 2 {
+		return legs
+	}
+
+	firstTransitIndex := -1
+	for i, leg := range legs {
+		if leg.Mode == "transit" {
+			firstTransitIndex = i
+			break
+		}
+	}
+	if firstTransitIndex <= 0 {
+		return legs
+	}
+
+	firstTransit := legs[firstTransitIndex]
+	firstWalk := legs[firstTransitIndex-1]
+	if firstWalk.Mode != "walk" || firstTransit.FromStop == nil || firstTransit.ToStop == nil {
+		return legs
+	}
+
+	tripTimes, ok := trips[firstTransit.TripID]
+	if !ok || len(tripTimes) == 0 {
+		return legs
+	}
+
+	originalBoardIndex := -1
+	originalAlightIndex := -1
+	for i, stopTime := range tripTimes {
+		if originalBoardIndex == -1 && stopTime.StopID == firstTransit.FromStop.StopId {
+			originalBoardIndex = i
+		}
+		if originalAlightIndex == -1 && stopTime.StopID == firstTransit.ToStop.StopId {
+			originalAlightIndex = i
+		}
+	}
+	if originalBoardIndex == -1 || originalAlightIndex == -1 || originalBoardIndex >= originalAlightIndex {
+		return legs
+	}
+
+	nearbyByStopID := make(map[string]StopWithDistance, len(nearbyStartStops))
+	for _, candidate := range nearbyStartStops {
+		nearbyByStopID[candidate.Stop.StopId] = candidate
+	}
+
+	originalDistance := firstWalk.DistanceKm
+	departSec := int(departAt.Sub(dayStart).Seconds())
+	bestStop := StopWithDistance{}
+	bestStopTime := tripStopTime{}
+	foundBetterStop := false
+
+	for i := originalBoardIndex + 1; i < originalAlightIndex; i++ {
+		stopTime := tripTimes[i]
+		candidate, ok := nearbyByStopID[stopTime.StopID]
+		if !ok || !stopTime.TripUsable {
+			continue
+		}
+
+		walkSeconds := walkDurationSeconds(candidate.Distance, walkSpeedKmph)
+		if departSec+walkSeconds > stopTime.DepartureSec {
+			continue
+		}
+		if candidate.Distance >= originalDistance {
+			continue
+		}
+
+		if !foundBetterStop || candidate.Distance < bestStop.Distance || (candidate.Distance == bestStop.Distance && stopTime.DepartureSec > bestStopTime.DepartureSec) {
+			bestStop = candidate
+			bestStopTime = stopTime
+			foundBetterStop = true
+		}
+	}
+	if !foundBetterStop {
+		return legs
+	}
+
+	updatedWalk := firstWalk
+	updatedWalk.ToStop = &bestStop.Stop
+	updatedWalk.ArrivalTime = dayStart.Add(time.Duration(departSec+walkDurationSeconds(bestStop.Distance, walkSpeedKmph)) * time.Second)
+	updatedWalk.Duration = updatedWalk.ArrivalTime.Sub(updatedWalk.DepartureTime)
+	updatedWalk.DistanceKm = bestStop.Distance
+
+	updatedTransit := firstTransit
+	if stop, ok := stopMap[bestStopTime.StopID]; ok {
+		stopCopy := stop
+		updatedTransit.FromStop = &stopCopy
+	} else {
+		stopCopy := bestStop.Stop
+		updatedTransit.FromStop = &stopCopy
+	}
+	updatedTransit.DepartureTime = dayStart.Add(time.Duration(bestStopTime.DepartureSec) * time.Second)
+	updatedTransit.Duration = updatedTransit.ArrivalTime.Sub(updatedTransit.DepartureTime)
+	updatedTransit.ScheduledDepartureTime = dayStart.Add(time.Duration(bestStopTime.ScheduledDepartureSec) * time.Second)
+	updatedTransit.RealtimeStatus = bestStopTime.RealtimeStatus
+	updatedTransit.TripUsable = bestStopTime.TripUsable
+
+	legs[firstTransitIndex-1] = updatedWalk
+	legs[firstTransitIndex] = updatedTransit
+
+	return legs
 }
 
 func parseTimeToSeconds(timeStr string) (int, error) {
