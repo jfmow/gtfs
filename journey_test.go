@@ -150,3 +150,31 @@ func TestNormalizeJourneyRequestUsesDefaultTransfersForNegativeValue(t *testing.
 		t.Fatalf("expected negative max transfers to default to 2, got %d", req.MaxTransfers)
 	}
 }
+
+func TestCanBoardTransitAtStopRequiresOneMinuteForTransfers(t *testing.T) {
+	if canBoardTransitAtStop(10*60, 10*60, false) != true {
+		t.Fatalf("expected non-transfer boarding at same second to be allowed")
+	}
+
+	if canBoardTransitAtStop(10*60, 10*60+59, true) != false {
+		t.Fatalf("expected transfer boarding with less than one minute to be rejected")
+	}
+
+	if canBoardTransitAtStop(10*60, 10*60+60, true) != true {
+		t.Fatalf("expected transfer boarding with one minute gap to be allowed")
+	}
+}
+
+func TestCanAlightForTransitConnectionRequiresOneMinuteForTransfers(t *testing.T) {
+	if canAlightForTransitConnection(10*60, 10*60, false) != true {
+		t.Fatalf("expected non-transfer alight at same second to be allowed")
+	}
+
+	if canAlightForTransitConnection(10*60, 10*60+59, true) != false {
+		t.Fatalf("expected transfer alight with less than one minute to be rejected")
+	}
+
+	if canAlightForTransitConnection(10*60, 10*60+60, true) != true {
+		t.Fatalf("expected transfer alight with one minute gap to be allowed")
+	}
+}

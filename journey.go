@@ -137,6 +137,8 @@ type journeyOriginCandidate struct {
 	DepartSec int
 }
 
+const minDirectTransferSeconds = 60
+
 // PlanJourneyRaptor computes a basic journey plan between two coordinates using a RAPTOR-style scan.
 func (v Database) PlanJourneyRaptor(req JourneyRequest) (*[]JourneyPlan, error) {
 	plans, err := v.PlanJourneysRaptor(req)
@@ -227,7 +229,10 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			boardScheduledDepartSec := 0
 			for _, stopTime := range tripTimes {
 				if !boarded {
-					if stopTime.TripUsable && updated[stopTime.StopID] && arrival[stopTime.StopID] <= stopTime.DepartureSec {
+					isTransfer := round > 0
+					if stopTime.TripUsable &&
+						updated[stopTime.StopID] &&
+						canBoardTransitAtStop(arrival[stopTime.StopID], stopTime.DepartureSec, isTransfer) {
 						boarded = true
 						boardStopID = stopTime.StopID
 						boardDepartSec = stopTime.DepartureSec
@@ -401,7 +406,10 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 			for i := len(tripTimes) - 1; i >= 0; i-- {
 				stopTime := tripTimes[i]
 				if !alightPossible {
-					if stopTime.TripUsable && updated[stopTime.StopID] && latest[stopTime.StopID] >= stopTime.ArrivalSec {
+					isTransfer := round > 0
+					if stopTime.TripUsable &&
+						updated[stopTime.StopID] &&
+						canAlightForTransitConnection(stopTime.ArrivalSec, latest[stopTime.StopID], isTransfer) {
 						alightPossible = true
 						downstreamStopID = stopTime.StopID
 						downstreamArriveSec = stopTime.ArrivalSec
@@ -484,6 +492,22 @@ func expandedCandidateLimit(maxResults int) int {
 		return 0
 	}
 	return maxResults * 3
+}
+
+func canBoardTransitAtStop(arrivalSec, departureSec int, isTransfer bool) bool {
+	requiredGap := 0
+	if isTransfer {
+		requiredGap = minDirectTransferSeconds
+	}
+	return arrivalSec+requiredGap <= departureSec
+}
+
+func canAlightForTransitConnection(arrivalSec, latestAllowedSec int, isTransfer bool) bool {
+	requiredGap := 0
+	if isTransfer {
+		requiredGap = minDirectTransferSeconds
+	}
+	return arrivalSec+requiredGap <= latestAllowedSec
 }
 
 func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsrealtime.Realtime) (map[string][]tripStopTime, error) {
