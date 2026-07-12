@@ -108,7 +108,9 @@ func (v Realtime) GetTripUpdates() (TripUpdatesMap, error) {
 		}
 	}
 
-	v.tripUpdatesCache.lastUpdated = time.Now()
+	now = time.Now()
+	v.tripUpdatesCache.lastUpdated = now
+	v.addTripUpdateHistory(v.tripUpdatesCache.data, now)
 
 	return v.tripUpdatesCache.data, nil
 }

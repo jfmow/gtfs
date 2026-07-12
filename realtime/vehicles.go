@@ -38,7 +38,9 @@ func (v Realtime) GetVehicles() (VehiclesMap, error) {
 	}
 
 	v.vehiclesCache.data = vehicles
-	v.vehiclesCache.lastUpdated = time.Now()
+	now := time.Now()
+	v.vehiclesCache.lastUpdated = now
+	v.addVehicleHistory(vehicles, now)
 
 	return vehicles, nil
 }

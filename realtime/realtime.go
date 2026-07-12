@@ -49,6 +49,7 @@ func NewClient(apiKey string, apiHeader string, refreshPeriod time.Duration, veh
 		tripUpdatesCache: &tripUpdateCache{},
 		alertsCache:      &alertsCache{},
 		vehiclesCache:    &vehiclesCache{},
+		tripHistoryCache: &tripHistoryCache{},
 		localTimeZone:    &localTimeZone,
 	}, nil
 }
@@ -67,6 +68,7 @@ type Realtime struct {
 	tripUpdatesCache *tripUpdateCache
 	vehiclesCache    *vehiclesCache
 	alertsCache      *alertsCache
+	tripHistoryCache *tripHistoryCache
 
 	localTimeZone *time.Location
 }
