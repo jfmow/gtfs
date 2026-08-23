@@ -49,7 +49,7 @@ func GenerateACache[In any, Out any](
 	}
 
 	go func() {
-		for range v.RefreshNotifier {
+		for range v.refreshNotifier.Subscribe() {
 			_ = refreshCache()
 		}
 	}()

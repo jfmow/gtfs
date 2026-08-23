@@ -3,7 +3,6 @@ package gtfs
 import (
 	"archive/zip"
 	"bytes"
-	"database/sql"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -13,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/jmoiron/sqlx"
 )
 
 type ApiKey struct {
@@ -40,6 +41,10 @@ func fetchZip(url string, apikey ApiKey) ([]byte, error) {
 		return nil, errors.New("error making http request")
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code fetching gtfs zip: %d", resp.StatusCode)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -72,8 +77,7 @@ var defaultTableNames = []string{
 	"feed_info",
 }
 
-func writeFilesToDB(zipData []byte, v Database) error {
-	db := v.db
+func writeFilesToDB(zipData []byte, v Database, tx *sqlx.Tx) error {
 	reader, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
 	if err != nil {
 		return errors.New("error reading GTFS zip file")
@@ -99,11 +103,6 @@ func writeFilesToDB(zipData []byte, v Database) error {
 		//fmt.Println("Reading CSV content from file:", file.Name)
 		csvReader := csv.NewReader(f)
 
-		tx, err := db.Begin() // Start transaction for better performance
-		if err != nil {
-			return fmt.Errorf("error starting transaction: %v", err)
-		}
-
 		// Read file line by line instead of loading all into memory
 		headers, err := csvReader.Read()
 		if err != nil {
@@ -117,15 +116,19 @@ func writeFilesToDB(zipData []byte, v Database) error {
 		//fmt.Println("Headers from file:", headers)
 
 		if !contains(defaultTableNames, tableName) {
-			v.createTableIfNotExists(tableName, headers)
+			if err := v.createTableIfNotExists(tx, tableName, headers); err != nil {
+				return fmt.Errorf("error creating table %s: %v", tableName, err)
+			}
 		} else {
-			columns, err := v.getTableColumns(tableName)
+			columns, err := v.getTableColumns(tx, tableName)
 			if err != nil {
-				log.Panicln(err)
+				return fmt.Errorf("error getting columns for table %s: %v", tableName, err)
 			}
 			for _, a := range headers {
 				if !contains(columns, a) {
-					v.createExtraColumn(tableName, a)
+					if err := v.createExtraColumn(tx, tableName, a); err != nil {
+						return fmt.Errorf("error adding column %s to table %s: %v", a, tableName, err)
+					}
 				}
 			}
 		}
@@ -148,12 +151,9 @@ func writeFilesToDB(zipData []byte, v Database) error {
 			}
 
 			// Insert into DB
-			insertRecord(tx, tableName, row)
-		}
-
-		// Commit the transaction after processing the file
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("error committing transaction: %v", err)
+			if err := insertRecord(tx, tableName, row); err != nil {
+				return fmt.Errorf("error inserting record into %s: %v", tableName, err)
+			}
 		}
 
 		//fmt.Println("Finished processing file:", file.Name)
@@ -161,7 +161,7 @@ func writeFilesToDB(zipData []byte, v Database) error {
 
 	return nil
 }
-func insertRecord(tx *sql.Tx, tableName string, record []CSVRecord) {
+func insertRecord(tx *sqlx.Tx, tableName string, record []CSVRecord) error {
 	headers := getHeaders(record)
 	var placeholders []string
 	var values []interface{}
@@ -177,7 +177,7 @@ func insertRecord(tx *sql.Tx, tableName string, record []CSVRecord) {
 
 	if len(values) == 0 {
 		log.Println("Skipping insert: No valid data in record")
-		return
+		return nil
 	}
 
 	insertSQL := fmt.Sprintf(`INSERT INTO %s (%s) VALUES (%s);`,
@@ -188,8 +188,9 @@ func insertRecord(tx *sql.Tx, tableName string, record []CSVRecord) {
 
 	_, err := tx.Exec(insertSQL, values...)
 	if err != nil {
-		log.Fatalf("Failed to insert record into table %s: %v", tableName, err)
+		return fmt.Errorf("failed to insert record into table %s: %w", tableName, err)
 	}
+	return nil
 }
 
 func getHeaders(record []CSVRecord) []string {

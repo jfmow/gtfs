@@ -2,6 +2,7 @@ package gtfs
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -15,7 +16,7 @@ type Database struct {
 	mailToEmail     string
 	apiKey          ApiKey
 	name            string
-	RefreshNotifier chan struct{}
+	refreshNotifier *notifier
 }
 
 /*
@@ -37,17 +38,19 @@ func New(url string, apiKey ApiKey, databaseName string, tz *time.Location, mail
 		panic(err)
 	}
 
-	database.RefreshNotifier = make(chan struct{})
-
 	// Check if the feed data is still up to date
 	isUpToDate, err := database.IsFeedDataUpToDate()
 
 	if !isUpToDate || err != nil {
 		fmt.Println("Feed data is not up to date: " + databaseName)
-		database.refreshDatabaseData()
+		if err := database.refreshWithRetries(3, 30*time.Second); err != nil {
+			log.Printf("gtfs: initial refresh failed for %s: %v", databaseName, err)
+		}
 	} else {
 		fmt.Println("Feed data is still up to date: " + databaseName)
-		database.createIndexes()
+		if err := database.createIndexesTx(); err != nil {
+			log.Printf("gtfs: failed to create indexes for %s: %v", databaseName, err)
+		}
 	}
 
 	database.EnableAutoUpdateGTFSData()

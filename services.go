@@ -29,7 +29,7 @@ Get all the services stopping at a given stop (child stop/parent with not childr
   - StopId: the id of the stop. REQUIRED
   - departureTimeFilter: the time to filter from, so any services after departureTimeFilter ("15:03:00"). NOT required, can be ""
   - limit: the amount of services to get. REQUIRED
-  - date: "20060102"
+  - date: the date to get active trips for, interpreted in the feed's configured timezone
 */
 func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.Time, limit int) ([]StopTimes, error) {
 	if departureTimeFilter != "" {
@@ -45,7 +45,7 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 
 	db := v.db
 
-	now := date
+	now := date.In(v.timeZone)
 	dayColumn := strings.ToLower(now.Weekday().String())
 	dateString := now.Format("20060102")
 

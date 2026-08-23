@@ -534,12 +534,12 @@ func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 		UNION ALL
 		SELECT service_id
 		FROM calendar_dates
-		WHERE date = ? AND exception_type = 1
+		WHERE date BETWEEN ? AND ? AND exception_type = 1
 	),
 	removed_services AS (
 		SELECT service_id
 		FROM calendar_dates
-		WHERE date = ? AND exception_type = 2
+		WHERE date BETWEEN ? AND ? AND exception_type = 2
 	),
 	adjusted_services AS (
 		SELECT service_id

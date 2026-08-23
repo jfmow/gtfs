@@ -9,10 +9,37 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
 )
+
+type notifier struct {
+	mu   sync.Mutex
+	subs []chan struct{}
+}
+
+// Subscribe returns a new buffered channel that receives a value every time
+// broadcast is called. Every subscriber is notified on every refresh cycle.
+func (n *notifier) Subscribe() <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	n.mu.Lock()
+	n.subs = append(n.subs, ch)
+	n.mu.Unlock()
+	return ch
+}
+
+func (n *notifier) broadcast() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, ch := range n.subs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
 
 func newDatabase(url string, apiKey ApiKey, databaseName string, tz *time.Location, mailToEmail string) (Database, error) {
 	if url == "" {
@@ -40,11 +67,11 @@ func newDatabase(url string, apiKey ApiKey, databaseName string, tz *time.Locati
 	}
 	// Initialize the Database struct
 	database := Database{db: db, url: url, timeZone: tz, mailToEmail: mailToEmail, apiKey: apiKey, name: databaseName}
-	database.RefreshNotifier = make(chan struct{}, 1) // Add a buffer to prevent blocking
+	database.refreshNotifier = &notifier{}
 	return database, nil
 }
 
-func (v Database) createDefaultGTFSTables() {
+func (v Database) createDefaultGTFSTables(tx *sqlx.Tx) error {
 	query := `
 		-- Table: agency
 		CREATE TABLE IF NOT EXISTS agency (
@@ -269,22 +296,22 @@ func (v Database) createDefaultGTFSTables() {
 		CREATE INDEX IF NOT EXISTS idx_route_ngrams_ngram ON route_ngrams(ngram);
 	`
 
-	_, err := v.db.Exec(query)
+	_, err := tx.Exec(query)
 	if err != nil {
-		log.Panicf("%s", err.Error())
+		return fmt.Errorf("failed to create default gtfs tables: %w", err)
 	}
-
+	return nil
 }
 
-func (v Database) deleteOldData() error {
+func (v Database) deleteOldData(tx *sqlx.Tx) error {
 	// Query to get all table names from the sqlite_master table
-	rows, err := v.db.Query("SELECT name FROM sqlite_master WHERE type='table'")
+	rows, err := tx.Query("SELECT name FROM sqlite_master WHERE type='table'")
 	if err != nil {
 		return fmt.Errorf("failed to fetch tables: %w", err)
 	}
 	defer rows.Close()
 
-	// Iterate over the tables and delete data from each
+	var tableNames []string
 	for rows.Next() {
 		var tableName string
 		if err := rows.Scan(&tableName); err != nil {
@@ -296,9 +323,17 @@ func (v Database) deleteOldData() error {
 			continue
 		}
 
+		tableNames = append(tableNames, tableName)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate tables: %w", err)
+	}
+	rows.Close()
+
+	for _, tableName := range tableNames {
 		// Delete data from the table
 		query := fmt.Sprintf("DELETE FROM %s", tableName)
-		_, err := v.db.Exec(query)
+		_, err := tx.Exec(query)
 		if err != nil {
 			return fmt.Errorf("failed to delete data from table %s: %w", tableName, err)
 		}
@@ -308,9 +343,7 @@ func (v Database) deleteOldData() error {
 	return nil
 }
 
-func (v Database) getTableColumns(tableName string) ([]string, error) {
-	db := v.db
-
+func (v Database) getTableColumns(tx *sqlx.Tx, tableName string) ([]string, error) {
 	// Validate the table name using a regex for valid SQLite table name characters
 	validTableName := regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 	if !validTableName.MatchString(tableName) {
@@ -331,7 +364,7 @@ func (v Database) getTableColumns(tableName string) ([]string, error) {
 	}
 
 	var columnsInfo []ColumnInfo
-	err := db.Select(&columnsInfo, query)
+	err := tx.Select(&columnsInfo, query)
 	if err != nil {
 		return nil, fmt.Errorf("error executing query: %w", err)
 	}
@@ -345,9 +378,7 @@ func (v Database) getTableColumns(tableName string) ([]string, error) {
 	return columns, nil
 }
 
-func (v Database) createExtraColumn(tableName string, columnName string) error {
-	db := v.db
-
+func (v Database) createExtraColumn(tx *sqlx.Tx, tableName string, columnName string) error {
 	// Validate the table name using regex to ensure it contains only valid characters
 	validName := regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 	if !validName.MatchString(tableName) {
@@ -361,10 +392,8 @@ func (v Database) createExtraColumn(tableName string, columnName string) error {
 
 	// Construct the SQL query with sanitized table and column names
 	alterTableSQL := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT;`, tableName, columnName)
-	//fmt.Println("Executing SQL:", alterTableSQL)
 
-	// Execute the query using sqlx
-	_, err := db.Exec(alterTableSQL)
+	_, err := tx.Exec(alterTableSQL)
 	if err != nil {
 		return fmt.Errorf("failed to add column %s to table %s: %v", columnName, tableName, err)
 	}
@@ -372,13 +401,11 @@ func (v Database) createExtraColumn(tableName string, columnName string) error {
 	return nil
 }
 
-func (v Database) createTableIfNotExists(tableName string, headers []string) {
-	db := v.db
-
+func (v Database) createTableIfNotExists(tx *sqlx.Tx, tableName string, headers []string) error {
 	// Validate the table name using regex to ensure it contains only valid characters
 	validName := regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 	if !validName.MatchString(tableName) {
-		log.Fatalf("Invalid table name: %s", tableName)
+		return fmt.Errorf("invalid table name: %s", tableName)
 	}
 
 	// Validate and sanitize the headers (column names)
@@ -400,12 +427,11 @@ func (v Database) createTableIfNotExists(tableName string, headers []string) {
 
 	// Construct the CREATE TABLE SQL with sanitized table and column names
 	createTableSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (%s);`, tableName, strings.Join(columns, ", "))
-	//fmt.Println("Executing SQL:", createTableSQL)
 
 	// Execute the table creation SQL
-	_, err := db.Exec(createTableSQL)
+	_, err := tx.Exec(createTableSQL)
 	if err != nil {
-		log.Fatalf("Failed to create table: %v", err)
+		return fmt.Errorf("failed to create table: %v", err)
 	}
 
 	// Create index for columns ending with "_id"
@@ -414,67 +440,82 @@ func (v Database) createTableIfNotExists(tableName string, headers []string) {
 			// Sanitize the index name as well
 			indexName := fmt.Sprintf("idx_%s_%s", tableName, header)
 			if !validName.MatchString(indexName) {
-				log.Fatalf("Invalid index name: %s", indexName)
+				return fmt.Errorf("invalid index name: %s", indexName)
 			}
 			indexSQL := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (%s);`, indexName, tableName, header)
-			fmt.Println("Executing SQL:", indexSQL)
 
-			_, err := db.Exec(indexSQL)
+			_, err := tx.Exec(indexSQL)
 			if err != nil {
-				log.Fatalf("Failed to create index on column %s: %v", header, err)
+				return fmt.Errorf("failed to create index on column %s: %v", header, err)
 			}
 		}
 	}
+	return nil
 }
 
+// refreshDatabaseData fetches a fresh copy of the GTFS feed and swaps it in
+// atomically: every delete, schema change, and insert runs inside a single
+// transaction, so concurrent readers either see the complete old dataset or
+// the complete new one, never a partially emptied/repopulated one, and any
+// failure along the way rolls back leaving the previous good data intact.
 func (v Database) refreshDatabaseData() error {
 	log.Println("Updating database data: " + v.name)
 
 	log.Println("Fetching new gtfs data.")
-	// Fetch and write new data
 	data, err := fetchZip(v.url, v.apiKey)
 	if err != nil {
 		log.Printf("Failed to fetch new data: %v", err)
 		return err
 	}
-
 	log.Println("Downloaded new gtfs data.")
 
+	tx, err := v.db.Beginx()
+	if err != nil {
+		return fmt.Errorf("failed to begin refresh transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
 	log.Println("Deleting old gtfs database")
-	if err := v.deleteOldData(); err != nil {
-		log.Printf("Failed to delete old data: %v \n(Old data may not exist yet)", err)
-		return err
+	if err := v.deleteOldData(tx); err != nil {
+		return fmt.Errorf("failed to delete old data: %w", err)
 	}
 
-	v.createDefaultGTFSTables()
-	v.createIndexes()
+	if err := v.createDefaultGTFSTables(tx); err != nil {
+		return err
+	}
+	if err := v.createIndexes(tx); err != nil {
+		return err
+	}
 
 	log.Println("Writing new data to database")
-	err = writeFilesToDB(data, v)
-	if err != nil {
-		log.Printf("Failed to write new data to the database: %v", err)
+	if err := writeFilesToDB(data, v, tx); err != nil {
+		return fmt.Errorf("failed to write new data to the database: %w", err)
+	}
+
+	if err := v.populateStopNgrams(tx); err != nil {
 		return err
 	}
+	if err := v.populateRouteNgrams(tx); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit refresh transaction: %w", err)
+	}
+	committed = true
 
 	fmt.Println("Data updated successfully.")
 
-	if err := v.populateStopNgrams(); err != nil {
-		return err
-	}
-	if err := v.populateRouteNgrams(); err != nil {
-		return err
-	}
-
-	select {
-	case v.RefreshNotifier <- struct{}{}:
-		fmt.Println("RefreshNotifier triggered")
-	default:
-		fmt.Println("RefreshNotifier skipped to avoid blocking")
-	}
+	v.refreshNotifier.broadcast()
 	return nil
 }
 
-func (v Database) createIndexes() {
+func (v Database) createIndexes(tx *sqlx.Tx) error {
 	query := `
 		-- Indexes for agency table
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_agency_agency_id ON agency (agency_id);
@@ -540,15 +581,31 @@ func (v Database) createIndexes() {
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_stop ON notifications (stop);
 	`
 
-	_, err := v.db.Exec(query)
+	_, err := tx.Exec(query)
 	if err != nil {
-		log.Panicf("%s", err.Error())
+		return fmt.Errorf("failed to create indexes: %w", err)
 	}
+	return nil
 }
 
-func (v Database) populateStopNgrams() error {
+// createIndexesTx wraps createIndexes in its own short-lived transaction, for
+// use outside of a refresh (e.g. at startup when the existing data is still
+// up to date and only the indexes need ensuring).
+func (v Database) createIndexesTx() error {
+	tx, err := v.db.Beginx()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	if err := v.createIndexes(tx); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func (v Database) populateStopNgrams(tx *sqlx.Tx) error {
 	// Clear old data
-	if _, err := v.db.Exec("DELETE FROM stop_ngrams"); err != nil {
+	if _, err := tx.Exec("DELETE FROM stop_ngrams"); err != nil {
 		return fmt.Errorf("failed to clear stop_ngrams: %w", err)
 	}
 
@@ -559,14 +616,9 @@ func (v Database) populateStopNgrams() error {
 	}
 
 	var stops []Stop
-	err := v.db.Select(&stops, "SELECT stop_id, stop_name FROM stops")
+	err := tx.Select(&stops, "SELECT stop_id, stop_name FROM stops")
 	if err != nil {
 		return fmt.Errorf("failed to select stops: %w", err)
-	}
-
-	tx, err := v.db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
 	stmt, err := tx.Prepare("INSERT INTO stop_ngrams(stop_id, ngram) VALUES (?, ?)")
@@ -586,7 +638,6 @@ func (v Database) populateStopNgrams() error {
 				for end := start + 2; end <= wordLen; end++ {
 					substr := word[start:end]
 					if _, err := stmt.Exec(stop.StopID, substr); err != nil {
-						tx.Rollback()
 						return fmt.Errorf("failed to insert ngram: %w", err)
 					}
 				}
@@ -594,16 +645,12 @@ func (v Database) populateStopNgrams() error {
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit ngrams transaction: %w", err)
-	}
-
 	log.Println("stop_ngrams table populated successfully")
 	return nil
 }
-func (v Database) populateRouteNgrams() error {
+func (v Database) populateRouteNgrams(tx *sqlx.Tx) error {
 	// Clear old data
-	if _, err := v.db.Exec("DELETE FROM route_ngrams"); err != nil {
+	if _, err := tx.Exec("DELETE FROM route_ngrams"); err != nil {
 		return fmt.Errorf("failed to clear route_ngrams: %w", err)
 	}
 
@@ -615,14 +662,9 @@ func (v Database) populateRouteNgrams() error {
 	}
 
 	var routes []Route
-	err := v.db.Select(&routes, "SELECT route_id, route_long_name, route_short_name FROM routes")
+	err := tx.Select(&routes, "SELECT route_id, route_long_name, route_short_name FROM routes")
 	if err != nil {
 		return fmt.Errorf("failed to select routes: %w", err)
-	}
-
-	tx, err := v.db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
 	stmt, err := tx.Prepare("INSERT INTO route_ngrams(route_id, ngram) VALUES (?, ?)")
@@ -644,16 +686,11 @@ func (v Database) populateRouteNgrams() error {
 				for end := start + 2; end <= wordLen; end++ {
 					substr := word[start:end]
 					if _, err := stmt.Exec(route.RouteID, substr); err != nil {
-						tx.Rollback()
 						return fmt.Errorf("failed to insert ngram: %w", err)
 					}
 				}
 			}
 		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit ngrams transaction: %w", err)
 	}
 
 	log.Println("route_ngrams table populated successfully")
