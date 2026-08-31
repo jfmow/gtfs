@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -291,7 +292,6 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			Transfers:     transfers,
 			TransferStops: transferStops,
 			Legs:          legs,
-			RouteGeoJSON:  buildJourneyGeoJSON(v, req, legs),
 			ID:            uuid.NewString(),
 		}
 		plans = append(plans, plan)
@@ -305,6 +305,12 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 	if len(plans) == 0 {
 		return nil, errors.New("no journey legs available")
 	}
+
+	// GeoJSON (walk legs in particular) is expensive - each walk leg costs a
+	// remote OSRM round-trip - so it's only built for the final, deduped
+	// result set rather than every expanded candidate, and in parallel across
+	// those results rather than one at a time.
+	populateRouteGeoJSON(v, req, plans)
 
 	return plans, nil
 }
@@ -469,7 +475,6 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 			Transfers:     transfers,
 			TransferStops: transferStops,
 			Legs:          legs,
-			RouteGeoJSON:  buildJourneyGeoJSON(v, req, legs),
 			ID:            uuid.NewString(),
 		}
 		plans = append(plans, plan)
@@ -483,6 +488,8 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 	if len(plans) == 0 {
 		return nil, errors.New("no journey legs available")
 	}
+
+	populateRouteGeoJSON(v, req, plans)
 
 	return plans, nil
 }
@@ -1267,11 +1274,27 @@ func reverseLegs(legs []JourneyLeg) {
 	}
 }
 
+// populateRouteGeoJSON fills in RouteGeoJSON for each plan, one goroutine per
+// plan, since it's only ever called on the final (small, deduped) result set.
+func populateRouteGeoJSON(db Database, req JourneyRequest, plans []JourneyPlan) {
+	var wg sync.WaitGroup
+	for i := range plans {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			plans[i].RouteGeoJSON = buildJourneyGeoJSON(db, req, plans[i].Legs)
+		}(i)
+	}
+	wg.Wait()
+}
+
 func buildJourneyGeoJSON(db Database, req JourneyRequest, legs []JourneyLeg) map[string]interface{} {
-	var features []map[string]interface{}
-	for _, leg := range legs {
+	features := make([]map[string]interface{}, len(legs))
+	var wg sync.WaitGroup
+	for i, leg := range legs {
 		switch leg.Mode {
 		case "transit":
+			// Local shape/DB lookups - cheap enough to stay on this goroutine.
 			if leg.TripID == "" {
 				continue
 			}
@@ -1296,23 +1319,47 @@ func buildJourneyGeoJSON(db Database, req JourneyRequest, legs []JourneyLeg) map
 					props["trip_id"] = leg.TripID
 				}
 			}
-			features = append(features, geoJSON)
+			features[i] = geoJSON
 		case "walk":
+			// Each walk leg costs a remote OSRM round-trip - run these
+			// concurrently rather than one after another.
 			startLat, startLon, endLat, endLon, ok := walkLegCoordinates(req, leg)
 			if !ok {
 				continue
 			}
-			feature := buildWalkFeature(req.OsrmURL, startLat, startLon, endLat, endLon)
-			if feature == nil {
-				continue
-			}
-			features = append(features, feature)
+			wg.Add(1)
+			go func(i int, leg JourneyLeg, startLat, startLon, endLat, endLon float64) {
+				defer wg.Done()
+				feature := buildWalkFeature(req.OsrmURL, startLat, startLon, endLat, endLon)
+				// Tags the leg's own from/to stop (mirrors route_id/trip_id on
+				// transit features) so a consumer can identify exactly which
+				// walk leg a feature belongs to - e.g. to swap the walk-to-the-
+				// boarding-stop leg for a live version anchored to the rider's
+				// current position instead of the plan's original start point.
+				if props, ok := feature["properties"].(map[string]interface{}); ok {
+					if leg.FromStop != nil {
+						props["from_stop_id"] = leg.FromStop.StopId
+					}
+					if leg.ToStop != nil {
+						props["to_stop_id"] = leg.ToStop.StopId
+					}
+				}
+				features[i] = feature
+			}(i, leg, startLat, startLon, endLat, endLon)
+		}
+	}
+	wg.Wait()
+
+	result := make([]map[string]interface{}, 0, len(features))
+	for _, f := range features {
+		if f != nil {
+			result = append(result, f)
 		}
 	}
 
 	return map[string]interface{}{
 		"type":     "FeatureCollection",
-		"features": features,
+		"features": result,
 	}
 }
 
