@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -52,11 +51,6 @@ func fetchZip(url string, apikey ApiKey) ([]byte, error) {
 	}
 
 	return body, nil
-}
-
-type CSVRecord struct {
-	Header string
-	Data   string
 }
 
 var defaultTableNames = []string{
@@ -108,7 +102,12 @@ func writeFilesToDB(zipData []byte, v Database, tx *sqlx.Tx) error {
 		if err != nil {
 			return fmt.Errorf("error reading csv headers from %s: %v", file.Name, err)
 		}
-		// Trim spaces from headers
+		// Trim spaces from headers, and strip a UTF-8 BOM off the first one
+		// (some feeds - e.g. Christchurch's feed_info.txt - ship one, which
+		// otherwise becomes part of the column name and breaks the import).
+		if len(headers) > 0 {
+			headers[0] = strings.TrimPrefix(headers[0], "\ufeff")
+		}
 		for i := range headers {
 			headers[i] = strings.TrimSpace(headers[i])
 		}
@@ -133,7 +132,8 @@ func writeFilesToDB(zipData []byte, v Database, tx *sqlx.Tx) error {
 			}
 		}
 
-		// Read each record (line by line)
+		// Read each record (line by line) and hand it to a batching inserter.
+		inserter := newBulkInserter(tx, tableName)
 		for {
 			record, err := csvReader.Read()
 			if err == io.EOF {
@@ -144,16 +144,12 @@ func writeFilesToDB(zipData []byte, v Database, tx *sqlx.Tx) error {
 				return fmt.Errorf("error reading csv file %s: %v", file.Name, err)
 			}
 
-			// Convert record into CSVRecord for insertion
-			var row []CSVRecord
-			for i, value := range record {
-				row = append(row, CSVRecord{Header: headers[i], Data: value})
-			}
-
-			// Insert into DB
-			if err := insertRecord(tx, tableName, row); err != nil {
+			if err := inserter.add(headers, record); err != nil {
 				return fmt.Errorf("error inserting record into %s: %v", tableName, err)
 			}
+		}
+		if err := inserter.flush(); err != nil {
+			return fmt.Errorf("error inserting records into %s: %v", tableName, err)
 		}
 
 		//fmt.Println("Finished processing file:", file.Name)
@@ -161,44 +157,96 @@ func writeFilesToDB(zipData []byte, v Database, tx *sqlx.Tx) error {
 
 	return nil
 }
-func insertRecord(tx *sqlx.Tx, tableName string, record []CSVRecord) error {
-	headers := getHeaders(record)
-	var placeholders []string
-	var values []interface{}
-	var filteredHeaders []string
 
-	for i, field := range record {
-		if field.Data != "" {
-			placeholders = append(placeholders, "?")
-			values = append(values, field.Data)
-			filteredHeaders = append(filteredHeaders, headers[i])
+// Keep total placeholders per statement well under any driver/SQLite variable
+// limit while still collapsing ~1M single-row inserts into a few thousand.
+const maxInsertParams = 20000
+
+// bulkInserter groups CSV rows by which columns they populate (GTFS rows are
+// near-homogeneous, so this is a handful of groups) and flushes each group as a
+// single multi-row INSERT. Preserves the old "omit empty fields so the column
+// DEFAULT applies" semantics exactly - an empty field is never written.
+type bulkInserter struct {
+	tx    *sqlx.Tx
+	table string
+	// keyed by comma-joined column list
+	groups map[string]*insertGroup
+}
+
+type insertGroup struct {
+	cols    []string
+	rowsPer int
+	buf     []interface{}
+	pending int
+}
+
+func newBulkInserter(tx *sqlx.Tx, table string) *bulkInserter {
+	return &bulkInserter{tx: tx, table: table, groups: map[string]*insertGroup{}}
+}
+
+func (b *bulkInserter) add(headers []string, record []string) error {
+	cols := make([]string, 0, len(record))
+	vals := make([]interface{}, 0, len(record))
+	for i, value := range record {
+		if i >= len(headers) {
+			break
+		}
+		if value != "" {
+			cols = append(cols, headers[i])
+			vals = append(vals, value)
 		}
 	}
-
-	if len(values) == 0 {
-		log.Println("Skipping insert: No valid data in record")
+	if len(cols) == 0 {
 		return nil
 	}
 
-	insertSQL := fmt.Sprintf(`INSERT INTO %s (%s) VALUES (%s);`,
-		tableName,
-		strings.Join(filteredHeaders, ", "),
-		strings.Join(placeholders, ", "),
-	)
+	key := strings.Join(cols, ",")
+	g := b.groups[key]
+	if g == nil {
+		rowsPer := maxInsertParams / len(cols)
+		if rowsPer < 1 {
+			rowsPer = 1
+		}
+		if rowsPer > 1000 {
+			rowsPer = 1000
+		}
+		g = &insertGroup{cols: cols, rowsPer: rowsPer}
+		b.groups[key] = g
+	}
 
-	_, err := tx.Exec(insertSQL, values...)
-	if err != nil {
-		return fmt.Errorf("failed to insert record into table %s: %w", tableName, err)
+	g.buf = append(g.buf, vals...)
+	g.pending++
+	if g.pending >= g.rowsPer {
+		return b.flushGroup(g)
 	}
 	return nil
 }
 
-func getHeaders(record []CSVRecord) []string {
-	var headers []string
-	for _, field := range record {
-		headers = append(headers, field.Header)
+func (b *bulkInserter) flushGroup(g *insertGroup) error {
+	if g.pending == 0 {
+		return nil
 	}
-	return headers
+
+	one := "(" + strings.TrimSuffix(strings.Repeat("?, ", len(g.cols)), ", ") + ")"
+	tuples := strings.TrimSuffix(strings.Repeat(one+", ", g.pending), ", ")
+	sql := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s;",
+		b.table, strings.Join(g.cols, ", "), tuples)
+
+	if _, err := b.tx.Exec(sql, g.buf...); err != nil {
+		return fmt.Errorf("failed to insert %d rows into table %s: %w", g.pending, b.table, err)
+	}
+	g.buf = g.buf[:0]
+	g.pending = 0
+	return nil
+}
+
+func (b *bulkInserter) flush() error {
+	for _, g := range b.groups {
+		if err := b.flushGroup(g); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func isCSVFile(fileName string) bool {

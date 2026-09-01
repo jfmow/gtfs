@@ -54,17 +54,45 @@ func newDatabase(url string, apiKey ApiKey, databaseName string, tz *time.Locati
 
 	os.Mkdir(filepath.Join(GetWorkDir(), "gtfs"), os.ModePerm)
 
-	db, err := sqlx.Open("sqlite", filepath.Join(GetWorkDir(), "gtfs", fmt.Sprintf("gtfs-%s.db", databaseName)))
+	dbPath := filepath.Join(GetWorkDir(), "gtfs", fmt.Sprintf("gtfs-%s.db", databaseName))
+	// Per-connection PRAGMAs via the DSN so every pooled connection gets them.
+	// synchronous=NORMAL is safe under WAL and much faster; a bounded page
+	// cache + in-memory temp store speed up the bulk rebuild and large joins;
+	// foreign_keys stays OFF (matching prior behaviour - the schema declares
+	// FKs but the loader relies on them not being enforced during import).
+	dsn := "file:" + dbPath + "?" + strings.Join([]string{
+		"_pragma=busy_timeout(10000)",
+		"_pragma=journal_mode(WAL)",
+		"_pragma=synchronous(NORMAL)",
+		"_pragma=foreign_keys(0)",
+		"_pragma=temp_store(MEMORY)",
+		"_pragma=cache_size(-65536)",
+	}, "&")
+
+	db, err := sqlx.Open("sqlite", dsn)
 	if err != nil {
 		fmt.Println(err)
 		panic("Failed to open the database")
 	}
 
-	// Enable WAL mode
-	_, err = db.Exec("PRAGMA journal_mode = WAL;")
-	if err != nil {
+	// SQLite allows a single writer; a small bounded pool keeps read
+	// concurrency without letting stray idle connections pin old WAL
+	// snapshots and block checkpointing (which is how the -wal files grew to
+	// hundreds of MB).
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
+	if _, err := db.Exec("PRAGMA journal_mode = WAL;"); err != nil {
 		panic("Failed to set WAL mode")
 	}
+	// Fold any oversized WAL left by a previous run back into the main db file
+	// so this startup (and its cache-warming queries) don't read through a
+	// multi-hundred-MB WAL.
+	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+		log.Printf("gtfs: startup wal_checkpoint failed for %s: %v", databaseName, err)
+	}
+
 	// Initialize the Database struct
 	database := Database{db: db, url: url, timeZone: tz, mailToEmail: mailToEmail, apiKey: apiKey, name: databaseName}
 	database.refreshNotifier = &notifier{}
@@ -286,14 +314,12 @@ func (v Database) createDefaultGTFSTables(tx *sqlx.Tx) error {
 			stop_id TEXT NOT NULL,
 			ngram TEXT NOT NULL
 		);
-		CREATE INDEX IF NOT EXISTS idx_stop_ngrams_stop_id ON stop_ngrams(stop_id);
-		CREATE INDEX IF NOT EXISTS idx_stop_ngrams_ngram ON stop_ngrams(ngram);
 		CREATE TABLE IF NOT EXISTS route_ngrams (
 			route_id TEXT NOT NULL,
 			ngram TEXT NOT NULL
 		);
-		CREATE INDEX IF NOT EXISTS idx_route_ngrams_route_id ON route_ngrams(route_id);
-		CREATE INDEX IF NOT EXISTS idx_route_ngrams_ngram ON route_ngrams(ngram);
+		-- ngram indexes are created in createIndexes(), after the tables are
+		-- populated, so the bulk n-gram insert isn't slowed by maintaining them.
 	`
 
 	_, err := tx.Exec(query)
@@ -331,15 +357,19 @@ func (v Database) deleteOldData(tx *sqlx.Tx) error {
 	rows.Close()
 
 	for _, tableName := range tableNames {
-		// Delete data from the table
-		query := fmt.Sprintf("DELETE FROM %s", tableName)
-		_, err := tx.Exec(query)
-		if err != nil {
-			return fmt.Errorf("failed to delete data from table %s: %w", tableName, err)
+		// DROP (not DELETE) - O(1) vs deleting millions of rows plus all the
+		// index maintenance and WAL churn that comes with it. DDL is
+		// transactional in SQLite, so a failed refresh still rolls back to the
+		// previous schema+data. createDefaultGTFSTables recreates the standard
+		// tables straight after; dynamic per-file tables are recreated during
+		// the import.
+		query := fmt.Sprintf("DROP TABLE IF EXISTS %q", tableName)
+		if _, err := tx.Exec(query); err != nil {
+			return fmt.Errorf("failed to drop table %s: %w", tableName, err)
 		}
 	}
 
-	log.Println("Old data deleted successfully")
+	log.Println("Old data dropped successfully")
 	return nil
 }
 
@@ -480,18 +510,18 @@ func (v Database) refreshDatabaseData() error {
 		}
 	}()
 
-	log.Println("Deleting old gtfs database")
+	log.Println("Dropping old gtfs tables")
 	if err := v.deleteOldData(tx); err != nil {
-		return fmt.Errorf("failed to delete old data: %w", err)
+		return fmt.Errorf("failed to drop old data: %w", err)
 	}
 
 	if err := v.createDefaultGTFSTables(tx); err != nil {
 		return err
 	}
-	if err := v.createIndexes(tx); err != nil {
-		return err
-	}
 
+	// Indexes are built AFTER the bulk load (see createIndexes call below) -
+	// creating them up front means every one of the ~1M stop_times / shapes
+	// inserts pays incremental b-tree maintenance on ~45 indexes.
 	log.Println("Writing new data to database")
 	if err := writeFilesToDB(data, v, tx); err != nil {
 		return fmt.Errorf("failed to write new data to the database: %w", err)
@@ -504,10 +534,25 @@ func (v Database) refreshDatabaseData() error {
 		return err
 	}
 
+	log.Println("Building indexes")
+	if err := v.createIndexes(tx); err != nil {
+		return err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit refresh transaction: %w", err)
 	}
 	committed = true
+
+	// Fold the (now large) WAL back into the main file and refresh planner
+	// stats, so the very next query - the cache warm-up - isn't reading through
+	// a huge WAL against un-analyzed tables.
+	if _, err := v.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+		log.Printf("gtfs: post-refresh wal_checkpoint failed for %s: %v", v.name, err)
+	}
+	if _, err := v.db.Exec("PRAGMA optimize;"); err != nil {
+		log.Printf("gtfs: post-refresh optimize failed for %s: %v", v.name, err)
+	}
 
 	fmt.Println("Data updated successfully.")
 
@@ -579,6 +624,12 @@ func (v Database) createIndexes(tx *sqlx.Tx) error {
 
 		-- Indexes for notifications table
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_stop ON notifications (stop);
+
+		-- Indexes for the search n-gram tables
+		CREATE INDEX IF NOT EXISTS idx_stop_ngrams_stop_id ON stop_ngrams (stop_id);
+		CREATE INDEX IF NOT EXISTS idx_stop_ngrams_ngram ON stop_ngrams (ngram);
+		CREATE INDEX IF NOT EXISTS idx_route_ngrams_route_id ON route_ngrams (route_id);
+		CREATE INDEX IF NOT EXISTS idx_route_ngrams_ngram ON route_ngrams (ngram);
 	`
 
 	_, err := tx.Exec(query)
@@ -600,61 +651,108 @@ func (v Database) createIndexesTx() error {
 		tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if _, err := v.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+		log.Printf("gtfs: wal_checkpoint after createIndexesTx failed for %s: %v", v.name, err)
+	}
+	return nil
+}
+
+// ngramWriter batches (id, ngram) pairs into multi-row INSERTs.
+type ngramWriter struct {
+	tx     *sqlx.Tx
+	table  string
+	idCol  string
+	buf    []interface{}
+	rows   int
+	maxRow int
+}
+
+func newNgramWriter(tx *sqlx.Tx, table, idCol string) *ngramWriter {
+	return &ngramWriter{tx: tx, table: table, idCol: idCol, maxRow: 1000}
+}
+
+func (w *ngramWriter) add(id, ngram string) error {
+	w.buf = append(w.buf, id, ngram)
+	w.rows++
+	if w.rows >= w.maxRow {
+		return w.flush()
+	}
+	return nil
+}
+
+func (w *ngramWriter) flush() error {
+	if w.rows == 0 {
+		return nil
+	}
+	tuples := strings.TrimSuffix(strings.Repeat("(?, ?), ", w.rows), ", ")
+	sql := fmt.Sprintf("INSERT INTO %s(%s, ngram) VALUES %s;", w.table, w.idCol, tuples)
+	if _, err := w.tx.Exec(sql, w.buf...); err != nil {
+		return fmt.Errorf("failed to insert %d %s rows: %w", w.rows, w.table, err)
+	}
+	w.buf = w.buf[:0]
+	w.rows = 0
+	return nil
+}
+
+// addNgrams generates every substring (length >= 2) of every word in text and
+// feeds the unique ones for this entity to w.
+func addNgrams(w *ngramWriter, id string, seen map[string]struct{}, text string) error {
+	for _, word := range strings.Fields(strings.ToLower(text)) {
+		for start := 0; start < len(word); start++ {
+			for end := start + 2; end <= len(word); end++ {
+				substr := word[start:end]
+				if _, dup := seen[substr]; dup {
+					continue
+				}
+				seen[substr] = struct{}{}
+				if err := w.add(id, substr); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (v Database) populateStopNgrams(tx *sqlx.Tx) error {
-	// Clear old data
 	if _, err := tx.Exec("DELETE FROM stop_ngrams"); err != nil {
 		return fmt.Errorf("failed to clear stop_ngrams: %w", err)
 	}
 
-	// Query all stops with id and stop_name
 	type Stop struct {
 		StopID   string `db:"stop_id"`
 		StopName string `db:"stop_name"`
 	}
 
 	var stops []Stop
-	err := tx.Select(&stops, "SELECT stop_id, stop_name FROM stops")
-	if err != nil {
+	if err := tx.Select(&stops, "SELECT stop_id, stop_name FROM stops"); err != nil {
 		return fmt.Errorf("failed to select stops: %w", err)
 	}
 
-	stmt, err := tx.Prepare("INSERT INTO stop_ngrams(stop_id, ngram) VALUES (?, ?)")
-	if err != nil {
-		return fmt.Errorf("failed to prepare insert statement: %w", err)
-	}
-	defer stmt.Close()
-
+	w := newNgramWriter(tx, "stop_ngrams", "stop_id")
+	seen := make(map[string]struct{})
 	for _, stop := range stops {
-		// Split stop_name into words (simple space split, adjust if needed)
-		words := strings.Fields(strings.ToLower(stop.StopName))
-
-		for _, word := range words {
-			wordLen := len(word)
-			// Generate all substrings length >= 2
-			for start := 0; start < wordLen; start++ {
-				for end := start + 2; end <= wordLen; end++ {
-					substr := word[start:end]
-					if _, err := stmt.Exec(stop.StopID, substr); err != nil {
-						return fmt.Errorf("failed to insert ngram: %w", err)
-					}
-				}
-			}
+		clear(seen)
+		if err := addNgrams(w, stop.StopID, seen, stop.StopName); err != nil {
+			return err
 		}
+	}
+	if err := w.flush(); err != nil {
+		return err
 	}
 
 	log.Println("stop_ngrams table populated successfully")
 	return nil
 }
+
 func (v Database) populateRouteNgrams(tx *sqlx.Tx) error {
-	// Clear old data
 	if _, err := tx.Exec("DELETE FROM route_ngrams"); err != nil {
 		return fmt.Errorf("failed to clear route_ngrams: %w", err)
 	}
 
-	// Query all stops with id and stop_name
 	type Route struct {
 		RouteID        string `db:"route_id"`
 		RouteLongName  string `db:"route_long_name"`
@@ -662,35 +760,20 @@ func (v Database) populateRouteNgrams(tx *sqlx.Tx) error {
 	}
 
 	var routes []Route
-	err := tx.Select(&routes, "SELECT route_id, route_long_name, route_short_name FROM routes")
-	if err != nil {
+	if err := tx.Select(&routes, "SELECT route_id, route_long_name, route_short_name FROM routes"); err != nil {
 		return fmt.Errorf("failed to select routes: %w", err)
 	}
 
-	stmt, err := tx.Prepare("INSERT INTO route_ngrams(route_id, ngram) VALUES (?, ?)")
-	if err != nil {
-		return fmt.Errorf("failed to prepare insert statement: %w", err)
-	}
-	defer stmt.Close()
-
+	w := newNgramWriter(tx, "route_ngrams", "route_id")
+	seen := make(map[string]struct{})
 	for _, route := range routes {
-		// Split route_long_name, route_id, and route_short_name into words (simple space split, adjust if needed)
-		words := strings.Fields(strings.ToLower(route.RouteLongName))
-		words = append(words, strings.Fields(strings.ToLower(route.RouteID))...)
-		words = append(words, strings.Fields(strings.ToLower(route.RouteShortName))...)
-
-		for _, word := range words {
-			wordLen := len(word)
-			// Generate all substrings length >= 2
-			for start := 0; start < wordLen; start++ {
-				for end := start + 2; end <= wordLen; end++ {
-					substr := word[start:end]
-					if _, err := stmt.Exec(route.RouteID, substr); err != nil {
-						return fmt.Errorf("failed to insert ngram: %w", err)
-					}
-				}
-			}
+		clear(seen)
+		if err := addNgrams(w, route.RouteID, seen, route.RouteLongName+" "+route.RouteID+" "+route.RouteShortName); err != nil {
+			return err
 		}
+	}
+	if err := w.flush(); err != nil {
+		return err
 	}
 
 	log.Println("route_ngrams table populated successfully")

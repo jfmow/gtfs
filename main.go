@@ -38,24 +38,45 @@ func New(url string, apiKey ApiKey, databaseName string, tz *time.Location, mail
 		panic(err)
 	}
 
-	// Check if the feed data is still up to date
+	// Decide whether to rebuild the DB from the upstream zip (slow) or reuse
+	// what's on disk.
 	isUpToDate, err := database.IsFeedDataUpToDate()
-
-	if !isUpToDate || err != nil {
-		fmt.Println("Feed data is not up to date: " + databaseName)
-		if err := database.refreshWithRetries(3, 30*time.Second); err != nil {
-			log.Printf("gtfs: initial refresh failed for %s: %v", databaseName, err)
-		}
-	} else {
+	switch {
+	case err == nil && isUpToDate:
 		fmt.Println("Feed data is still up to date: " + databaseName)
 		if err := database.createIndexesTx(); err != nil {
 			log.Printf("gtfs: failed to create indexes for %s: %v", databaseName, err)
+		}
+	case err != nil && database.hasCoreData():
+		// feed_info is missing / unparseable (some feeds don't ship it) but the
+		// core tables are populated - don't pay a full rebuild on every single
+		// startup; the daily auto-refresh will pull fresh data.
+		fmt.Printf("gtfs: %s: can't read feed_end_date (%v); keeping existing data, daily refresh will update\n", databaseName, err)
+		if err := database.createIndexesTx(); err != nil {
+			log.Printf("gtfs: failed to create indexes for %s: %v", databaseName, err)
+		}
+	default:
+		fmt.Println("Feed data is not up to date: " + databaseName)
+		if err := database.refreshWithRetries(3, 30*time.Second); err != nil {
+			log.Printf("gtfs: initial refresh failed for %s: %v", databaseName, err)
 		}
 	}
 
 	database.EnableAutoUpdateGTFSData()
 
 	return database, nil
+}
+
+// hasCoreData reports whether the essential GTFS tables exist and are non-empty,
+// i.e. a previous import succeeded and the DB is usable as-is.
+func (v Database) hasCoreData() bool {
+	for _, table := range []string{"stops", "routes", "trips", "stop_times"} {
+		var one int
+		if err := v.db.QueryRow("SELECT 1 FROM " + table + " LIMIT 1").Scan(&one); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (v Database) IsFeedDataUpToDate() (bool, error) {

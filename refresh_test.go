@@ -98,6 +98,58 @@ func TestRefreshDatabaseDataAtomicRollbackOnFailure(t *testing.T) {
 	}
 }
 
+// TestRefreshBatchedInsertPreservesEmptyFieldSemantics checks that the batching
+// bulk inserter still omits empty CSV fields so the column DEFAULT applies -
+// i.e. an empty integer column reads back as its default 0, not "".
+func TestRefreshBatchedInsertPreservesEmptyFieldSemantics(t *testing.T) {
+	db := newTestDatabase(t, "batchinsert")
+
+	// Row 1 populates wheelchair_boarding; rows 2 and 3 leave it empty. Rows
+	// also vary which optional columns they set, exercising multiple groups.
+	zip := buildGTFSZip(t, map[string]string{
+		"stops.txt": "stop_id,stop_name,stop_lat,stop_lon,wheelchair_boarding,platform_code\n" +
+			"S1,Alpha,-36.1,174.1,1,A\n" +
+			"S2,Beta,-36.2,174.2,,\n" +
+			"S3,Gamma,-36.3,174.3,,3\n",
+		"routes.txt": "route_id,route_short_name,route_long_name,route_type\nR1,1,Route One,3\n",
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(zip) }))
+	defer srv.Close()
+	db.url = srv.URL
+
+	if err := db.refreshDatabaseData(); err != nil {
+		t.Fatalf("refresh failed: %v", err)
+	}
+
+	var cnt int
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM stops").Scan(&cnt); err != nil || cnt != 3 {
+		t.Fatalf("expected 3 stops, got %d (err %v)", cnt, err)
+	}
+
+	// Empty wheelchair_boarding must fall back to the column default 0.
+	var wb int
+	if err := db.db.QueryRow("SELECT wheelchair_boarding FROM stops WHERE stop_id = 'S2'").Scan(&wb); err != nil {
+		t.Fatalf("scan S2 wheelchair_boarding: %v", err)
+	}
+	if wb != 0 {
+		t.Fatalf("expected S2 wheelchair_boarding default 0, got %d", wb)
+	}
+	var got int
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM stops WHERE wheelchair_boarding = 0").Scan(&got); err != nil || got != 2 {
+		t.Fatalf("expected 2 stops with wheelchair_boarding = 0, got %d (err %v)", got, err)
+	}
+
+	// Populated value survives.
+	if err := db.db.QueryRow("SELECT wheelchair_boarding FROM stops WHERE stop_id = 'S1'").Scan(&wb); err != nil || wb != 1 {
+		t.Fatalf("expected S1 wheelchair_boarding 1, got %d (err %v)", wb, err)
+	}
+
+	// n-gram tables populated and indexed without error.
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM stop_ngrams").Scan(&cnt); err != nil || cnt == 0 {
+		t.Fatalf("expected stop_ngrams populated, got %d (err %v)", cnt, err)
+	}
+}
+
 // TestNotifierBroadcastsToAllSubscribers verifies that every subscriber
 // (e.g. one per GenerateACache consumer) receives a notification on every
 // broadcast, not just one of them.
