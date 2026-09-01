@@ -226,3 +226,53 @@ func TestBuildTransitLegTimingFallsBackToScheduleOnInversion(t *testing.T) {
 		t.Fatalf("expected scheduled departure 17:21, got %v", timing.DepartureTime)
 	}
 }
+
+func TestEnforceMonotonicStopTimesRelabelsDraggedStop(t *testing.T) {
+	// A downstream stop kept "on_time" from an early realtime pass, then a big
+	// upstream delay drags it 6 min past schedule via the monotonic clamp.
+	stopTimes := []tripStopTime{
+		{StopID: "a", ArrivalSec: 8*3600 + 6*60, DepartureSec: 8*3600 + 6*60, ScheduledArrivalSec: 8 * 3600, ScheduledDepartureSec: 8 * 3600, RealtimeStatus: "delayed"},
+		{StopID: "b", ArrivalSec: 8*3600 + 3*60, DepartureSec: 8*3600 + 3*60, ScheduledArrivalSec: 8*3600 + 3*60, ScheduledDepartureSec: 8*3600 + 3*60, RealtimeStatus: "on_time"},
+	}
+	enforceMonotonicStopTimes(stopTimes)
+
+	if stopTimes[1].ArrivalSec != 8*3600+6*60 {
+		t.Fatalf("expected stop b clamped forward to 08:06, got %d", stopTimes[1].ArrivalSec)
+	}
+	if stopTimes[1].RealtimeStatus != "delayed" {
+		t.Fatalf("expected dragged-forward stop b relabelled 'delayed', got %q", stopTimes[1].RealtimeStatus)
+	}
+}
+
+func TestDeferOriginWalkRemovesLeadingWait(t *testing.T) {
+	day := time.Date(2026, 3, 23, 0, 0, 0, 0, time.UTC)
+	walkDur := 9 * time.Minute
+	trainDep := day.Add(20*time.Hour + 20*time.Minute) // 20:20
+
+	legs := []JourneyLeg{
+		{Mode: "walk", DepartureTime: day.Add(19*time.Hour + 42*time.Minute), ArrivalTime: day.Add(19*time.Hour + 51*time.Minute), Duration: walkDur},
+		{Mode: "transit", DepartureTime: trainDep, ArrivalTime: trainDep.Add(18 * time.Minute), Duration: 18 * time.Minute},
+	}
+	out := deferOriginWalk(legs)
+
+	wantArrive := trainDep.Add(-originWalkBufferSeconds * time.Second) // 20:18
+	if !out[0].ArrivalTime.Equal(wantArrive) {
+		t.Fatalf("expected walk to arrive at %v (train - 2min), got %v", wantArrive, out[0].ArrivalTime)
+	}
+	if !out[0].DepartureTime.Equal(wantArrive.Add(-walkDur)) {
+		t.Fatalf("expected walk to start at %v, got %v", wantArrive.Add(-walkDur), out[0].DepartureTime)
+	}
+	if out[0].ArrivalTime.Sub(out[0].DepartureTime) != walkDur {
+		t.Fatalf("walk duration changed: %v", out[0].ArrivalTime.Sub(out[0].DepartureTime))
+	}
+
+	// A tight connection (well under the buffer) is left untouched.
+	tight := []JourneyLeg{
+		{Mode: "walk", DepartureTime: day, ArrivalTime: day.Add(walkDur), Duration: walkDur},
+		{Mode: "transit", DepartureTime: day.Add(walkDur + 30*time.Second), ArrivalTime: day.Add(walkDur + 20*time.Minute)},
+	}
+	tightOut := deferOriginWalk(tight)
+	if !tightOut[0].DepartureTime.Equal(day) {
+		t.Fatalf("expected a tight connection's walk left at its original start, got %v", tightOut[0].DepartureTime)
+	}
+}

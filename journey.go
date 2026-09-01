@@ -280,15 +280,20 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			continue
 		}
 		legs = preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, departAt, dayStart, req.WalkSpeedKmph)
+		legs = deferOriginWalk(legs)
 		arrivalTime := dayStart.Add(time.Duration(candidate.ArrivalSec) * time.Second)
+		planDeparture := departAt
+		if len(legs) > 0 && legs[0].Mode == "walk" {
+			planDeparture = legs[0].DepartureTime
+		}
 		plan := JourneyPlan{
 			StartLat:      req.StartLat,
 			StartLon:      req.StartLon,
 			EndLat:        req.EndLat,
 			EndLon:        req.EndLon,
-			DepartureTime: departAt,
+			DepartureTime: planDeparture,
 			ArrivalTime:   arrivalTime,
-			TotalDuration: arrivalTime.Sub(departAt),
+			TotalDuration: arrivalTime.Sub(planDeparture),
 			Transfers:     transfers,
 			TransferStops: transferStops,
 			Legs:          legs,
@@ -462,7 +467,11 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		if len(legs) == 0 {
 			continue
 		}
+		legs = deferOriginWalk(legs)
 		departAt := dayStart.Add(time.Duration(candidate.DepartSec) * time.Second)
+		if len(legs) > 0 && legs[0].Mode == "walk" {
+			departAt = legs[0].DepartureTime
+		}
 		arrivalTime := legs[len(legs)-1].ArrivalTime
 		plan := JourneyPlan{
 			StartLat:      req.StartLat,
@@ -700,8 +709,13 @@ func clampNonNegative(value int) int {
 // genuinely large. Anything outside this window is clamped to the edge.
 const (
 	minTrustedDelaySeconds = -10 * 60
-	maxTrustedDelaySeconds = 6 * 60 * 60
+	maxTrustedDelaySeconds = 2 * 60 * 60
 )
+
+// How far a monotonic-clamp has to move a stop's arrival past its scheduled time
+// before we relabel the stop as delayed (the clamp mutates the times but not the
+// status, so without this a dragged-forward stop keeps reading "on_time").
+const clampStatusThresholdSeconds = 60
 
 func clampDelaySeconds(delay int) int {
 	if delay < minTrustedDelaySeconds {
@@ -718,7 +732,9 @@ func clampDelaySeconds(delay int) int {
 // departure and every departure is >= its own arrival. Scheduled feeds are
 // already monotonic, so this only ever moves times that a realtime adjustment
 // pushed out of order - which is what produces arrival-before-departure legs
-// downstream. Scheduled*Sec fields are left untouched.
+// downstream. Scheduled*Sec fields are left untouched; RealtimeStatus is
+// updated to "delayed" for any stop the clamp pushed meaningfully past its
+// scheduled time (otherwise a dragged-forward stop keeps its stale status).
 func enforceMonotonicStopTimes(stopTimes []tripStopTime) {
 	for i := range stopTimes {
 		if i > 0 && stopTimes[i].ArrivalSec < stopTimes[i-1].DepartureSec {
@@ -726,6 +742,10 @@ func enforceMonotonicStopTimes(stopTimes []tripStopTime) {
 		}
 		if stopTimes[i].DepartureSec < stopTimes[i].ArrivalSec {
 			stopTimes[i].DepartureSec = stopTimes[i].ArrivalSec
+		}
+		if stopTimes[i].RealtimeStatus != "scheduled" && stopTimes[i].RealtimeStatus != "canceled" && stopTimes[i].RealtimeStatus != "skipped" &&
+			stopTimes[i].ArrivalSec-stopTimes[i].ScheduledArrivalSec > clampStatusThresholdSeconds {
+			stopTimes[i].RealtimeStatus = "delayed"
 		}
 	}
 }
@@ -1356,6 +1376,29 @@ func reverseLegs(legs []JourneyLeg) {
 	for i, j := 0, len(legs)-1; i < j; i, j = i+1, j-1 {
 		legs[i], legs[j] = legs[j], legs[i]
 	}
+}
+
+// The rider should reach their first boarding stop this many seconds before the
+// train leaves, not earlier - anything more is dead time on a platform.
+const originWalkBufferSeconds = 120
+
+// deferOriginWalk pushes a leading "walk to the first stop" leg as late as
+// possible: the rider leaves just in time to catch their first service (plus a
+// small platform buffer) rather than immediately, so a big schedule gap isn't
+// shown as time spent standing at the stop. The walk's duration is fixed, so
+// only its start/end shift; the journey's arrival is unchanged. The arrive-by
+// planner already does the equivalent for the final walk.
+func deferOriginWalk(legs []JourneyLeg) []JourneyLeg {
+	if len(legs) < 2 || legs[0].Mode != "walk" || legs[1].Mode != "transit" {
+		return legs
+	}
+	slack := legs[1].DepartureTime.Sub(legs[0].ArrivalTime) - originWalkBufferSeconds*time.Second
+	if slack <= 0 {
+		return legs
+	}
+	legs[0].DepartureTime = legs[0].DepartureTime.Add(slack)
+	legs[0].ArrivalTime = legs[0].ArrivalTime.Add(slack)
+	return legs
 }
 
 // populateRouteGeoJSON fills in RouteGeoJSON for each plan, one goroutine per
