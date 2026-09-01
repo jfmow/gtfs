@@ -242,7 +242,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 					continue
 				}
 
-				if stopTime.TripUsable && stopTime.ArrivalSec < arrival[stopTime.StopID] {
+				if stopTime.TripUsable && stopTime.ArrivalSec >= boardDepartSec && stopTime.ArrivalSec < arrival[stopTime.StopID] {
 					arrival[stopTime.StopID] = stopTime.ArrivalSec
 					predecessor[stopTime.StopID] = stopPredecessor{
 						FromStopID:         boardStopID,
@@ -678,6 +678,12 @@ func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsreal
 		return nil, errors.New("no trip times found for active services")
 	}
 
+	// Rows arrive ORDER BY trip_id, stop_sequence, so each slice is already in
+	// sequence order - clamp any realtime-adjusted times back into order.
+	for tripID := range trips {
+		enforceMonotonicStopTimes(trips[tripID])
+	}
+
 	return trips, nil
 }
 
@@ -686,6 +692,75 @@ func clampNonNegative(value int) int {
 		return 0
 	}
 	return value
+}
+
+// Bounds for a GTFS-realtime delay we're willing to trust. Vehicles do not
+// legitimately run more than a few minutes ahead of schedule, so a large
+// "early" value is almost always a stale/bogus feed entry; lateness can be
+// genuinely large. Anything outside this window is clamped to the edge.
+const (
+	minTrustedDelaySeconds = -10 * 60
+	maxTrustedDelaySeconds = 6 * 60 * 60
+)
+
+func clampDelaySeconds(delay int) int {
+	if delay < minTrustedDelaySeconds {
+		return minTrustedDelaySeconds
+	}
+	if delay > maxTrustedDelaySeconds {
+		return maxTrustedDelaySeconds
+	}
+	return delay
+}
+
+// enforceMonotonicStopTimes clamps a trip's (realtime-adjusted) stop times
+// forward so that, in stop-sequence order, every arrival is >= the previous
+// departure and every departure is >= its own arrival. Scheduled feeds are
+// already monotonic, so this only ever moves times that a realtime adjustment
+// pushed out of order - which is what produces arrival-before-departure legs
+// downstream. Scheduled*Sec fields are left untouched.
+func enforceMonotonicStopTimes(stopTimes []tripStopTime) {
+	for i := range stopTimes {
+		if i > 0 && stopTimes[i].ArrivalSec < stopTimes[i-1].DepartureSec {
+			stopTimes[i].ArrivalSec = stopTimes[i-1].DepartureSec
+		}
+		if stopTimes[i].DepartureSec < stopTimes[i].ArrivalSec {
+			stopTimes[i].DepartureSec = stopTimes[i].ArrivalSec
+		}
+	}
+}
+
+type legTiming struct {
+	DepartureTime          time.Time
+	ArrivalTime            time.Time
+	ScheduledDepartureTime time.Time
+	ScheduledArrivalTime   time.Time
+	Duration               time.Duration
+	RealtimeStatus         string
+	DelaySeconds           int
+}
+
+// buildTransitLegTiming derives a transit leg's time fields, falling back to the
+// schedule when the realtime-adjusted board departure / alight arrival are
+// inconsistent (arrival before departure) - which otherwise surfaces as a
+// negative-duration, "arrives before it departs" leg.
+func buildTransitLegTiming(dayStart time.Time, departSec, arriveSec, schedDepartSec, schedArriveSec int, realtimeStatus string) legTiming {
+	if arriveSec < departSec {
+		departSec, arriveSec = schedDepartSec, schedArriveSec
+		realtimeStatus = "scheduled"
+	}
+	if arriveSec < departSec {
+		arriveSec = departSec
+	}
+	return legTiming{
+		DepartureTime:          dayStart.Add(time.Duration(departSec) * time.Second),
+		ArrivalTime:            dayStart.Add(time.Duration(arriveSec) * time.Second),
+		ScheduledDepartureTime: dayStart.Add(time.Duration(schedDepartSec) * time.Second),
+		ScheduledArrivalTime:   dayStart.Add(time.Duration(schedArriveSec) * time.Second),
+		Duration:               time.Duration(arriveSec-departSec) * time.Second,
+		RealtimeStatus:         realtimeStatus,
+		DelaySeconds:           arriveSec - schedArriveSec,
+	}
 }
 
 func shouldApplyRealtimeAdjustment(adj realtimeTripAdjustment, serviceDay, today string) bool {
@@ -717,7 +792,7 @@ func loadRealtimeTripAdjustments(client *gtfsrealtime.Realtime) map[string]realt
 		}
 
 		adj := realtimeTripAdjustment{
-			tripDelay:    int(update.GetDelay()),
+			tripDelay:    clampDelaySeconds(int(update.GetDelay())),
 			tripCanceled: update.GetTrip().GetScheduleRelationship() == proto.TripDescriptor_CANCELED,
 			stopBySeq:    map[int]realtimeStopAdjustment{},
 			stopByID:     map[string]realtimeStopAdjustment{},
@@ -726,9 +801,16 @@ func loadRealtimeTripAdjustments(client *gtfsrealtime.Realtime) map[string]realt
 		}
 
 		for _, stu := range update.GetStopTimeUpdate() {
+			// Stale stop updates preserved from a previous fetch (see
+			// mergeTripUpdates) still describe where the vehicle was reported
+			// hours ago - applying them to future planning drags a stop's time
+			// permanently off. Only trust fresh entries.
+			if stu.GetStopTimeProperties().GetHistoric() {
+				continue
+			}
 			stopAdj := realtimeStopAdjustment{
-				arrivalDelay:   stopTimeEventDelay(stu.GetArrival(), adj.tripDelay),
-				departureDelay: stopTimeEventDelay(stu.GetDeparture(), adj.tripDelay),
+				arrivalDelay:   clampDelaySeconds(stopTimeEventDelay(stu.GetArrival(), adj.tripDelay)),
+				departureDelay: clampDelaySeconds(stopTimeEventDelay(stu.GetDeparture(), adj.tripDelay)),
 				skipped:        stu.GetScheduleRelationship() == proto.TripUpdate_StopTimeUpdate_SKIPPED,
 			}
 
@@ -1120,6 +1202,7 @@ func buildJourneyLegs(endStop StopWithDistance, endArrivalSec int, predecessor m
 			routeCopy := route
 			routePtr = &routeCopy
 		}
+		timing := buildTransitLegTiming(dayStart, pred.DepartSec, pred.ArriveSec, pred.ScheduledDepartSec, pred.ScheduledArriveSec, pred.RealtimeStatus)
 		leg := JourneyLeg{
 			Mode:                   "transit",
 			FromStop:               &fromStop,
@@ -1127,13 +1210,13 @@ func buildJourneyLegs(endStop StopWithDistance, endArrivalSec int, predecessor m
 			TripID:                 pred.TripID,
 			RouteID:                pred.RouteID,
 			Route:                  routePtr,
-			DepartureTime:          dayStart.Add(time.Duration(pred.DepartSec) * time.Second),
-			ArrivalTime:            dayStart.Add(time.Duration(pred.ArriveSec) * time.Second),
-			Duration:               time.Duration(pred.ArriveSec-pred.DepartSec) * time.Second,
-			ScheduledDepartureTime: dayStart.Add(time.Duration(pred.ScheduledDepartSec) * time.Second),
-			ScheduledArrivalTime:   dayStart.Add(time.Duration(pred.ScheduledArriveSec) * time.Second),
-			RealtimeStatus:         pred.RealtimeStatus,
-			DelaySeconds:           pred.ArriveSec - pred.ScheduledArriveSec,
+			DepartureTime:          timing.DepartureTime,
+			ArrivalTime:            timing.ArrivalTime,
+			Duration:               timing.Duration,
+			ScheduledDepartureTime: timing.ScheduledDepartureTime,
+			ScheduledArrivalTime:   timing.ScheduledArrivalTime,
+			RealtimeStatus:         timing.RealtimeStatus,
+			DelaySeconds:           timing.DelaySeconds,
 			TripUsable:             pred.TripUsable,
 		}
 		if lastTripID != "" && lastTripID != pred.TripID {
@@ -1237,6 +1320,7 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 			routeCopy := route
 			routePtr = &routeCopy
 		}
+		timing := buildTransitLegTiming(dayStart, next.DepartSec, next.ArriveSec, next.ScheduledDepartSec, next.ScheduledArriveSec, next.RealtimeStatus)
 		leg := JourneyLeg{
 			Mode:                   "transit",
 			FromStop:               &fromStop,
@@ -1244,13 +1328,13 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 			TripID:                 next.TripID,
 			RouteID:                next.RouteID,
 			Route:                  routePtr,
-			DepartureTime:          dayStart.Add(time.Duration(next.DepartSec) * time.Second),
-			ArrivalTime:            dayStart.Add(time.Duration(next.ArriveSec) * time.Second),
-			Duration:               time.Duration(next.ArriveSec-next.DepartSec) * time.Second,
-			ScheduledDepartureTime: dayStart.Add(time.Duration(next.ScheduledDepartSec) * time.Second),
-			ScheduledArrivalTime:   dayStart.Add(time.Duration(next.ScheduledArriveSec) * time.Second),
-			RealtimeStatus:         next.RealtimeStatus,
-			DelaySeconds:           next.ArriveSec - next.ScheduledArriveSec,
+			DepartureTime:          timing.DepartureTime,
+			ArrivalTime:            timing.ArrivalTime,
+			Duration:               timing.Duration,
+			ScheduledDepartureTime: timing.ScheduledDepartureTime,
+			ScheduledArrivalTime:   timing.ScheduledArrivalTime,
+			RealtimeStatus:         timing.RealtimeStatus,
+			DelaySeconds:           timing.DelaySeconds,
 			TripUsable:             next.TripUsable,
 		}
 		if lastTripID != "" && lastTripID != next.TripID {

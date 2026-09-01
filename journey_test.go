@@ -178,3 +178,51 @@ func TestCanAlightForTransitConnectionRequiresOneMinuteForTransfers(t *testing.T
 		t.Fatalf("expected transfer alight with one minute gap to be allowed")
 	}
 }
+
+func TestClampDelaySeconds(t *testing.T) {
+	if got := clampDelaySeconds(-2460); got != minTrustedDelaySeconds {
+		t.Fatalf("expected bogus 41-min-early delay clamped to %d, got %d", minTrustedDelaySeconds, got)
+	}
+	if got := clampDelaySeconds(12 * 60 * 60); got != maxTrustedDelaySeconds {
+		t.Fatalf("expected 12h delay clamped to %d, got %d", maxTrustedDelaySeconds, got)
+	}
+	if got := clampDelaySeconds(180); got != 180 {
+		t.Fatalf("expected a plausible 3-min delay to pass through, got %d", got)
+	}
+}
+
+func TestEnforceMonotonicStopTimes(t *testing.T) {
+	// Alight stop dragged 41 min early by a bogus realtime adjustment while the
+	// board stop kept its scheduled time.
+	stopTimes := []tripStopTime{
+		{StopID: "board", ArrivalSec: 17 * 3600, DepartureSec: 17 * 3600, ScheduledArrivalSec: 17 * 3600, ScheduledDepartureSec: 17 * 3600},
+		{StopID: "alight", ArrivalSec: 17*3600 + 4*60 - 2460, DepartureSec: 17*3600 + 4*60 - 2460, ScheduledArrivalSec: 17*3600 + 4*60, ScheduledDepartureSec: 17*3600 + 4*60},
+	}
+	enforceMonotonicStopTimes(stopTimes)
+
+	if stopTimes[1].ArrivalSec < stopTimes[0].DepartureSec {
+		t.Fatalf("alight arrival %d is before board departure %d", stopTimes[1].ArrivalSec, stopTimes[0].DepartureSec)
+	}
+	if stopTimes[1].DepartureSec < stopTimes[1].ArrivalSec {
+		t.Fatalf("alight departure %d is before its own arrival %d", stopTimes[1].DepartureSec, stopTimes[1].ArrivalSec)
+	}
+}
+
+func TestBuildTransitLegTimingFallsBackToScheduleOnInversion(t *testing.T) {
+	dayStart := time.Date(2026, 3, 23, 0, 0, 0, 0, time.UTC)
+	// Adjusted arrival (departSec 17:25, arriveSec 16:44) is before departure.
+	timing := buildTransitLegTiming(dayStart, 17*3600+25*60, 16*3600+44*60, 17*3600+21*60, 17*3600+25*60, "early")
+
+	if timing.ArrivalTime.Before(timing.DepartureTime) {
+		t.Fatalf("leg arrives (%v) before it departs (%v)", timing.ArrivalTime, timing.DepartureTime)
+	}
+	if timing.Duration < 0 {
+		t.Fatalf("expected non-negative duration, got %v", timing.Duration)
+	}
+	if timing.RealtimeStatus != "scheduled" {
+		t.Fatalf("expected fallback to scheduled status, got %q", timing.RealtimeStatus)
+	}
+	if !timing.DepartureTime.Equal(dayStart.Add(17*time.Hour + 21*time.Minute)) {
+		t.Fatalf("expected scheduled departure 17:21, got %v", timing.DepartureTime)
+	}
+}
