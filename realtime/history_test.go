@@ -10,6 +10,7 @@ import (
 func TestTripHistoryStoresVehicleLocationsAndTripUpdatesByTripID(t *testing.T) {
 	cache := &tripHistoryCache{}
 	realtime := Realtime{tripHistoryCache: cache}
+	realtime.EnableTripHistory()
 	now := time.Unix(100, 0)
 	tripID := "trip-1"
 	vehicleTimestamp := uint64(100)
@@ -52,6 +53,7 @@ func TestTripHistoryStoresVehicleLocationsAndTripUpdatesByTripID(t *testing.T) {
 func TestTripHistoryExpiresWhenTripEnds(t *testing.T) {
 	cache := &tripHistoryCache{}
 	realtime := Realtime{tripHistoryCache: cache}
+	realtime.EnableTripHistory()
 	tripID := "trip-1"
 	updateTimestamp := uint64(101)
 	endTime := int64(200)

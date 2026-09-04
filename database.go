@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -65,8 +66,11 @@ func newDatabase(url string, apiKey ApiKey, databaseName string, tz *time.Locati
 		"_pragma=journal_mode(WAL)",
 		"_pragma=synchronous(NORMAL)",
 		"_pragma=foreign_keys(0)",
-		"_pragma=temp_store(MEMORY)",
-		"_pragma=cache_size(-65536)",
+		// 16 MiB page cache per connection (was 64). Steady-state serving does
+		// not need the larger cache; a small pool (below) keeps total RSS bounded
+		// on memory-constrained hosts. temp_store is left at the default (FILE)
+		// so large ORDER BY sorts spill to disk instead of RAM.
+		"_pragma=cache_size(-16384)",
 	}, "&")
 
 	db, err := sqlx.Open("sqlite", dsn)
@@ -78,9 +82,11 @@ func newDatabase(url string, apiKey ApiKey, databaseName string, tz *time.Locati
 	// SQLite allows a single writer; a small bounded pool keeps read
 	// concurrency without letting stray idle connections pin old WAL
 	// snapshots and block checkpointing (which is how the -wal files grew to
-	// hundreds of MB).
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(4)
+	// hundreds of MB). Each connection carries its own page cache, so the pool
+	// size directly multiplies RSS - keep it to 2 (one for a background cron,
+	// one for a user request) and let the second close when idle.
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(1)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 
 	if _, err := db.Exec("PRAGMA journal_mode = WAL;"); err != nil {
@@ -553,8 +559,23 @@ func (v Database) refreshDatabaseData() error {
 	if _, err := v.db.Exec("PRAGMA optimize;"); err != nil {
 		log.Printf("gtfs: post-refresh optimize failed for %s: %v", v.name, err)
 	}
+	// The daily rebuild DROPs every table and reloads it, which dumps the old
+	// pages onto the freelist - SQLite never returns those to the OS on its own
+	// (auto_vacuum is off), so the file only ever grows to its high-water mark.
+	// A full VACUUM after each refresh reclaims them. Needs ~1x the db size in
+	// free disk transiently; runs at 1am under cronMutex with an idle pool.
+	if _, err := v.db.Exec("VACUUM;"); err != nil {
+		log.Printf("gtfs: post-refresh VACUUM failed for %s: %v", v.name, err)
+	}
+	// Hand the pages VACUUM just freed (and the rebuild's transient buffers)
+	// back to the OS rather than letting the Go runtime sit on them.
+	debug.FreeOSMemory()
 
 	fmt.Println("Data updated successfully.")
+
+	// The fresh feed may change today's schedule - drop the short-lived
+	// loadTripStopTimes memo so the next plan rebuilds against the new data.
+	tripStopTimesMemos.Delete(v.name)
 
 	v.refreshNotifier.broadcast()
 	return nil

@@ -11,8 +11,13 @@ import (
 )
 
 type tripHistoryCache struct {
-	mu   sync.Mutex
-	data TripHistoryMap
+	mu sync.Mutex
+	// enabled is off by default - the sampling loop deep-clones every trip
+	// update / vehicle position on every feed poll and only evicts once a trip's
+	// end time can be inferred, so it can grow to hundreds of MB over a service
+	// day. Callers that actually read GetTripHistory opt in via EnableTripHistory.
+	enabled bool
+	data    TripHistoryMap
 }
 
 // TripHistoryMap stores realtime samples by trip id for the active trip period.
@@ -28,10 +33,23 @@ type TripHistory struct {
 	ExpiresAt   time.Time                    `json:"expires_at,omitempty"`
 }
 
+// EnableTripHistory turns on the per-trip realtime sampling that GetTripHistory
+// returns. It is off by default (see tripHistoryCache.enabled). tripHistoryCache
+// is a shared pointer across Realtime value copies, so enabling it on any copy
+// enables it for all of them.
+func (v Realtime) EnableTripHistory() {
+	v.tripHistoryCache.mu.Lock()
+	v.tripHistoryCache.enabled = true
+	v.tripHistoryCache.mu.Unlock()
+}
+
 func (v Realtime) addVehicleHistory(vehicles VehiclesMap, now time.Time) {
 	v.tripHistoryCache.mu.Lock()
 	defer v.tripHistoryCache.mu.Unlock()
 
+	if !v.tripHistoryCache.enabled {
+		return
+	}
 	v.expireTripHistoryLocked(now)
 	for tripID, vehicle := range vehicles {
 		if tripID == "" || vehicle == nil {
@@ -48,6 +66,9 @@ func (v Realtime) addTripUpdateHistory(updates TripUpdatesMap, now time.Time) {
 	v.tripHistoryCache.mu.Lock()
 	defer v.tripHistoryCache.mu.Unlock()
 
+	if !v.tripHistoryCache.enabled {
+		return
+	}
 	v.expireTripHistoryLocked(now)
 	for tripID, update := range updates {
 		if tripID == "" || update == nil {

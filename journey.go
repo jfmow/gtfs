@@ -526,7 +526,44 @@ func canAlightForTransitConnection(arrivalSec, latestAllowedSec int, isTransfer 
 	return arrivalSec+requiredGap <= latestAllowedSec
 }
 
+// tripStopTimesMemo caches one built loadTripStopTimes result per database, for
+// a short window. Every /services/plan request rebuilds the same ~500k-row map
+// from scratch (SQL scan + realtime overlay), which is the dominant per-request
+// allocation; concurrent plan requests within the TTL now share one read-only
+// copy instead of each materialising their own. Callers MUST NOT mutate the
+// returned map or its slices (the RAPTOR scan only reads them).
+type tripStopTimesMemo struct {
+	mu      sync.Mutex
+	day     string
+	builtAt time.Time
+	data    map[string][]tripStopTime
+}
+
+const tripStopTimesMemoTTL = 30 * time.Second
+
+var tripStopTimesMemos sync.Map // database name -> *tripStopTimesMemo
+
 func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsrealtime.Realtime) (map[string][]tripStopTime, error) {
+	day := dayStart.Format("20060102")
+	mi, _ := tripStopTimesMemos.LoadOrStore(v.name, &tripStopTimesMemo{})
+	m := mi.(*tripStopTimesMemo)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.data != nil && m.day == day && time.Since(m.builtAt) < tripStopTimesMemoTTL {
+		return m.data, nil
+	}
+
+	built, err := v.buildTripStopTimes(dayStart, realtimeClient)
+	if err != nil {
+		return nil, err
+	}
+	m.data, m.day, m.builtAt = built, day, time.Now()
+	return built, nil
+}
+
+func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrealtime.Realtime) (map[string][]tripStopTime, error) {
 	weekday := strings.ToLower(dayStart.Weekday().String()) // "monday", "tuesday", etc.
 
 	query := fmt.Sprintf(`
