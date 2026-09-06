@@ -1065,6 +1065,19 @@ func parseTimeToSeconds(timeStr string) (int, error) {
 	return hours*3600 + minutes*60 + seconds, nil
 }
 
+// stationKey groups stops that are the same physical place: child platforms
+// share a parent_station, and where a feed leaves the parent blank it still
+// co-locates the platforms, so fall back to the (tightly) rounded coordinate.
+// Used to stop the planner treating e.g. Ellerslie's two platforms as separate
+// destinations - one of which is only reachable by riding past the station and
+// doubling back.
+func stationKey(stop Stop) string {
+	if stop.ParentStation != "" {
+		return "p:" + stop.ParentStation
+	}
+	return fmt.Sprintf("c:%.5f,%.5f", stop.StopLat, stop.StopLon)
+}
+
 func selectBestDestinations(candidates []StopWithDistance, arrival map[string]int, departSec int, walkSpeedKmph float64, maxResults int) []journeyCandidate {
 	var results []journeyCandidate
 	for _, candidate := range candidates {
@@ -1084,6 +1097,20 @@ func selectBestDestinations(candidates []StopWithDistance, arrival map[string]in
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].ArrivalSec < results[j].ArrivalSec
 	})
+	// One arrival per physical station - after the sort the first hit is the
+	// earliest, so a doubleback plan to another platform of the same station
+	// never survives.
+	seen := make(map[string]struct{}, len(results))
+	collapsed := results[:0]
+	for _, r := range results {
+		key := stationKey(r.Stop.Stop)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		collapsed = append(collapsed, r)
+	}
+	results = collapsed
 	if maxResults > 0 && len(results) > maxResults {
 		results = results[:maxResults]
 	}
@@ -1110,6 +1137,20 @@ func selectBestOriginsArriveAt(candidates []StopWithDistance, latest map[string]
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].DepartSec > results[j].DepartSec
 	})
+	// One departure per physical station - first hit after the sort is the
+	// latest possible, so the mirror-image doubleback (board a platform only
+	// reachable by riding away from the destination first) is discarded.
+	seen := make(map[string]struct{}, len(results))
+	collapsed := results[:0]
+	for _, r := range results {
+		key := stationKey(r.Stop.Stop)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		collapsed = append(collapsed, r)
+	}
+	results = collapsed
 	if maxResults > 0 && len(results) > maxResults {
 		results = results[:maxResults]
 	}
