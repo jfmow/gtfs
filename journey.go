@@ -206,24 +206,41 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 
 	transferGraph := v.stopTransferGraph(stopMap, req.IncludeChildren)
 
-	buildPlans := func(banned map[string]bool) []JourneyPlan {
-		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, departSec, req.MaxTransfers, req.WalkSpeedKmph, banned)
+	// buildPlans runs one RAPTOR scan and turns it into itineraries. `banned`
+	// skips trips on those routes; `fromSec` (0 = use the request's own time)
+	// overrides the departure so the diversity pass can ask for "the next
+	// service" on a low-frequency corridor.
+	buildPlans := func(banned map[string]bool, fromSec int) []JourneyPlan {
+		scanSec := departSec
+		scanAt := departAt
+		if fromSec > 0 {
+			scanSec = fromSec
+			scanAt = dayStart.Add(time.Duration(fromSec) * time.Second)
+		}
+
+		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, scanSec, req.MaxTransfers, req.WalkSpeedKmph, banned)
 
 		candidateLimit := expandedCandidateLimit(req.MaxResults)
-		bestCandidates := selectBestDestinations(nearbyEndStops, arrival, departSec, req.WalkSpeedKmph, candidateLimit)
+		bestCandidates := selectBestDestinations(nearbyEndStops, arrival, scanSec, req.WalkSpeedKmph, candidateLimit)
 
 		var plans []JourneyPlan
 		for _, candidate := range bestCandidates {
-			legs, transfers, transferStops := buildJourneyLegs(candidate.Stop, candidate.ArrivalSec, predecessor, stopMap, routeMap, departAt, dayStart, req.WalkSpeedKmph, req.StartLat, req.StartLon)
+			legs, transfers, transferStops := buildJourneyLegs(candidate.Stop, candidate.ArrivalSec, predecessor, stopMap, routeMap, scanAt, dayStart, req.WalkSpeedKmph, req.StartLat, req.StartLon)
 			if len(legs) == 0 {
 				continue
 			}
-			legs = preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, departAt, dayStart, req.WalkSpeedKmph)
+			legs = preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, scanAt, dayStart, req.WalkSpeedKmph)
 			legs = dropRedundantLeadingHop(legs, nearbyStartStops, trips, req.WalkSpeedKmph, dayStart)
 			legs = mergeAdjacentWalkLegs(legs)
 			legs = deferOriginWalk(legs)
+			// Guard against the round loop's occasional over-count (a foot leg can
+			// smuggle in one more boarding than MaxTransfers): recount from the
+			// final legs and drop anything over budget.
+			if tc := countTransfers(legs); tc > req.MaxTransfers {
+				continue
+			}
 			arrivalTime := legs[len(legs)-1].ArrivalTime
-			planDeparture := departAt
+			planDeparture := scanAt
 			if legs[0].Mode == "walk" {
 				planDeparture = legs[0].DepartureTime
 			}
@@ -244,7 +261,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		return plans
 	}
 
-	plans := buildPlans(nil)
+	plans := buildPlans(nil, 0)
 	if len(plans) == 0 {
 		return nil, errors.New("no journey found between the given coordinates")
 	}
@@ -254,10 +271,10 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 	plans = dedupePlansByTransitService(plans, 0)
 
 	// Diversity pass: RAPTOR keeps only the single earliest arrival per stop, so
-	// every candidate plan tends to share one spine (e.g. all via the 782). Re-run
-	// with each route the best plan uses banned in turn, so a slightly-slower plan
-	// that takes a different route (the 70, say) still surfaces as an option.
-	plans = diversifyPlans(plans, buildPlans, req.MaxResults)
+	// every candidate plan tends to share one spine. Re-run with routes banned to
+	// pull in genuinely different options, and if the corridor is thin, add the
+	// next departures so the rider still gets at least MinResults choices.
+	plans = diversifyPlans(plans, dayStart, buildPlans, req.MinResults, req.MaxResults)
 
 	plans = dedupePlansByTransitService(plans, req.MaxResults)
 	if len(plans) == 0 {
@@ -361,15 +378,52 @@ func raptorDepartScan(
 	return arrival, predecessor
 }
 
-// diversifyPlans re-runs the planner with each transit route from the current
-// best plan banned in turn, appending any genuinely different route options.
-func diversifyPlans(plans []JourneyPlan, buildPlans func(map[string]bool) []JourneyPlan, maxResults int) []JourneyPlan {
+// countTransfers counts boardings-minus-one across a finished leg list (a walk
+// leg between two transit legs is still one transfer, not two).
+func countTransfers(legs []JourneyLeg) int {
+	boardings := 0
+	for _, leg := range legs {
+		if leg.Mode == "transit" {
+			boardings++
+		}
+	}
+	if boardings == 0 {
+		return 0
+	}
+	return boardings - 1
+}
+
+// firstTransitDepartSec returns the seconds-since-dayStart of a plan's first
+// transit leg (0 if it's somehow walk-only).
+func firstTransitDepartSec(plan JourneyPlan, dayStart time.Time) int {
+	for _, leg := range plan.Legs {
+		if leg.Mode == "transit" {
+			return int(leg.DepartureTime.Sub(dayStart).Seconds())
+		}
+	}
+	return 0
+}
+
+// diversifyPlans grows a thin result set toward minResults. First it re-runs the
+// planner with routes from the current plans banned, one at a time, to pull in
+// genuinely different route choices. If the corridor is still thin (low
+// frequency, one sensible path) it then adds the *next* departures on that path
+// so the rider always gets a few concrete options.
+func diversifyPlans(
+	plans []JourneyPlan,
+	dayStart time.Time,
+	buildPlans func(banned map[string]bool, fromSec int) []JourneyPlan,
+	minResults, maxResults int,
+) []JourneyPlan {
 	if len(plans) == 0 {
 		return plans
 	}
-	target := maxResults
-	if target < 4 {
-		target = 4
+	target := minResults
+	if target < 3 {
+		target = 3
+	}
+	if maxResults > target {
+		target = maxResults
 	}
 	if len(plans) >= target {
 		return plans
@@ -377,42 +431,74 @@ func diversifyPlans(plans []JourneyPlan, buildPlans func(map[string]bool) []Jour
 
 	sort.SliceStable(plans, func(i, j int) bool { return plans[i].TotalDuration < plans[j].TotalDuration })
 
-	seenRoute := map[string]bool{}
-	var toBan []string
-	for _, leg := range plans[0].Legs {
-		if leg.Mode == "transit" && leg.RouteID != "" && !seenRoute[leg.RouteID] {
-			seenRoute[leg.RouteID] = true
-			toBan = append(toBan, leg.RouteID)
-		}
-	}
-
 	haveSignature := map[string]bool{}
 	for _, p := range plans {
 		haveSignature[transitServiceSignature(p)] = true
 	}
+	add := func(cands []JourneyPlan) int {
+		added := 0
+		for _, p := range cands {
+			sig := transitServiceSignature(p)
+			if !haveSignature[sig] {
+				haveSignature[sig] = true
+				plans = append(plans, p)
+				added++
+			}
+		}
+		return added
+	}
 
-	const maxExtraRuns = 4
+	// Phase A - route banning. Routes from every current plan, best first.
+	seenRoute := map[string]bool{}
+	var toBan []string
+	for _, p := range plans {
+		for _, leg := range p.Legs {
+			if leg.Mode == "transit" && leg.RouteID != "" && !seenRoute[leg.RouteID] {
+				seenRoute[leg.RouteID] = true
+				toBan = append(toBan, leg.RouteID)
+			}
+		}
+	}
+	const maxExtraRuns = 6
 	if debugJourneyDiversity {
-		fmt.Fprintf(os.Stderr, "[diversify] base plans=%d toBan=%v\n", len(plans), toBan)
+		fmt.Fprintf(os.Stderr, "[diversify] base=%d target=%d toBan=%v\n", len(plans), target, toBan)
 	}
 	for i, routeID := range toBan {
 		if i >= maxExtraRuns || len(plans) >= target {
 			break
 		}
-		alts := buildPlans(map[string]bool{routeID: true})
-		added := 0
-		for _, alt := range alts {
-			sig := transitServiceSignature(alt)
-			if !haveSignature[sig] {
-				haveSignature[sig] = true
-				plans = append(plans, alt)
-				added++
+		n := add(buildPlans(map[string]bool{routeID: true}, 0))
+		if debugJourneyDiversity {
+			fmt.Fprintf(os.Stderr, "[diversify] ban %s -> +%d (now %d)\n", routeID, n, len(plans))
+		}
+	}
+
+	// Phase B - next departures. Walk forward from the earliest first-transit
+	// departure we have, asking for the service after it each time, so a
+	// half-hourly corridor still yields "now", "the next one", "the one after".
+	cursor := math.MaxInt32
+	for _, p := range plans {
+		if d := firstTransitDepartSec(p, dayStart); d > 0 && d < cursor {
+			cursor = d
+		}
+	}
+	for iter := 0; iter < 6 && len(plans) < target && cursor != math.MaxInt32; iter++ {
+		before := len(plans)
+		add(buildPlans(nil, cursor+60))
+		if len(plans) == before {
+			break
+		}
+		// Advance past the latest first-transit departure now in the set.
+		for _, p := range plans[before:] {
+			if d := firstTransitDepartSec(p, dayStart); d > cursor {
+				cursor = d
 			}
 		}
 		if debugJourneyDiversity {
-			fmt.Fprintf(os.Stderr, "[diversify] ban %s -> %d alts, %d new\n", routeID, len(alts), added)
+			fmt.Fprintf(os.Stderr, "[diversify] next departures -> now %d, cursor %ds\n", len(plans), cursor)
 		}
 	}
+
 	return plans
 }
 

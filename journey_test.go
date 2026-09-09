@@ -413,3 +413,22 @@ func TestMergeAdjacentWalkLegs(t *testing.T) {
 		t.Fatalf("merged walk leg wrong: dur=%v dist=%v", out[0].Duration, out[0].DistanceKm)
 	}
 }
+
+func TestCountTransfers(t *testing.T) {
+	base := time.Now()
+	tl := func(mode string) JourneyLeg { return JourneyLeg{Mode: mode, DepartureTime: base, ArrivalTime: base} }
+	cases := []struct {
+		legs []JourneyLeg
+		want int
+	}{
+		{[]JourneyLeg{tl("walk")}, 0},
+		{[]JourneyLeg{tl("walk"), tl("transit"), tl("walk")}, 0},
+		{[]JourneyLeg{tl("walk"), tl("transit"), tl("walk"), tl("transit"), tl("walk")}, 1},
+		{[]JourneyLeg{tl("walk"), tl("transit"), tl("transit"), tl("walk"), tl("transit")}, 2},
+	}
+	for i, c := range cases {
+		if got := countTransfers(c.legs); got != c.want {
+			t.Fatalf("case %d: got %d want %d", i, got, c.want)
+		}
+	}
+}
