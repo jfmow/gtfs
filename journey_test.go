@@ -1,6 +1,7 @@
 package gtfs
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -274,5 +275,68 @@ func TestDeferOriginWalkRemovesLeadingWait(t *testing.T) {
 	tightOut := deferOriginWalk(tight)
 	if !tightOut[0].DepartureTime.Equal(day) {
 		t.Fatalf("expected a tight connection's walk left at its original start, got %v", tightOut[0].DepartureTime)
+	}
+}
+
+func TestBuildStopTransferGraphLinksNearbyStops(t *testing.T) {
+	// A ~300 m gap (different stop_ids, no shared parent) - the case RAPTOR
+	// couldn't bridge before: e.g. route 70's Greenlane stop and route 65's.
+	stopMap := map[string]Stop{
+		"a": {StopId: "a", StopName: "Great South Road/Market Road", StopLat: -36.8890, StopLon: 174.8010},
+		"b": {StopId: "b", StopName: "Green Lane West/Great South Road", StopLat: -36.8912, StopLon: 174.8022},
+		// Far away - must NOT be linked.
+		"far": {StopId: "far", StopName: "Far Stop", StopLat: -36.8500, StopLon: 174.7600},
+		// Same pole (~20 m) - below the min, must NOT be linked.
+		"a2": {StopId: "a2", StopName: "Great South Road/Market Road (other side)", StopLat: -36.88902, StopLon: 174.80098},
+	}
+
+	g := buildStopTransferGraph(stopMap)
+
+	hasEdge := func(from, to string) bool {
+		for _, tr := range g[from] {
+			if tr.ToStopID == to {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasEdge("a", "b") || !hasEdge("b", "a") {
+		t.Fatalf("expected a<->b foot transfer, got %+v", g)
+	}
+	if hasEdge("a", "far") {
+		t.Fatalf("did not expect a->far foot transfer")
+	}
+	if hasEdge("a", "a2") {
+		t.Fatalf("did not expect a sub-%.0fm 'transfer' a->a2", footTransferMinKm*1000)
+	}
+	for _, tr := range g["a"] {
+		if tr.ToStopID == "b" && tr.WalkSec <= footTransferBufferSec {
+			t.Fatalf("walk time should include travel + buffer, got %ds", tr.WalkSec)
+		}
+	}
+}
+
+func TestRelaxFootTransfersImprovesArrivalAndChains(t *testing.T) {
+	graph := map[string][]stopTransfer{
+		"onroute": {{ToStopID: "otherroute", WalkSec: 240}},
+	}
+	arrival := map[string]int{
+		"onroute":    8 * 3600,
+		"otherroute": math.MaxInt32,
+	}
+	pred := map[string]stopPredecessor{}
+	nextUpdated := map[string]bool{"onroute": true}
+
+	relaxFootTransfers([]string{"onroute"}, graph, arrival, pred, nextUpdated)
+
+	if got, want := arrival["otherroute"], 8*3600+240; got != want {
+		t.Fatalf("expected otherroute arrival %d, got %d", want, got)
+	}
+	if !nextUpdated["otherroute"] {
+		t.Fatalf("otherroute should be marked so the next round boards there")
+	}
+	if p := pred["otherroute"]; p.Mode != "walk-transfer" || p.FromStopID != "onroute" {
+		t.Fatalf("unexpected predecessor: %+v", p)
 	}
 }

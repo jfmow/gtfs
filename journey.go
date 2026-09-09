@@ -261,6 +261,17 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			}
 		}
 
+		// Foot-path phase: walk from stops improved by transit this round to
+		// nearby stops so the next round can board a route that doesn't call at
+		// the exact same stop. Skipped after the final round (nothing boards).
+		if round < req.MaxTransfers && len(nextUpdated) > 0 {
+			transitUpdated := make([]string, 0, len(nextUpdated))
+			for id := range nextUpdated {
+				transitUpdated = append(transitUpdated, id)
+			}
+			relaxFootTransfers(transitUpdated, v.stopTransferGraph(stopMap, req.IncludeChildren), arrival, predecessor, nextUpdated)
+		}
+
 		if len(nextUpdated) == 0 {
 			break
 		}
@@ -448,6 +459,14 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 			}
 		}
 
+		if round < req.MaxTransfers && len(nextUpdated) > 0 {
+			transitUpdated := make([]string, 0, len(nextUpdated))
+			for id := range nextUpdated {
+				transitUpdated = append(transitUpdated, id)
+			}
+			relaxFootTransfersArriveAt(transitUpdated, v.stopTransferGraph(stopMap, req.IncludeChildren), latest, successor, nextUpdated)
+		}
+
 		if len(nextUpdated) == 0 {
 			break
 		}
@@ -524,6 +543,190 @@ func canAlightForTransitConnection(arrivalSec, latestAllowedSec int, isTransfer 
 		requiredGap = minDirectTransferSeconds
 	}
 	return arrivalSec+requiredGap <= latestAllowedSec
+}
+
+// --- Foot-transfer graph -----------------------------------------------------
+//
+// RAPTOR's round loop only chains trips that call at the *same* stop_id. A real
+// transfer where the rider walks a short distance between two nearby stops of
+// different routes (e.g. route 70 at "Great South Road/Market Road" -> route 65
+// at "Green Lane West/Great South Road", ~300 m apart at Greenlane) was
+// impossible, so the planner would return a long dogleg instead. This graph
+// feeds a foot-path relaxation pass after each round's trip scan.
+
+type stopTransfer struct {
+	ToStopID string
+	WalkSec  int
+}
+
+const (
+	// How far a rider will walk to change service, and how many candidates to
+	// keep per stop (nearest first) so a dense CBD stop doesn't blow up the
+	// per-round relaxation.
+	footTransferRadiusKm    = 0.40
+	footTransferMinKm       = 0.05 // below this two stops are effectively the same pole - a "walk leg" there is just noise
+	footTransferMaxPerStop  = 8
+	footTransferBufferSec   = 30
+	footTransferWalkSpeedKm = 4.6 // slightly slower than the trip-planner default: street crossings, finding the stop
+	footTransferGridDeg     = 0.005
+)
+
+type stopTransferGraphMemo struct {
+	mu      sync.Mutex
+	key     string
+	builtAt time.Time
+	data    map[string][]stopTransfer
+}
+
+const stopTransferGraphTTL = 30 * time.Minute
+
+var stopTransferGraphMemos sync.Map // database name -> *stopTransferGraphMemo
+
+// stopTransferGraph returns, for each stop, the nearby stops reachable on foot
+// for a transfer. It's memoised per database (the stop set only changes on the
+// daily feed refresh) so the O(n·neighbours) build is paid once, not per plan.
+// The returned map and its slices are read-only for callers.
+func (v Database) stopTransferGraph(stopMap map[string]Stop, includeChildren bool) map[string][]stopTransfer {
+	key := v.name + "|" + strconv.FormatBool(includeChildren)
+	mi, _ := stopTransferGraphMemos.LoadOrStore(v.name, &stopTransferGraphMemo{})
+	m := mi.(*stopTransferGraphMemo)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.data != nil && m.key == key && time.Since(m.builtAt) < stopTransferGraphTTL {
+		return m.data
+	}
+
+	m.data = buildStopTransferGraph(stopMap)
+	m.key = key
+	m.builtAt = time.Now()
+	return m.data
+}
+
+type gridCell struct{ x, y int }
+
+func buildStopTransferGraph(stopMap map[string]Stop) map[string][]stopTransfer {
+	cellOf := func(lat, lon float64) gridCell {
+		return gridCell{int(math.Floor(lon / footTransferGridDeg)), int(math.Floor(lat / footTransferGridDeg))}
+	}
+
+	grid := make(map[gridCell][]string, len(stopMap))
+	for id, s := range stopMap {
+		if s.StopLat == 0 && s.StopLon == 0 {
+			continue
+		}
+		c := cellOf(s.StopLat, s.StopLon)
+		grid[c] = append(grid[c], id)
+	}
+
+	graph := make(map[string][]stopTransfer, len(stopMap))
+	for id, s := range stopMap {
+		if s.StopLat == 0 && s.StopLon == 0 {
+			continue
+		}
+		base := cellOf(s.StopLat, s.StopLon)
+		var near []stopTransfer
+		for dx := -1; dx <= 1; dx++ {
+			for dy := -1; dy <= 1; dy++ {
+				for _, otherID := range grid[gridCell{base.x + dx, base.y + dy}] {
+					if otherID == id {
+						continue
+					}
+					o := stopMap[otherID]
+					// Same physical station (parent, or same coords) - RAPTOR
+					// already handles that as a same-stop board; a walk edge
+					// there just adds noise.
+					if stationKey(s) == stationKey(o) {
+						continue
+					}
+					dKm := calculateDistance(s.StopLat, s.StopLon, o.StopLat, o.StopLon)
+					if dKm > footTransferRadiusKm || dKm < footTransferMinKm {
+						continue
+					}
+					near = append(near, stopTransfer{
+						ToStopID: otherID,
+						WalkSec:  walkDurationSeconds(dKm, footTransferWalkSpeedKm) + footTransferBufferSec,
+					})
+				}
+			}
+		}
+		if len(near) == 0 {
+			continue
+		}
+		sort.Slice(near, func(i, j int) bool { return near[i].WalkSec < near[j].WalkSec })
+		if len(near) > footTransferMaxPerStop {
+			near = near[:footTransferMaxPerStop]
+		}
+		graph[id] = near
+	}
+	return graph
+}
+
+// relaxFootTransfers extends a RAPTOR depart-after round: from every stop whose
+// arrival improved this round, walking to a nearby stop may beat its current
+// arrival and let the next round board a route that doesn't call there. Only the
+// transit-updated stops (passed in `sources`) are walked from, so walk legs
+// never chain. Newly-improved stops are added to `nextUpdated` so the next round
+// boards at them.
+func relaxFootTransfers(
+	sources []string,
+	graph map[string][]stopTransfer,
+	arrival map[string]int,
+	predecessor map[string]stopPredecessor,
+	nextUpdated map[string]bool,
+) {
+	for _, fromID := range sources {
+		base := arrival[fromID]
+		if base == math.MaxInt32 {
+			continue
+		}
+		for _, tr := range graph[fromID] {
+			cand := base + tr.WalkSec
+			if cand >= arrival[tr.ToStopID] {
+				continue
+			}
+			arrival[tr.ToStopID] = cand
+			predecessor[tr.ToStopID] = stopPredecessor{
+				FromStopID: fromID,
+				DepartSec:  base,
+				ArriveSec:  cand,
+				TripUsable: true,
+				Mode:       "walk-transfer",
+			}
+			nextUpdated[tr.ToStopID] = true
+		}
+	}
+}
+
+// relaxFootTransfersArriveAt is the reverse-scan mirror: from every stop the
+// dest is reachable from this round, a nearby stop can reach it too by walking
+// across, so its latest feasible departure is pushed back.
+func relaxFootTransfersArriveAt(
+	sources []string,
+	graph map[string][]stopTransfer,
+	latest map[string]int,
+	successor map[string]stopSuccessor,
+	nextUpdated map[string]bool,
+) {
+	for _, toID := range sources {
+		base := latest[toID]
+		for _, tr := range graph[toID] {
+			cand := base - tr.WalkSec
+			if cand < 0 || cand <= latest[tr.ToStopID] {
+				continue
+			}
+			latest[tr.ToStopID] = cand
+			successor[tr.ToStopID] = stopSuccessor{
+				ToStopID:   toID,
+				DepartSec:  cand,
+				ArriveSec:  base,
+				TripUsable: true,
+				Mode:       "walk-transfer",
+			}
+			nextUpdated[tr.ToStopID] = true
+		}
+	}
 }
 
 // tripStopTimesMemo caches one built loadTripStopTimes result per database, for
@@ -1293,6 +1496,24 @@ func buildJourneyLegs(endStop StopWithDistance, endArrivalSec int, predecessor m
 			break
 		}
 
+		if pred.Mode == "walk-transfer" {
+			fromStop := stopMap[pred.FromStopID]
+			toStop := stopMap[currentStopID]
+			legs = append(legs, JourneyLeg{
+				Mode:          "walk",
+				FromStop:      &fromStop,
+				ToStop:        &toStop,
+				DepartureTime: dayStart.Add(time.Duration(pred.DepartSec) * time.Second),
+				ArrivalTime:   dayStart.Add(time.Duration(pred.ArriveSec) * time.Second),
+				Duration:      time.Duration(pred.ArriveSec-pred.DepartSec) * time.Second,
+				DistanceKm:    calculateDistance(fromStop.StopLat, fromStop.StopLon, toStop.StopLat, toStop.StopLon),
+				TripUsable:    true,
+			})
+			lastStop = &fromStop
+			currentStopID = pred.FromStopID
+			continue
+		}
+
 		fromStop := stopMap[pred.FromStopID]
 		toStop := stopMap[currentStopID]
 		var routePtr *Route
@@ -1406,6 +1627,29 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 			}
 			legs = append(legs, walkToDestination)
 			break
+		}
+		if next.Mode == "walk-transfer" {
+			fromStop := stopMap[currentStopID]
+			toStop := stopMap[next.ToStopID]
+			departTime := dayStart.Add(time.Duration(next.DepartSec) * time.Second)
+			if len(legs) > 0 {
+				departTime = legs[len(legs)-1].ArrivalTime
+			}
+			dKm := calculateDistance(fromStop.StopLat, fromStop.StopLon, toStop.StopLat, toStop.StopLon)
+			walkSecs := walkDurationSeconds(dKm, footTransferWalkSpeedKm) + footTransferBufferSec
+			legs = append(legs, JourneyLeg{
+				Mode:          "walk",
+				FromStop:      &fromStop,
+				ToStop:        &toStop,
+				DepartureTime: departTime,
+				ArrivalTime:   departTime.Add(time.Duration(walkSecs) * time.Second),
+				Duration:      time.Duration(walkSecs) * time.Second,
+				DistanceKm:    dKm,
+				TripUsable:    true,
+			})
+			lastStop = &toStop
+			currentStopID = next.ToStopID
+			continue
 		}
 		if next.Mode != "transit" {
 			break
