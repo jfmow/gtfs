@@ -43,9 +43,9 @@ func TestPreferCloserOriginStopOnSameTrip(t *testing.T) {
 
 	trips := map[string][]tripStopTime{
 		"trip-1": {
-			{TripID: "trip-1", StopID: "far", DepartureSec: 15 * 3600, ScheduledDepartureSec: 15 * 3600, TripUsable: true, RealtimeStatus: "scheduled"},
-			{TripID: "trip-1", StopID: "close", DepartureSec: 15*3600 + 3*60, ScheduledDepartureSec: 15*3600 + 3*60, TripUsable: true, RealtimeStatus: "scheduled"},
-			{TripID: "trip-1", StopID: "downtown", DepartureSec: 15*3600 + 20*60, ArrivalSec: 15*3600 + 20*60, ScheduledArrivalSec: 15*3600 + 20*60, TripUsable: true, RealtimeStatus: "scheduled"},
+			{TripID: "trip-1", StopID: "far", DepartureSec: 15 * 3600, ScheduledDepartureSec: 15 * 3600, TripUsable: true, Boardable: true, Alightable: true, RealtimeStatus: "scheduled"},
+			{TripID: "trip-1", StopID: "close", DepartureSec: 15*3600 + 3*60, ScheduledDepartureSec: 15*3600 + 3*60, TripUsable: true, Boardable: true, Alightable: true, RealtimeStatus: "scheduled"},
+			{TripID: "trip-1", StopID: "downtown", DepartureSec: 15*3600 + 20*60, ArrivalSec: 15*3600 + 20*60, ScheduledArrivalSec: 15*3600 + 20*60, TripUsable: true, Boardable: true, Alightable: true, RealtimeStatus: "scheduled"},
 		},
 	}
 
@@ -338,5 +338,78 @@ func TestRelaxFootTransfersImprovesArrivalAndChains(t *testing.T) {
 	}
 	if p := pred["otherroute"]; p.Mode != "walk-transfer" || p.FromStopID != "onroute" {
 		t.Fatalf("unexpected predecessor: %+v", p)
+	}
+}
+
+func TestRaptorDepartScanRespectsPickupDropoff(t *testing.T) {
+	// Two-stop ferry-style trip: board only at A (pickup ok), alight only at B
+	// (B has pickup_type=1 -> Boardable false). The rider must still be able to
+	// ride A->B.
+	trips := map[string][]tripStopTime{
+		"ferry": {
+			{TripID: "ferry", StopID: "A", DepartureSec: 8 * 3600, ScheduledDepartureSec: 8 * 3600, TripUsable: true, Boardable: true, Alightable: true},
+			{TripID: "ferry", StopID: "B", ArrivalSec: 8*3600 + 12*60, ScheduledArrivalSec: 8*3600 + 12*60, TripUsable: true, Boardable: false, Alightable: true},
+		},
+	}
+	stopMap := map[string]Stop{
+		"A": {StopId: "A", StopLat: -36.84, StopLon: 174.77},
+		"B": {StopId: "B", StopLat: -36.83, StopLon: 174.80},
+	}
+	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.05}}
+
+	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, nil)
+
+	if arrival["B"] != 8*3600+12*60 {
+		t.Fatalf("expected to ride ferry A->B, arrival[B]=%d", arrival["B"])
+	}
+	if pred["B"].Mode != "transit" || pred["B"].FromStopID != "A" {
+		t.Fatalf("unexpected predecessor for B: %+v", pred["B"])
+	}
+
+	// And a rider starting at B must NOT be able to board the ferry there.
+	nearB := []StopWithDistance{{Stop: stopMap["B"], Distance: 0.05}}
+	arrival2, _ := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, nearB, 7*3600+55*60, 2, 4.8, nil)
+	if arrival2["A"] != math.MaxInt32 {
+		t.Fatalf("should not be able to board at set-down-only stop B; arrival[A]=%d", arrival2["A"])
+	}
+}
+
+func TestBuildStopTransferGraphKeepsFerryStops(t *testing.T) {
+	// A CBD bus stop with many nearby bus poles and one ferry wharf just past
+	// the trim cutoff - the wharf must survive.
+	stopMap := map[string]Stop{
+		"bus0": {StopId: "bus0", StopName: "Queen Street", StopType: "bus", StopLat: -36.8460, StopLon: 174.7660},
+	}
+	for i := 0; i < 12; i++ {
+		id := "b" + string(rune('A'+i))
+		stopMap[id] = Stop{StopId: id, StopName: id, StopType: "bus", StopLat: -36.8460 + float64(i+1)*0.0002, StopLon: 174.7660}
+	}
+	stopMap["wharf"] = Stop{StopId: "wharf", StopName: "Downtown Ferry Terminal Pier 4", StopType: "ferry", StopLat: -36.8458, StopLon: 174.7690} // ~270 m away
+
+	g := buildStopTransferGraph(stopMap)
+	found := false
+	for _, tr := range g["bus0"] {
+		if tr.ToStopID == "wharf" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ferry wharf trimmed from bus0 transfers: %+v", g["bus0"])
+	}
+}
+
+func TestMergeAdjacentWalkLegs(t *testing.T) {
+	base := time.Date(2026, 3, 23, 8, 0, 0, 0, time.UTC)
+	legs := []JourneyLeg{
+		{Mode: "walk", DepartureTime: base, ArrivalTime: base.Add(2 * time.Minute), Duration: 2 * time.Minute, DistanceKm: 0.15},
+		{Mode: "walk", DepartureTime: base.Add(2 * time.Minute), ArrivalTime: base.Add(6 * time.Minute), Duration: 4 * time.Minute, DistanceKm: 0.30},
+		{Mode: "transit", DepartureTime: base.Add(8 * time.Minute), ArrivalTime: base.Add(20 * time.Minute)},
+	}
+	out := mergeAdjacentWalkLegs(legs)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 legs after merge, got %d", len(out))
+	}
+	if out[0].Duration != 6*time.Minute || math.Abs(out[0].DistanceKm-0.45) > 1e-6 {
+		t.Fatalf("merged walk leg wrong: dur=%v dist=%v", out[0].Duration, out[0].DistanceKm)
 	}
 }

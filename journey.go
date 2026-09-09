@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -84,6 +85,12 @@ type tripStopTime struct {
 	ScheduledDepartureSec int
 	RealtimeStatus        string
 	TripUsable            bool
+	// GTFS pickup_type / drop_off_type == 0. A route terminus is typically
+	// set-down-only (Boardable false); a two-stop ferry's arrival pier is too.
+	// These gate boarding/alighting in RAPTOR - the stop still stays in the
+	// trip so a through-rider can pass it.
+	Boardable  bool
+	Alightable bool
 }
 
 type stopPredecessor struct {
@@ -140,6 +147,8 @@ type journeyOriginCandidate struct {
 
 const minDirectTransferSeconds = 60
 
+var debugJourneyDiversity = os.Getenv("DEBUG_JOURNEY_DIVERSITY") != ""
+
 // PlanJourneyRaptor computes a basic journey plan between two coordinates using a RAPTOR-style scan.
 func (v Database) PlanJourneyRaptor(req JourneyRequest) (*[]JourneyPlan, error) {
 	plans, err := v.PlanJourneysRaptor(req)
@@ -195,45 +204,120 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		routeMap[route.RouteId] = route
 	}
 
+	transferGraph := v.stopTransferGraph(stopMap, req.IncludeChildren)
+
+	buildPlans := func(banned map[string]bool) []JourneyPlan {
+		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, departSec, req.MaxTransfers, req.WalkSpeedKmph, banned)
+
+		candidateLimit := expandedCandidateLimit(req.MaxResults)
+		bestCandidates := selectBestDestinations(nearbyEndStops, arrival, departSec, req.WalkSpeedKmph, candidateLimit)
+
+		var plans []JourneyPlan
+		for _, candidate := range bestCandidates {
+			legs, transfers, transferStops := buildJourneyLegs(candidate.Stop, candidate.ArrivalSec, predecessor, stopMap, routeMap, departAt, dayStart, req.WalkSpeedKmph, req.StartLat, req.StartLon)
+			if len(legs) == 0 {
+				continue
+			}
+			legs = preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, departAt, dayStart, req.WalkSpeedKmph)
+			legs = dropRedundantLeadingHop(legs, nearbyStartStops, trips, req.WalkSpeedKmph, dayStart)
+			legs = mergeAdjacentWalkLegs(legs)
+			legs = deferOriginWalk(legs)
+			arrivalTime := legs[len(legs)-1].ArrivalTime
+			planDeparture := departAt
+			if legs[0].Mode == "walk" {
+				planDeparture = legs[0].DepartureTime
+			}
+			plans = append(plans, JourneyPlan{
+				StartLat:      req.StartLat,
+				StartLon:      req.StartLon,
+				EndLat:        req.EndLat,
+				EndLon:        req.EndLon,
+				DepartureTime: planDeparture,
+				ArrivalTime:   arrivalTime,
+				TotalDuration: arrivalTime.Sub(planDeparture),
+				Transfers:     transfers,
+				TransferStops: transferStops,
+				Legs:          legs,
+				ID:            uuid.NewString(),
+			})
+		}
+		return plans
+	}
+
+	plans := buildPlans(nil)
+	if len(plans) == 0 {
+		return nil, errors.New("no journey found between the given coordinates")
+	}
+
+	// Collapse the raw candidates (which all tend to share one route spine)
+	// before deciding whether we need more variety.
+	plans = dedupePlansByTransitService(plans, 0)
+
+	// Diversity pass: RAPTOR keeps only the single earliest arrival per stop, so
+	// every candidate plan tends to share one spine (e.g. all via the 782). Re-run
+	// with each route the best plan uses banned in turn, so a slightly-slower plan
+	// that takes a different route (the 70, say) still surfaces as an option.
+	plans = diversifyPlans(plans, buildPlans, req.MaxResults)
+
+	plans = dedupePlansByTransitService(plans, req.MaxResults)
+	if len(plans) == 0 {
+		return nil, errors.New("no journey legs available")
+	}
+
+	// GeoJSON (walk legs in particular) is expensive - each walk leg costs a
+	// remote OSRM round-trip - so it's only built for the final, deduped
+	// result set rather than every expanded candidate, and in parallel across
+	// those results rather than one at a time.
+	populateRouteGeoJSON(v, req, plans)
+
+	return plans, nil
+}
+
+// raptorDepartScan runs the depart-after RAPTOR round loop and returns the best
+// arrival time and predecessor for every reachable stop. `bannedRoutes` (may be
+// nil) skips trips on those routes - used by the diversity pass to force an
+// alternative route into the results.
+func raptorDepartScan(
+	trips map[string][]tripStopTime,
+	stopMap map[string]Stop,
+	transferGraph map[string][]stopTransfer,
+	nearbyStartStops []StopWithDistance,
+	departSec, maxTransfers int,
+	walkSpeedKmph float64,
+	bannedRoutes map[string]bool,
+) (map[string]int, map[string]stopPredecessor) {
+	const inf = math.MaxInt32
 	arrival := make(map[string]int, len(stopMap))
 	predecessor := make(map[string]stopPredecessor, len(stopMap))
 	updated := make(map[string]bool, len(stopMap))
-	const inf = math.MaxInt32
 	for stopID := range stopMap {
 		arrival[stopID] = inf
 	}
+	arr := func(id string) int { return arrival[id] }
 
 	for _, candidate := range nearbyStartStops {
-		walkSeconds := walkDurationSeconds(candidate.Distance, req.WalkSpeedKmph)
-		arrivalTime := departSec + walkSeconds
-		if arrivalTime < arrival[candidate.Stop.StopId] {
-			arrival[candidate.Stop.StopId] = arrivalTime
-			predecessor[candidate.Stop.StopId] = stopPredecessor{
-				FromStopID: "",
-				TripID:     "",
-				RouteID:    "",
-				DepartSec:  departSec,
-				ArriveSec:  arrivalTime,
-				Mode:       "walk-origin",
-			}
+		t := departSec + walkDurationSeconds(candidate.Distance, walkSpeedKmph)
+		if t < arr(candidate.Stop.StopId) {
+			arrival[candidate.Stop.StopId] = t
+			predecessor[candidate.Stop.StopId] = stopPredecessor{DepartSec: departSec, ArriveSec: t, Mode: "walk-origin"}
 			updated[candidate.Stop.StopId] = true
 		}
 	}
 
-	// inside PlanJourneysRaptor (depart-after scan)
-	for round := 0; round <= req.MaxTransfers; round++ {
+	for round := 0; round <= maxTransfers; round++ {
 		nextUpdated := make(map[string]bool)
 		for _, tripTimes := range trips {
+			if len(tripTimes) > 0 && bannedRoutes[tripTimes[0].RouteID] {
+				continue
+			}
 			boarded := false
 			boardStopID := ""
 			boardDepartSec := 0
 			boardScheduledDepartSec := 0
 			for _, stopTime := range tripTimes {
 				if !boarded {
-					isTransfer := round > 0
-					if stopTime.TripUsable &&
-						updated[stopTime.StopID] &&
-						canBoardTransitAtStop(arrival[stopTime.StopID], stopTime.DepartureSec, isTransfer) {
+					if stopTime.TripUsable && stopTime.Boardable && updated[stopTime.StopID] &&
+						canBoardTransitAtStop(arr(stopTime.StopID), stopTime.DepartureSec, round > 0) {
 						boarded = true
 						boardStopID = stopTime.StopID
 						boardDepartSec = stopTime.DepartureSec
@@ -241,8 +325,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 					}
 					continue
 				}
-
-				if stopTime.TripUsable && stopTime.ArrivalSec >= boardDepartSec && stopTime.ArrivalSec < arrival[stopTime.StopID] {
+				if stopTime.TripUsable && stopTime.Alightable && stopTime.ArrivalSec >= boardDepartSec && stopTime.ArrivalSec < arr(stopTime.StopID) {
 					arrival[stopTime.StopID] = stopTime.ArrivalSec
 					predecessor[stopTime.StopID] = stopPredecessor{
 						FromStopID:         boardStopID,
@@ -261,15 +344,12 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			}
 		}
 
-		// Foot-path phase: walk from stops improved by transit this round to
-		// nearby stops so the next round can board a route that doesn't call at
-		// the exact same stop. Skipped after the final round (nothing boards).
-		if round < req.MaxTransfers && len(nextUpdated) > 0 {
+		if round < maxTransfers && len(nextUpdated) > 0 {
 			transitUpdated := make([]string, 0, len(nextUpdated))
 			for id := range nextUpdated {
 				transitUpdated = append(transitUpdated, id)
 			}
-			relaxFootTransfers(transitUpdated, v.stopTransferGraph(stopMap, req.IncludeChildren), arrival, predecessor, nextUpdated)
+			relaxFootTransfers(transitUpdated, transferGraph, arrival, predecessor, nextUpdated)
 		}
 
 		if len(nextUpdated) == 0 {
@@ -278,57 +358,110 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		updated = nextUpdated
 	}
 
-	candidateLimit := expandedCandidateLimit(req.MaxResults)
-	bestCandidates := selectBestDestinations(nearbyEndStops, arrival, departSec, req.WalkSpeedKmph, candidateLimit)
-	if len(bestCandidates) == 0 {
-		return nil, errors.New("no journey found between the given coordinates")
-	}
+	return arrival, predecessor
+}
 
-	var plans []JourneyPlan
-	for _, candidate := range bestCandidates {
-		legs, transfers, transferStops := buildJourneyLegs(candidate.Stop, candidate.ArrivalSec, predecessor, stopMap, routeMap, departAt, dayStart, req.WalkSpeedKmph, req.StartLat, req.StartLon)
-		if len(legs) == 0 {
-			continue
-		}
-		legs = preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, departAt, dayStart, req.WalkSpeedKmph)
-		legs = deferOriginWalk(legs)
-		arrivalTime := dayStart.Add(time.Duration(candidate.ArrivalSec) * time.Second)
-		planDeparture := departAt
-		if len(legs) > 0 && legs[0].Mode == "walk" {
-			planDeparture = legs[0].DepartureTime
-		}
-		plan := JourneyPlan{
-			StartLat:      req.StartLat,
-			StartLon:      req.StartLon,
-			EndLat:        req.EndLat,
-			EndLon:        req.EndLon,
-			DepartureTime: planDeparture,
-			ArrivalTime:   arrivalTime,
-			TotalDuration: arrivalTime.Sub(planDeparture),
-			Transfers:     transfers,
-			TransferStops: transferStops,
-			Legs:          legs,
-			ID:            uuid.NewString(),
-		}
-		plans = append(plans, plan)
-	}
-
+// diversifyPlans re-runs the planner with each transit route from the current
+// best plan banned in turn, appending any genuinely different route options.
+func diversifyPlans(plans []JourneyPlan, buildPlans func(map[string]bool) []JourneyPlan, maxResults int) []JourneyPlan {
 	if len(plans) == 0 {
-		return nil, errors.New("no journey legs available")
+		return plans
+	}
+	target := maxResults
+	if target < 4 {
+		target = 4
+	}
+	if len(plans) >= target {
+		return plans
 	}
 
-	plans = dedupePlansByTransitService(plans, req.MaxResults)
-	if len(plans) == 0 {
-		return nil, errors.New("no journey legs available")
+	sort.SliceStable(plans, func(i, j int) bool { return plans[i].TotalDuration < plans[j].TotalDuration })
+
+	seenRoute := map[string]bool{}
+	var toBan []string
+	for _, leg := range plans[0].Legs {
+		if leg.Mode == "transit" && leg.RouteID != "" && !seenRoute[leg.RouteID] {
+			seenRoute[leg.RouteID] = true
+			toBan = append(toBan, leg.RouteID)
+		}
 	}
 
-	// GeoJSON (walk legs in particular) is expensive - each walk leg costs a
-	// remote OSRM round-trip - so it's only built for the final, deduped
-	// result set rather than every expanded candidate, and in parallel across
-	// those results rather than one at a time.
-	populateRouteGeoJSON(v, req, plans)
+	haveSignature := map[string]bool{}
+	for _, p := range plans {
+		haveSignature[transitServiceSignature(p)] = true
+	}
 
-	return plans, nil
+	const maxExtraRuns = 4
+	if debugJourneyDiversity {
+		fmt.Fprintf(os.Stderr, "[diversify] base plans=%d toBan=%v\n", len(plans), toBan)
+	}
+	for i, routeID := range toBan {
+		if i >= maxExtraRuns || len(plans) >= target {
+			break
+		}
+		alts := buildPlans(map[string]bool{routeID: true})
+		added := 0
+		for _, alt := range alts {
+			sig := transitServiceSignature(alt)
+			if !haveSignature[sig] {
+				haveSignature[sig] = true
+				plans = append(plans, alt)
+				added++
+			}
+		}
+		if debugJourneyDiversity {
+			fmt.Fprintf(os.Stderr, "[diversify] ban %s -> %d alts, %d new\n", routeID, len(alts), added)
+		}
+	}
+	return plans
+}
+
+// dropRedundantLeadingHop removes a pointless first transit leg: the rider boards
+// route A near the origin, rides a stop or two, then (after a short walk) boards
+// route B - but route B's trip also called at, or right by, where they boarded A,
+// early enough to catch. The A leg saved nothing. Splice it out and let the
+// origin walk go straight to B's boarding stop.
+func dropRedundantLeadingHop(legs []JourneyLeg, nearbyStartStops []StopWithDistance, trips map[string][]tripStopTime, walkSpeedKmph float64, dayStart time.Time) []JourneyLeg {
+	if len(legs) < 4 || legs[0].Mode != "walk" || legs[1].Mode != "transit" || legs[3].Mode != "transit" {
+		return legs
+	}
+	if legs[2].Mode != "walk" {
+		return legs
+	}
+	hop := legs[1]
+	if hop.FromStop == nil || hop.ArrivalTime.Sub(hop.DepartureTime) > 4*time.Minute {
+		return legs
+	}
+	next := legs[3]
+	if next.FromStop == nil {
+		return legs
+	}
+	// Is the origin already within the walk budget of route B's boarding stop?
+	var boardDist float64 = -1
+	for _, c := range nearbyStartStops {
+		if c.Stop.StopId == next.FromStop.StopId {
+			boardDist = c.Distance
+			break
+		}
+	}
+	if boardDist < 0 {
+		return legs
+	}
+	// Would the direct origin walk still make route B's departure?
+	arriveByWalk := legs[0].DepartureTime.Add(time.Duration(walkDurationSeconds(boardDist, walkSpeedKmph)) * time.Second)
+	if arriveByWalk.After(next.DepartureTime) {
+		return legs
+	}
+	newWalk := JourneyLeg{
+		Mode:          "walk",
+		ToStop:        next.FromStop,
+		DepartureTime: legs[0].DepartureTime,
+		ArrivalTime:   arriveByWalk,
+		Duration:      arriveByWalk.Sub(legs[0].DepartureTime),
+		DistanceKm:    boardDist,
+		TripUsable:    true,
+	}
+	return append([]JourneyLeg{newWalk}, legs[3:]...)
 }
 
 func normalizeJourneyRequest(req JourneyRequest) JourneyRequest {
@@ -429,7 +562,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 				stopTime := tripTimes[i]
 				if !alightPossible {
 					isTransfer := round > 0
-					if stopTime.TripUsable &&
+					if stopTime.TripUsable && stopTime.Alightable &&
 						updated[stopTime.StopID] &&
 						canAlightForTransitConnection(stopTime.ArrivalSec, latest[stopTime.StopID], isTransfer) {
 						alightPossible = true
@@ -440,7 +573,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 					continue
 				}
 
-				if stopTime.TripUsable && stopTime.DepartureSec <= downstreamArriveSec && stopTime.DepartureSec > latest[stopTime.StopID] {
+				if stopTime.TripUsable && stopTime.Boardable && stopTime.DepartureSec <= downstreamArriveSec && stopTime.DepartureSec > latest[stopTime.StopID] {
 					latest[stopTime.StopID] = stopTime.DepartureSec
 					successor[stopTime.StopID] = stopSuccessor{
 						ToStopID:           downstreamStopID,
@@ -486,6 +619,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		if len(legs) == 0 {
 			continue
 		}
+		legs = mergeAdjacentWalkLegs(legs)
 		legs = deferOriginWalk(legs)
 		departAt := dayStart.Add(time.Duration(candidate.DepartSec) * time.Second)
 		if len(legs) > 0 && legs[0].Mode == "walk" {
@@ -520,6 +654,28 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 	populateRouteGeoJSON(v, req, plans)
 
 	return plans, nil
+}
+
+// mergeAdjacentWalkLegs folds consecutive walk legs (an origin/destination walk
+// meeting a foot-transfer, or two foot-transfers) into one, so the itinerary
+// reads "walk 6 min" instead of "walk 2 min, walk 4 min".
+func mergeAdjacentWalkLegs(legs []JourneyLeg) []JourneyLeg {
+	if len(legs) < 2 {
+		return legs
+	}
+	out := legs[:1]
+	for _, leg := range legs[1:] {
+		last := &out[len(out)-1]
+		if last.Mode == "walk" && leg.Mode == "walk" {
+			last.ToStop = leg.ToStop
+			last.ArrivalTime = leg.ArrivalTime
+			last.Duration = last.ArrivalTime.Sub(last.DepartureTime)
+			last.DistanceKm += leg.DistanceKm
+			continue
+		}
+		out = append(out, leg)
+	}
+	return out
 }
 
 func expandedCandidateLimit(maxResults int) int {
@@ -557,6 +713,7 @@ func canAlightForTransitConnection(arrivalSec, latestAllowedSec int, isTransfer 
 type stopTransfer struct {
 	ToStopID string
 	WalkSec  int
+	rare     bool // target is a ferry/rail stop - never trimmed from the candidate list
 }
 
 const (
@@ -606,6 +763,18 @@ func (v Database) stopTransferGraph(stopMap map[string]Stop, includeChildren boo
 
 type gridCell struct{ x, y int }
 
+// normalizeStopName strips the leading "Stop A " / "Stop 1 " designator and
+// lowercases, so the two kerbside halves of one stop compare equal.
+func normalizeStopName(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if strings.HasPrefix(n, "stop ") {
+		if i := strings.IndexByte(n[5:], ' '); i >= 0 && i <= 3 {
+			n = strings.TrimSpace(n[5+i+1:])
+		}
+	}
+	return n
+}
+
 func buildStopTransferGraph(stopMap map[string]Stop) map[string][]stopTransfer {
 	cellOf := func(lat, lon float64) gridCell {
 		return gridCell{int(math.Floor(lon / footTransferGridDeg)), int(math.Floor(lat / footTransferGridDeg))}
@@ -644,9 +813,18 @@ func buildStopTransferGraph(stopMap map[string]Stop) map[string][]stopTransfer {
 					if dKm > footTransferRadiusKm || dKm < footTransferMinKm {
 						continue
 					}
+					// Two stops with the same name a short distance apart (kerbside
+					// pair, opposite sides of an intersection) are one transfer
+					// point. A walk edge between them lets RAPTOR "ride one stop and
+					// hop off" to board a parallel route that already served the
+					// boarding stop - a pointless leading hop. Treat them as one.
+					if dKm < 0.30 && normalizeStopName(s.StopName) == normalizeStopName(o.StopName) {
+						continue
+					}
 					near = append(near, stopTransfer{
 						ToStopID: otherID,
 						WalkSec:  walkDurationSeconds(dKm, footTransferWalkSpeedKm) + footTransferBufferSec,
+						rare:     o.StopType != "" && o.StopType != "bus",
 					})
 				}
 			}
@@ -655,8 +833,22 @@ func buildStopTransferGraph(stopMap map[string]Stop) map[string][]stopTransfer {
 			continue
 		}
 		sort.Slice(near, func(i, j int) bool { return near[i].WalkSec < near[j].WalkSec })
+		// Keep the nearest few, but never trim away a transfer to a ferry wharf
+		// or train station - those are the high-value, rarely-adjacent
+		// connections a dense CBD stop would otherwise lose to eight nearer bus
+		// poles (which is why the ferry never showed up in a plan).
 		if len(near) > footTransferMaxPerStop {
-			near = near[:footTransferMaxPerStop]
+			kept := near[:0]
+			busKept := 0
+			for _, tr := range near {
+				if tr.rare {
+					kept = append(kept, tr)
+				} else if busKept < footTransferMaxPerStop {
+					kept = append(kept, tr)
+					busKept++
+				}
+			}
+			near = kept
 		}
 		graph[id] = near
 	}
@@ -803,12 +995,12 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 		st.stop_id,
 		st.stop_sequence,
 		st.arrival_time,
-		st.departure_time
+		st.departure_time,
+		COALESCE(st.pickup_type, 0),
+		COALESCE(st.drop_off_type, 0)
 	FROM stop_times st
 	JOIN trips t ON st.trip_id = t.trip_id
 	JOIN adjusted_services a ON t.service_id = a.service_id
-	WHERE (st.drop_off_type = 0 OR st.drop_off_type IS NULL)
-	  AND (st.pickup_type = 0 OR st.pickup_type IS NULL)
 	ORDER BY st.trip_id, st.stop_sequence
 	`, weekday)
 
@@ -829,7 +1021,7 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 
 	for rows.Next() {
 		var tripID, routeID, stopID, arrivalTime, departureTime string
-		var sequence int
+		var sequence, pickupType, dropOffType int
 
 		if err := rows.Scan(
 			&tripID,
@@ -838,6 +1030,8 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 			&sequence,
 			&arrivalTime,
 			&departureTime,
+			&pickupType,
+			&dropOffType,
 		); err != nil {
 			return nil, err
 		}
@@ -916,6 +1110,8 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 			ScheduledDepartureSec: scheduledDepartureSec,
 			RealtimeStatus:        realtimeStatus,
 			TripUsable:            tripUsable,
+			Boardable:             pickupType == 0,
+			Alightable:            dropOffType == 0,
 		})
 	}
 
@@ -1195,7 +1391,7 @@ func preferCloserOriginStopOnSameTrip(legs []JourneyLeg, nearbyStartStops []Stop
 	for i := originalBoardIndex + 1; i < originalAlightIndex; i++ {
 		stopTime := tripTimes[i]
 		candidate, ok := nearbyByStopID[stopTime.StopID]
-		if !ok || !stopTime.TripUsable {
+		if !ok || !stopTime.TripUsable || !stopTime.Boardable {
 			continue
 		}
 
