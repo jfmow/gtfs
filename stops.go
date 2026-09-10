@@ -526,6 +526,12 @@ func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 	startDate := time.Now().In(v.timeZone).Format("20060102")
 	endDate := time.Now().In(v.timeZone).AddDate(0, 0, days).Format("20060102")
 
+	// A service is relevant if its active window overlaps [startDate, endDate]
+	// at all - i.e. start_date <= endDate AND end_date >= startDate. Testing
+	// "end_date >= endDate" instead would drop every service whose block ends
+	// inside the window, which is exactly what happens in the last day or two
+	// before a feed version rollover (the entire current service set can have
+	// an end_date of tomorrow).
 	query := `
 	WITH active_services AS (
 		SELECT DISTINCT service_id
@@ -574,7 +580,7 @@ func (v Database) GetStopsForTrips(days int) (map[string][]Stop, error) {
 		st.stop_sequence
 `
 
-	rows, err := db.Query(query, startDate, endDate, startDate, endDate, startDate, endDate)
+	rows, err := db.Query(query, endDate, startDate, startDate, endDate, startDate, endDate)
 	if err != nil {
 		return nil, err
 	}
