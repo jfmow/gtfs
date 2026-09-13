@@ -35,7 +35,17 @@ type JourneyRequest struct {
 	MaxResults      int
 	IncludeChildren bool
 	OsrmURL         string
-	Realtime        *gtfsrealtime.Realtime `json:"-"`
+	// OnlyRouteIDs, when non-empty, restricts every transit leg to these route
+	// IDs - no other route may be boarded. Walking (to reach a stop, or to
+	// transfer between stops) is unaffected. If these routes alone can't
+	// connect the origin and destination, no itinerary is returned.
+	OnlyRouteIDs []string
+	// RequiredRouteIDs, when non-empty, keeps only itineraries that use every
+	// one of these routes somewhere along the way. Unlike OnlyRouteIDs, other
+	// routes may still be used for the rest of the trip (e.g. to transfer
+	// onto a required route).
+	RequiredRouteIDs []string
+	Realtime         *gtfsrealtime.Realtime `json:"-"`
 }
 
 type JourneyLeg struct {
@@ -204,6 +214,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		routeMap[route.RouteId] = route
 	}
 
+	onlyRoutes := routeSetOf(req.OnlyRouteIDs)
 	transferGraph := v.stopTransferGraph(stopMap, req.IncludeChildren)
 
 	// buildPlans runs one RAPTOR scan and turns it into itineraries. `banned`
@@ -218,7 +229,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			scanAt = dayStart.Add(time.Duration(fromSec) * time.Second)
 		}
 
-		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, scanSec, req.MaxTransfers, req.WalkSpeedKmph, banned)
+		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, scanSec, req.MaxTransfers, req.WalkSpeedKmph, banned, onlyRoutes)
 
 		candidateLimit := expandedCandidateLimit(req.MaxResults)
 		bestCandidates := selectBestDestinations(nearbyEndStops, arrival, scanSec, req.WalkSpeedKmph, candidateLimit)
@@ -237,6 +248,9 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			// smuggle in one more boarding than MaxTransfers): recount from the
 			// final legs and drop anything over budget.
 			if tc := countTransfers(legs); tc > req.MaxTransfers {
+				continue
+			}
+			if !legsIncludeAllRoutes(legs, req.RequiredRouteIDs) {
 				continue
 			}
 			arrivalTime := legs[len(legs)-1].ArrivalTime
@@ -293,7 +307,9 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 // raptorDepartScan runs the depart-after RAPTOR round loop and returns the best
 // arrival time and predecessor for every reachable stop. `bannedRoutes` (may be
 // nil) skips trips on those routes - used by the diversity pass to force an
-// alternative route into the results.
+// alternative route into the results. `onlyRoutes` (may be nil), when
+// non-empty, restricts boarding to just those routes - the request-level
+// "only use these routes" constraint.
 func raptorDepartScan(
 	trips map[string][]tripStopTime,
 	stopMap map[string]Stop,
@@ -302,6 +318,7 @@ func raptorDepartScan(
 	departSec, maxTransfers int,
 	walkSpeedKmph float64,
 	bannedRoutes map[string]bool,
+	onlyRoutes map[string]bool,
 ) (map[string]int, map[string]stopPredecessor) {
 	const inf = math.MaxInt32
 	arrival := make(map[string]int, len(stopMap))
@@ -324,7 +341,7 @@ func raptorDepartScan(
 	for round := 0; round <= maxTransfers; round++ {
 		nextUpdated := make(map[string]bool)
 		for _, tripTimes := range trips {
-			if len(tripTimes) > 0 && bannedRoutes[tripTimes[0].RouteID] {
+			if len(tripTimes) > 0 && !routeAllowed(tripTimes[0].RouteID, onlyRoutes, bannedRoutes) {
 				continue
 			}
 			boarded := false
@@ -573,7 +590,76 @@ func normalizeJourneyRequest(req JourneyRequest) JourneyRequest {
 	if req.MinResults > 0 && req.MaxResults < req.MinResults {
 		req.MaxResults = req.MinResults
 	}
+	req.OnlyRouteIDs = cleanRouteIDs(req.OnlyRouteIDs)
+	req.RequiredRouteIDs = cleanRouteIDs(req.RequiredRouteIDs)
 	return req
+}
+
+// cleanRouteIDs trims whitespace and drops empty entries, returning nil for an
+// empty result so downstream code can treat "no filter" as a nil/zero-length
+// slice consistently regardless of how the request was built.
+func cleanRouteIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// routeSetOf builds a lookup set from a route ID slice, or nil if the slice is
+// empty (the zero value of a nil map correctly reads as "no restriction").
+func routeSetOf(ids []string) map[string]bool {
+	if len(ids) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set
+}
+
+// routeAllowed reports whether a trip on routeID may be boarded given an
+// allow-list (onlyRoutes, nil/empty = no restriction) and a deny-list
+// (bannedRoutes, nil/empty = nothing banned).
+func routeAllowed(routeID string, onlyRoutes, bannedRoutes map[string]bool) bool {
+	if bannedRoutes[routeID] {
+		return false
+	}
+	if len(onlyRoutes) > 0 && !onlyRoutes[routeID] {
+		return false
+	}
+	return true
+}
+
+// legsIncludeAllRoutes reports whether the given itinerary uses every route
+// in required somewhere along the way (order doesn't matter). An empty
+// required list is trivially satisfied.
+func legsIncludeAllRoutes(legs []JourneyLeg, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	have := make(map[string]bool, len(legs))
+	for _, leg := range legs {
+		if leg.Mode == "transit" && leg.RouteID != "" {
+			have[leg.RouteID] = true
+		}
+	}
+	for _, r := range required {
+		if !have[r] {
+			return false
+		}
+	}
+	return true
 }
 
 func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan, error) {
@@ -606,6 +692,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		routeMap[route.RouteId] = route
 	}
 
+	onlyRoutes := routeSetOf(req.OnlyRouteIDs)
 	latest := make(map[string]int, len(stopMap))
 	successor := make(map[string]stopSuccessor, len(stopMap))
 	updated := make(map[string]bool, len(stopMap))
@@ -640,6 +727,9 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 	for round := 0; round <= req.MaxTransfers; round++ {
 		nextUpdated := make(map[string]bool)
 		for _, tripTimes := range trips {
+			if len(tripTimes) > 0 && !routeAllowed(tripTimes[0].RouteID, onlyRoutes, nil) {
+				continue
+			}
 			alightPossible := false
 			downstreamStopID := ""
 			downstreamArriveSec := 0
@@ -707,6 +797,9 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		}
 		legs = mergeAdjacentWalkLegs(legs)
 		legs = deferOriginWalk(legs)
+		if !legsIncludeAllRoutes(legs, req.RequiredRouteIDs) {
+			continue
+		}
 		departAt := dayStart.Add(time.Duration(candidate.DepartSec) * time.Second)
 		if len(legs) > 0 && legs[0].Mode == "walk" {
 			departAt = legs[0].DepartureTime

@@ -357,7 +357,7 @@ func TestRaptorDepartScanRespectsPickupDropoff(t *testing.T) {
 	}
 	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.05}}
 
-	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, nil)
+	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, nil, nil)
 
 	if arrival["B"] != 8*3600+12*60 {
 		t.Fatalf("expected to ride ferry A->B, arrival[B]=%d", arrival["B"])
@@ -368,7 +368,7 @@ func TestRaptorDepartScanRespectsPickupDropoff(t *testing.T) {
 
 	// And a rider starting at B must NOT be able to board the ferry there.
 	nearB := []StopWithDistance{{Stop: stopMap["B"], Distance: 0.05}}
-	arrival2, _ := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, nearB, 7*3600+55*60, 2, 4.8, nil)
+	arrival2, _ := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, nearB, 7*3600+55*60, 2, 4.8, nil, nil)
 	if arrival2["A"] != math.MaxInt32 {
 		t.Fatalf("should not be able to board at set-down-only stop B; arrival[A]=%d", arrival2["A"])
 	}
@@ -430,5 +430,90 @@ func TestCountTransfers(t *testing.T) {
 		if got := countTransfers(c.legs); got != c.want {
 			t.Fatalf("case %d: got %d want %d", i, got, c.want)
 		}
+	}
+}
+
+func TestRouteAllowed(t *testing.T) {
+	cases := []struct {
+		name    string
+		routeID string
+		only    map[string]bool
+		banned  map[string]bool
+		want    bool
+	}{
+		{"no filters", "70", nil, nil, true},
+		{"banned", "70", nil, map[string]bool{"70": true}, false},
+		{"not banned", "70", nil, map[string]bool{"71": true}, true},
+		{"only allows listed", "70", map[string]bool{"70": true}, nil, true},
+		{"only excludes unlisted", "70", map[string]bool{"71": true}, nil, false},
+		{"banned wins over only", "70", map[string]bool{"70": true}, map[string]bool{"70": true}, false},
+	}
+	for _, c := range cases {
+		if got := routeAllowed(c.routeID, c.only, c.banned); got != c.want {
+			t.Fatalf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestLegsIncludeAllRoutes(t *testing.T) {
+	legs := []JourneyLeg{
+		{Mode: "walk"},
+		{Mode: "transit", RouteID: "70"},
+		{Mode: "walk"},
+		{Mode: "transit", RouteID: "NEX"},
+	}
+	if !legsIncludeAllRoutes(legs, nil) {
+		t.Fatalf("empty requirement should always pass")
+	}
+	if !legsIncludeAllRoutes(legs, []string{"70"}) {
+		t.Fatalf("expected single required route to be found")
+	}
+	if !legsIncludeAllRoutes(legs, []string{"70", "NEX"}) {
+		t.Fatalf("expected both required routes to be found")
+	}
+	if legsIncludeAllRoutes(legs, []string{"70", "999"}) {
+		t.Fatalf("should fail when one required route is missing")
+	}
+}
+
+func TestCleanRouteIDs(t *testing.T) {
+	if got := cleanRouteIDs(nil); got != nil {
+		t.Fatalf("expected nil for nil input, got %v", got)
+	}
+	if got := cleanRouteIDs([]string{"", "  "}); got != nil {
+		t.Fatalf("expected nil when all entries are blank, got %v", got)
+	}
+	got := cleanRouteIDs([]string{" 70 ", "", "NEX"})
+	if len(got) != 2 || got[0] != "70" || got[1] != "NEX" {
+		t.Fatalf("unexpected cleaned route IDs: %v", got)
+	}
+}
+
+func TestRaptorDepartScanOnlyRoutesRestrictsBoarding(t *testing.T) {
+	// Two parallel trips connect A to B: one on route "70", one on route "71".
+	// With onlyRoutes={"71"}, the "70" trip must be skipped even though it's
+	// otherwise a valid, faster boarding.
+	trips := map[string][]tripStopTime{
+		"trip70": {
+			{TripID: "trip70", RouteID: "70", StopID: "A", DepartureSec: 8 * 3600, TripUsable: true, Boardable: true, Alightable: true},
+			{TripID: "trip70", RouteID: "70", StopID: "B", ArrivalSec: 8*3600 + 5*60, TripUsable: true, Boardable: true, Alightable: true},
+		},
+		"trip71": {
+			{TripID: "trip71", RouteID: "71", StopID: "A", DepartureSec: 8 * 3600, TripUsable: true, Boardable: true, Alightable: true},
+			{TripID: "trip71", RouteID: "71", StopID: "B", ArrivalSec: 8*3600 + 15*60, TripUsable: true, Boardable: true, Alightable: true},
+		},
+	}
+	stopMap := map[string]Stop{
+		"A": {StopId: "A", StopLat: -36.84, StopLon: 174.77},
+		"B": {StopId: "B", StopLat: -36.83, StopLon: 174.80},
+	}
+	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.05}}
+
+	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, nil, map[string]bool{"71": true})
+	if arrival["B"] != 8*3600+15*60 {
+		t.Fatalf("expected onlyRoutes to force the slower route 71 trip, arrival[B]=%d", arrival["B"])
+	}
+	if pred["B"].RouteID != "71" {
+		t.Fatalf("expected predecessor route 71, got %q", pred["B"].RouteID)
 	}
 }
