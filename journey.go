@@ -1501,11 +1501,49 @@ func filterNearbyStops(stops map[string]Stop, lat, lon, maxDistanceKm float64, m
 		return stopDistances[i].Distance < stopDistances[j].Distance
 	})
 
-	if maxStops < len(stopDistances) {
-		stopDistances = stopDistances[:maxStops]
+	if maxStops > 0 && maxStops < len(stopDistances) {
+		// A dense area can have 50+ bus poles (plus their child sub-stops)
+		// within the walk radius, crowding a genuinely-in-range train/ferry
+		// stop out of the candidate list on proximity alone - even a same-named
+		// bus interchange bay a few metres closer counts against it, even
+		// though no train ever calls there. RAPTOR then never sees that
+		// service as reachable at all, regardless of how good a connection it
+		// is. Keep every rare (non-bus) stop in range and fill the remaining
+		// budget with the nearest common stops - the same trade-off already
+		// made for foot-transfer candidates in buildStopTransferGraph.
+		kept := make([]StopWithDistance, 0, maxStops)
+		commonBudget := maxStops
+		for _, sd := range stopDistances {
+			if isRareStopType(sd.Stop.StopType) {
+				kept = append(kept, sd)
+				commonBudget--
+			}
+		}
+		if commonBudget < 0 {
+			commonBudget = 0
+		}
+		for _, sd := range stopDistances {
+			if commonBudget == 0 {
+				break
+			}
+			if isRareStopType(sd.Stop.StopType) {
+				continue
+			}
+			kept = append(kept, sd)
+			commonBudget--
+		}
+		sort.Slice(kept, func(i, j int) bool { return kept[i].Distance < kept[j].Distance })
+		stopDistances = kept
 	}
 
 	return stopDistances
+}
+
+// isRareStopType reports whether a stop is a train/ferry stop (as opposed to
+// a bus stop) - the same "don't casually trim this" classification
+// buildStopTransferGraph already uses for foot-transfer candidates.
+func isRareStopType(stopType string) bool {
+	return stopType != "" && stopType != "bus"
 }
 
 func walkDurationSeconds(distanceKm, speedKmph float64) int {

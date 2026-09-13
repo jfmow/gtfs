@@ -1,6 +1,7 @@
 package gtfs
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -515,5 +516,38 @@ func TestRaptorDepartScanOnlyRoutesRestrictsBoarding(t *testing.T) {
 	}
 	if pred["B"].RouteID != "71" {
 		t.Fatalf("expected predecessor route 71, got %q", pred["B"].RouteID)
+	}
+}
+
+// TestFilterNearbyStopsKeepsTrainStopBeyondCap reproduces a real journey that
+// used to fail with OnlyRouteIDs set to a train line: a dense CBD destination
+// has 50+ bus poles within the walk radius, and the actual train platform
+// (further away than all of them, but still in range) used to be trimmed by
+// the maxStops cap - even a same-named bus interchange bay a few metres
+// closer than the platform counted against it, though no train calls there.
+// RAPTOR then never saw the train as reachable, regardless of how good the
+// connection was.
+func TestFilterNearbyStopsKeepsTrainStopBeyondCap(t *testing.T) {
+	stopMap := map[string]Stop{}
+	// 55 bus stops, all closer than the train platform.
+	for i := 0; i < 55; i++ {
+		id := fmt.Sprintf("bus%d", i)
+		stopMap[id] = Stop{StopId: id, StopName: id, StopType: "bus", StopLat: -36.8520 + float64(i)*0.0002, StopLon: 174.7690}
+	}
+	// A same-named bus interchange bay, closer than the platform, but not a
+	// train stop - it must not be mistaken for the real thing.
+	stopMap["decoy"] = Stop{StopId: "decoy", StopName: "Stop D Example Station", StopType: "bus", StopLat: -36.8525, StopLon: 174.7691}
+	stopMap["platform"] = Stop{StopId: "platform", StopName: "Example Train Station", StopType: "train", StopLat: -36.8600, StopLon: 174.7700} // ~0.9km away
+
+	near := filterNearbyStops(stopMap, -36.8526, 174.7690, 1.0, 50)
+
+	foundPlatform := false
+	for _, sd := range near {
+		if sd.Stop.StopId == "platform" {
+			foundPlatform = true
+		}
+	}
+	if !foundPlatform {
+		t.Fatalf("train platform trimmed from nearby stops despite being in range: %d candidates returned", len(near))
 	}
 }
