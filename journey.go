@@ -40,12 +40,7 @@ type JourneyRequest struct {
 	// transfer between stops) is unaffected. If these routes alone can't
 	// connect the origin and destination, no itinerary is returned.
 	OnlyRouteIDs []string
-	// RequiredRouteIDs, when non-empty, keeps only itineraries that use every
-	// one of these routes somewhere along the way. Unlike OnlyRouteIDs, other
-	// routes may still be used for the rest of the trip (e.g. to transfer
-	// onto a required route).
-	RequiredRouteIDs []string
-	Realtime         *gtfsrealtime.Realtime `json:"-"`
+	Realtime     *gtfsrealtime.Realtime `json:"-"`
 }
 
 type JourneyLeg struct {
@@ -250,9 +245,6 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			if tc := countTransfers(legs); tc > req.MaxTransfers {
 				continue
 			}
-			if !legsIncludeAllRoutes(legs, req.RequiredRouteIDs) {
-				continue
-			}
 			arrivalTime := legs[len(legs)-1].ArrivalTime
 			planDeparture := scanAt
 			if legs[0].Mode == "walk" {
@@ -277,7 +269,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 
 	plans := buildPlans(nil, 0)
 	if len(plans) == 0 {
-		return nil, errors.New("no journey found between the given coordinates")
+		return nil, noOnlyRouteJourneyError(req)
 	}
 
 	// Collapse the raw candidates (which all tend to share one route spine)
@@ -591,7 +583,6 @@ func normalizeJourneyRequest(req JourneyRequest) JourneyRequest {
 		req.MaxResults = req.MinResults
 	}
 	req.OnlyRouteIDs = cleanRouteIDs(req.OnlyRouteIDs)
-	req.RequiredRouteIDs = cleanRouteIDs(req.RequiredRouteIDs)
 	return req
 }
 
@@ -641,25 +632,14 @@ func routeAllowed(routeID string, onlyRoutes, bannedRoutes map[string]bool) bool
 	return true
 }
 
-// legsIncludeAllRoutes reports whether the given itinerary uses every route
-// in required somewhere along the way (order doesn't matter). An empty
-// required list is trivially satisfied.
-func legsIncludeAllRoutes(legs []JourneyLeg, required []string) bool {
-	if len(required) == 0 {
-		return true
+// noOnlyRouteJourneyError explains a "found nothing at all" result in terms
+// of OnlyRouteIDs when the request has one - RAPTOR couldn't connect the two
+// points while restricted to those routes alone.
+func noOnlyRouteJourneyError(req JourneyRequest) error {
+	if len(req.OnlyRouteIDs) > 0 {
+		return errors.New("no journey found using only the selected routes - they may not connect these two locations within the allowed walking distance")
 	}
-	have := make(map[string]bool, len(legs))
-	for _, leg := range legs {
-		if leg.Mode == "transit" && leg.RouteID != "" {
-			have[leg.RouteID] = true
-		}
-	}
-	for _, r := range required {
-		if !have[r] {
-			return false
-		}
-	}
-	return true
+	return errors.New("no journey found between the given coordinates")
 }
 
 func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan, error) {
@@ -785,7 +765,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 	candidateLimit := expandedCandidateLimit(req.MaxResults)
 	candidates := selectBestOriginsArriveAt(nearbyStartStops, latest, req.WalkSpeedKmph, candidateLimit)
 	if len(candidates) == 0 {
-		return nil, errors.New("no journey found between the given coordinates")
+		return nil, noOnlyRouteJourneyError(req)
 	}
 
 	var plans []JourneyPlan
@@ -797,9 +777,6 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		}
 		legs = mergeAdjacentWalkLegs(legs)
 		legs = deferOriginWalk(legs)
-		if !legsIncludeAllRoutes(legs, req.RequiredRouteIDs) {
-			continue
-		}
 		departAt := dayStart.Add(time.Duration(candidate.DepartSec) * time.Second)
 		if len(legs) > 0 && legs[0].Mode == "walk" {
 			departAt = legs[0].DepartureTime

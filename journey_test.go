@@ -3,6 +3,7 @@ package gtfs
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -456,27 +457,6 @@ func TestRouteAllowed(t *testing.T) {
 	}
 }
 
-func TestLegsIncludeAllRoutes(t *testing.T) {
-	legs := []JourneyLeg{
-		{Mode: "walk"},
-		{Mode: "transit", RouteID: "70"},
-		{Mode: "walk"},
-		{Mode: "transit", RouteID: "NEX"},
-	}
-	if !legsIncludeAllRoutes(legs, nil) {
-		t.Fatalf("empty requirement should always pass")
-	}
-	if !legsIncludeAllRoutes(legs, []string{"70"}) {
-		t.Fatalf("expected single required route to be found")
-	}
-	if !legsIncludeAllRoutes(legs, []string{"70", "NEX"}) {
-		t.Fatalf("expected both required routes to be found")
-	}
-	if legsIncludeAllRoutes(legs, []string{"70", "999"}) {
-		t.Fatalf("should fail when one required route is missing")
-	}
-}
-
 func TestCleanRouteIDs(t *testing.T) {
 	if got := cleanRouteIDs(nil); got != nil {
 		t.Fatalf("expected nil for nil input, got %v", got)
@@ -549,5 +529,16 @@ func TestFilterNearbyStopsKeepsTrainStopBeyondCap(t *testing.T) {
 	}
 	if !foundPlatform {
 		t.Fatalf("train platform trimmed from nearby stops despite being in range: %d candidates returned", len(near))
+	}
+}
+
+func TestNoOnlyRouteJourneyError(t *testing.T) {
+	generic := noOnlyRouteJourneyError(JourneyRequest{})
+	if !strings.Contains(generic.Error(), "no journey found between") {
+		t.Fatalf("expected generic message, got %q", generic.Error())
+	}
+	withOnly := noOnlyRouteJourneyError(JourneyRequest{OnlyRouteIDs: []string{"70"}})
+	if !strings.Contains(withOnly.Error(), "only the selected routes") {
+		t.Fatalf("expected only-routes-specific message, got %q", withOnly.Error())
 	}
 }
