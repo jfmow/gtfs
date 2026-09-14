@@ -418,20 +418,26 @@ func TestMergeAdjacentWalkLegs(t *testing.T) {
 
 func TestCountTransfers(t *testing.T) {
 	base := time.Now()
-	tl := func(mode string) JourneyLeg { return JourneyLeg{Mode: mode, DepartureTime: base, ArrivalTime: base} }
+	tl := func(mode, routeID string) JourneyLeg {
+		return JourneyLeg{Mode: mode, RouteID: routeID, DepartureTime: base, ArrivalTime: base}
+	}
 	cases := []struct {
+		name string
 		legs []JourneyLeg
 		want int
 	}{
-		{[]JourneyLeg{tl("walk")}, 0},
-		{[]JourneyLeg{tl("walk"), tl("transit"), tl("walk")}, 0},
-		{[]JourneyLeg{tl("walk"), tl("transit"), tl("walk"), tl("transit"), tl("walk")}, 1},
-		{[]JourneyLeg{tl("walk"), tl("transit"), tl("transit"), tl("walk"), tl("transit")}, 2},
+		{"walk only", []JourneyLeg{tl("walk", "")}, 0},
+		{"single transit leg", []JourneyLeg{tl("walk", ""), tl("transit", "A"), tl("walk", "")}, 0},
+		{"two different routes via a walk", []JourneyLeg{tl("walk", ""), tl("transit", "A"), tl("walk", ""), tl("transit", "B"), tl("walk", "")}, 1},
+		{"three transit legs, two route changes", []JourneyLeg{tl("walk", ""), tl("transit", "A"), tl("transit", "B"), tl("walk", ""), tl("transit", "C")}, 2},
+		{"same route split across two trips isn't a transfer", []JourneyLeg{tl("walk", ""), tl("transit", "A"), tl("transit", "A"), tl("walk", "")}, 0},
 	}
-	for i, c := range cases {
-		if got := countTransfers(c.legs); got != c.want {
-			t.Fatalf("case %d: got %d want %d", i, got, c.want)
-		}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := countTransfers(c.legs); got != c.want {
+				t.Fatalf("got %d want %d", got, c.want)
+			}
+		})
 	}
 }
 

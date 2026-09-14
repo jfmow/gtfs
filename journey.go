@@ -387,19 +387,26 @@ func raptorDepartScan(
 	return arrival, predecessor
 }
 
-// countTransfers counts boardings-minus-one across a finished leg list (a walk
-// leg between two transit legs is still one transfer, not two).
+// countTransfers counts route changes across a finished leg list (a walk leg
+// between two transit legs is still one transfer, not two; two consecutive
+// transit legs on the same route - a through-running service split across
+// trip ids - isn't a transfer at all). Mirrors the counting
+// buildJourneyLegs/buildJourneyLegsArriveAt do when they set JourneyPlan's own
+// Transfers field, so this safety-cap check can never reject an itinerary its
+// own Transfers already says is within budget.
 func countTransfers(legs []JourneyLeg) int {
-	boardings := 0
+	transfers := 0
+	lastRouteID := ""
 	for _, leg := range legs {
-		if leg.Mode == "transit" {
-			boardings++
+		if leg.Mode != "transit" {
+			continue
 		}
+		if lastRouteID != "" && lastRouteID != leg.RouteID {
+			transfers++
+		}
+		lastRouteID = leg.RouteID
 	}
-	if boardings == 0 {
-		return 0
-	}
-	return boardings - 1
+	return transfers
 }
 
 // firstTransitDepartSec returns the seconds-since-dayStart of a plan's first
@@ -1840,7 +1847,11 @@ func buildJourneyLegs(endStop StopWithDistance, endArrivalSec int, predecessor m
 	transfers := 0
 	var transferStops []Stop
 	currentStopID := endStop.Stop.StopId
-	lastTripID := ""
+	// Tracks the previous transit leg's route, not trip - a rail service
+	// through-running as two consecutive trip_ids (a scheduling/block split,
+	// not a real alighting) must not count as a transfer just because the
+	// trip id changed underneath the same ride.
+	lastRouteID := ""
 	var lastStop *Stop
 
 	if currentStopID == "" {
@@ -1928,13 +1939,13 @@ func buildJourneyLegs(endStop StopWithDistance, endArrivalSec int, predecessor m
 			DelaySeconds:           timing.DelaySeconds,
 			TripUsable:             pred.TripUsable,
 		}
-		if lastTripID != "" && lastTripID != pred.TripID {
+		if lastRouteID != "" && lastRouteID != pred.RouteID {
 			transfers++
 			if lastStop != nil {
 				transferStops = append(transferStops, *lastStop)
 			}
 		}
-		lastTripID = pred.TripID
+		lastRouteID = pred.RouteID
 		legs = append(legs, leg)
 		lastStop = &fromStop
 		currentStopID = pred.FromStopID
@@ -1950,7 +1961,9 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 	transfers := 0
 	var transferStops []Stop
 	currentStopID := startStop.Stop.StopId
-	lastTripID := ""
+	// See buildJourneyLegs: compares route, not trip, so a through-running
+	// service split across two trip_ids isn't miscounted as a transfer.
+	lastRouteID := ""
 	var lastStop *Stop
 
 	if currentStopID == "" {
@@ -2069,13 +2082,13 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 			DelaySeconds:           timing.DelaySeconds,
 			TripUsable:             next.TripUsable,
 		}
-		if lastTripID != "" && lastTripID != next.TripID {
+		if lastRouteID != "" && lastRouteID != next.RouteID {
 			transfers++
 			if lastStop != nil {
 				transferStops = append(transferStops, *lastStop)
 			}
 		}
-		lastTripID = next.TripID
+		lastRouteID = next.RouteID
 		legs = append(legs, leg)
 		lastStop = &fromStop
 		currentStopID = next.ToStopID
