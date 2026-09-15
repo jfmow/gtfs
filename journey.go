@@ -889,6 +889,12 @@ const (
 	footTransferBufferSec   = 30
 	footTransferWalkSpeedKm = 4.6 // slightly slower than the trip-planner default: street crossings, finding the stop
 	footTransferGridDeg     = 0.005
+	// Minimum change time for a same-station, different-platform transfer (e.g.
+	// crossing to the opposite platform at a through-station). Straight-line
+	// distance between platforms can be a few metres, but the rider still has
+	// to cross a bridge/underpass or wait for a level crossing, so a distance-
+	// scaled walk time understates it.
+	sameStationTransferSec = 120
 )
 
 type stopTransferGraphMemo struct {
@@ -966,10 +972,23 @@ func buildStopTransferGraph(stopMap map[string]Stop) map[string][]stopTransfer {
 						continue
 					}
 					o := stopMap[otherID]
-					// Same physical station (parent, or same coords) - RAPTOR
-					// already handles that as a same-stop board; a walk edge
-					// there just adds noise.
+					// Same physical station (parent, or same coords) but a
+					// different stop_id - e.g. opposite platforms of a
+					// through-station. RAPTOR only chains trips at an
+					// identical stop_id, so without an edge here a rider can
+					// never use one line to reach a connecting line that
+					// departs from the other platform of the very same
+					// station - the planner would have to route via whatever
+					// stop the two lines happen to share, however far away.
+					// This bypasses the distance floor/ceiling and the
+					// same-name pairing below: it's always one interchange,
+					// never "noise" or a "pointless leading hop".
 					if stationKey(s) == stationKey(o) {
+						near = append(near, stopTransfer{
+							ToStopID: otherID,
+							WalkSec:  sameStationTransferSec,
+							rare:     true, // an essential interchange - never trimmed
+						})
 						continue
 					}
 					dKm := calculateDistance(s.StopLat, s.StopLon, o.StopLat, o.StopLon)

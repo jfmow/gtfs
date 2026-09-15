@@ -400,6 +400,35 @@ func TestBuildStopTransferGraphKeepsFerryStops(t *testing.T) {
 	}
 }
 
+func TestBuildStopTransferGraphLinksSameStationDifferentPlatform(t *testing.T) {
+	// Karanga-a-Hape's two platforms: same parent_station, ~40 m apart - under
+	// footTransferMinKm, so the ordinary distance-based rule would drop them,
+	// and the old same-stationKey skip dropped them outright. A rider must
+	// still be able to cross from one line's platform to the other's.
+	stopMap := map[string]Stop{
+		"p1": {StopId: "p1", StopName: "Karanga-a-Hape Train Station 1", ParentStation: "station", StopType: "train", StopLat: -36.85816, StopLon: 174.75879},
+		"p2": {StopId: "p2", StopName: "Karanga-a-Hape Train Station 2", ParentStation: "station", StopType: "train", StopLat: -36.85809, StopLon: 174.75923},
+	}
+
+	g := buildStopTransferGraph(stopMap)
+
+	var tr *stopTransfer
+	for i, t := range g["p1"] {
+		if t.ToStopID == "p2" {
+			tr = &g["p1"][i]
+		}
+	}
+	if tr == nil {
+		t.Fatalf("expected p1->p2 same-station transfer, got %+v", g["p1"])
+	}
+	if tr.WalkSec != sameStationTransferSec {
+		t.Fatalf("expected fixed same-station change time %ds, got %ds", sameStationTransferSec, tr.WalkSec)
+	}
+	if !tr.rare {
+		t.Fatalf("same-station transfer must never be trimmed")
+	}
+}
+
 func TestMergeAdjacentWalkLegs(t *testing.T) {
 	base := time.Date(2026, 3, 23, 8, 0, 0, 0, time.UTC)
 	legs := []JourneyLeg{
