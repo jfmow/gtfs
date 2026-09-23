@@ -155,29 +155,29 @@ func TestNormalizeJourneyRequestUsesDefaultTransfersForNegativeValue(t *testing.
 }
 
 func TestCanBoardTransitAtStopRequiresOneMinuteForTransfers(t *testing.T) {
-	if canBoardTransitAtStop(10*60, 10*60, false) != true {
+	if canBoardTransitAtStop(10*60, 10*60, false, minDirectTransferSeconds) != true {
 		t.Fatalf("expected non-transfer boarding at same second to be allowed")
 	}
 
-	if canBoardTransitAtStop(10*60, 10*60+59, true) != false {
+	if canBoardTransitAtStop(10*60, 10*60+59, true, minDirectTransferSeconds) != false {
 		t.Fatalf("expected transfer boarding with less than one minute to be rejected")
 	}
 
-	if canBoardTransitAtStop(10*60, 10*60+60, true) != true {
+	if canBoardTransitAtStop(10*60, 10*60+60, true, minDirectTransferSeconds) != true {
 		t.Fatalf("expected transfer boarding with one minute gap to be allowed")
 	}
 }
 
 func TestCanAlightForTransitConnectionRequiresOneMinuteForTransfers(t *testing.T) {
-	if canAlightForTransitConnection(10*60, 10*60, false) != true {
+	if canAlightForTransitConnection(10*60, 10*60, false, minDirectTransferSeconds) != true {
 		t.Fatalf("expected non-transfer alight at same second to be allowed")
 	}
 
-	if canAlightForTransitConnection(10*60, 10*60+59, true) != false {
+	if canAlightForTransitConnection(10*60, 10*60+59, true, minDirectTransferSeconds) != false {
 		t.Fatalf("expected transfer alight with less than one minute to be rejected")
 	}
 
-	if canAlightForTransitConnection(10*60, 10*60+60, true) != true {
+	if canAlightForTransitConnection(10*60, 10*60+60, true, minDirectTransferSeconds) != true {
 		t.Fatalf("expected transfer alight with one minute gap to be allowed")
 	}
 }
@@ -359,7 +359,7 @@ func TestRaptorDepartScanRespectsPickupDropoff(t *testing.T) {
 	}
 	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.05}}
 
-	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, nil, nil)
+	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds, nil, nil)
 
 	if arrival["B"] != 8*3600+12*60 {
 		t.Fatalf("expected to ride ferry A->B, arrival[B]=%d", arrival["B"])
@@ -370,7 +370,7 @@ func TestRaptorDepartScanRespectsPickupDropoff(t *testing.T) {
 
 	// And a rider starting at B must NOT be able to board the ferry there.
 	nearB := []StopWithDistance{{Stop: stopMap["B"], Distance: 0.05}}
-	arrival2, _ := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, nearB, 7*3600+55*60, 2, 4.8, nil, nil)
+	arrival2, _ := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, nearB, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds, nil, nil)
 	if arrival2["A"] != math.MaxInt32 {
 		t.Fatalf("should not be able to board at set-down-only stop B; arrival[A]=%d", arrival2["A"])
 	}
@@ -525,7 +525,7 @@ func TestRaptorDepartScanOnlyRoutesRestrictsBoarding(t *testing.T) {
 	}
 	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.05}}
 
-	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, nil, map[string]bool{"71": true})
+	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds, nil, map[string]bool{"71": true})
 	if arrival["B"] != 8*3600+15*60 {
 		t.Fatalf("expected onlyRoutes to force the slower route 71 trip, arrival[B]=%d", arrival["B"])
 	}
@@ -575,5 +575,121 @@ func TestNoOnlyRouteJourneyError(t *testing.T) {
 	withOnly := noOnlyRouteJourneyError(JourneyRequest{OnlyRouteIDs: []string{"70"}})
 	if !strings.Contains(withOnly.Error(), "only the selected routes") {
 		t.Fatalf("expected only-routes-specific message, got %q", withOnly.Error())
+	}
+}
+
+func TestAllowedRouteSetFiltersByMode(t *testing.T) {
+	routeMap := map[string]Route{
+		"bus70":   {RouteId: "bus70", RouteType: 3},
+		"bus71":   {RouteId: "bus71", RouteType: 3},
+		"eastern": {RouteId: "eastern", RouteType: 2},
+		"ferry":   {RouteId: "ferry", RouteType: 4},
+	}
+
+	if got := allowedRouteSet(routeMap, nil, nil); got != nil {
+		t.Fatalf("no filters should mean no restriction, got %v", got)
+	}
+
+	trainOrFerry := allowedRouteSet(routeMap, nil, []int{2, 4})
+	if !trainOrFerry["eastern"] || !trainOrFerry["ferry"] || trainOrFerry["bus70"] || len(trainOrFerry) != 2 {
+		t.Fatalf("expected only the train and ferry, got %v", trainOrFerry)
+	}
+
+	// Both filters: a route must pass each.
+	both := allowedRouteSet(routeMap, []string{"bus70", "eastern"}, []int{3})
+	if !both["bus70"] || len(both) != 1 {
+		t.Fatalf("expected just bus70, got %v", both)
+	}
+
+	// A mode with no routes must block everything, not lift the restriction.
+	none := allowedRouteSet(routeMap, nil, []int{5})
+	if len(none) == 0 || routeAllowed("bus70", none, nil) {
+		t.Fatalf("a mode with no routes must allow nothing, got %v", none)
+	}
+}
+
+func TestRaptorDepartScanModeFilterSkipsOtherModes(t *testing.T) {
+	// A fast train and a slow bus both run A -> B. Bus only must take the bus.
+	trips := map[string][]tripStopTime{
+		"train": {
+			{TripID: "train", RouteID: "eastern", StopID: "A", DepartureSec: 8 * 3600, TripUsable: true, Boardable: true, Alightable: true},
+			{TripID: "train", RouteID: "eastern", StopID: "B", ArrivalSec: 8*3600 + 5*60, TripUsable: true, Boardable: true, Alightable: true},
+		},
+		"bus": {
+			{TripID: "bus", RouteID: "bus70", StopID: "A", DepartureSec: 8 * 3600, TripUsable: true, Boardable: true, Alightable: true},
+			{TripID: "bus", RouteID: "bus70", StopID: "B", ArrivalSec: 8*3600 + 20*60, TripUsable: true, Boardable: true, Alightable: true},
+		},
+	}
+	stopMap := map[string]Stop{
+		"A": {StopId: "A", StopLat: -36.84, StopLon: 174.77},
+		"B": {StopId: "B", StopLat: -36.83, StopLon: 174.80},
+	}
+	routeMap := map[string]Route{
+		"eastern": {RouteId: "eastern", RouteType: 2},
+		"bus70":   {RouteId: "bus70", RouteType: 3},
+	}
+	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.05}}
+
+	only := allowedRouteSet(routeMap, nil, []int{3})
+	_, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds, nil, only)
+	if pred["B"].RouteID != "bus70" {
+		t.Fatalf("expected the bus, got route %q", pred["B"].RouteID)
+	}
+}
+
+func TestRaptorDepartScanMinTransferSecRejectsRushedChange(t *testing.T) {
+	// Route 1 reaches X at 8:10; route 2 leaves X at 8:12. A two-minute change
+	// is fine normally, but not when the rider asked for three extra minutes.
+	trips := map[string][]tripStopTime{
+		"t1": {
+			{TripID: "t1", RouteID: "1", StopID: "A", DepartureSec: 8 * 3600, TripUsable: true, Boardable: true, Alightable: true},
+			{TripID: "t1", RouteID: "1", StopID: "X", ArrivalSec: 8*3600 + 10*60, TripUsable: true, Boardable: true, Alightable: true},
+		},
+		"t2": {
+			{TripID: "t2", RouteID: "2", StopID: "X", DepartureSec: 8*3600 + 12*60, TripUsable: true, Boardable: true, Alightable: true},
+			{TripID: "t2", RouteID: "2", StopID: "B", ArrivalSec: 8*3600 + 20*60, TripUsable: true, Boardable: true, Alightable: true},
+		},
+	}
+	stopMap := map[string]Stop{
+		"A": {StopId: "A"}, "X": {StopId: "X"}, "B": {StopId: "B"},
+	}
+	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.05}}
+
+	arrival, _ := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds, nil, nil)
+	if arrival["B"] != 8*3600+20*60 {
+		t.Fatalf("expected the normal two-minute change to work, arrival[B]=%d", arrival["B"])
+	}
+	arrival, _ = raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds+180, nil, nil)
+	if arrival["B"] != math.MaxInt32 {
+		t.Fatalf("expected the rushed change to be rejected, arrival[B]=%d", arrival["B"])
+	}
+}
+
+func TestTransferGraphAtSpeedRetimesForSlowWalkers(t *testing.T) {
+	graph := map[string][]stopTransfer{
+		"a": {
+			{ToStopID: "b", WalkSec: walkDurationSeconds(0.3, footTransferWalkSpeedKm) + footTransferBufferSec, DistKm: 0.3},
+			{ToStopID: "platform2", WalkSec: sameStationTransferSec},
+		},
+	}
+	if got := transferGraphAtSpeed(graph, 4.8); got["a"][0].WalkSec != graph["a"][0].WalkSec {
+		t.Fatalf("normal pace should reuse the shared graph")
+	}
+	slow := transferGraphAtSpeed(graph, 3.0)
+	if want := walkDurationSeconds(0.3, 3.0) + footTransferBufferSec; slow["a"][0].WalkSec != want {
+		t.Fatalf("expected %ds at 3 km/h, got %d", want, slow["a"][0].WalkSec)
+	}
+	if slow["a"][1].WalkSec != sameStationTransferSec {
+		t.Fatalf("same-station interchange should keep its fixed time, got %d", slow["a"][1].WalkSec)
+	}
+	if graph["a"][0].WalkSec == slow["a"][0].WalkSec {
+		t.Fatalf("the shared graph must not be modified")
+	}
+}
+
+func TestNoJourneyErrorMentionsTheModeFilter(t *testing.T) {
+	err := noOnlyRouteJourneyError(JourneyRequest{AllowedRouteTypes: []int{2, 4, 1000, 1200}})
+	if !strings.Contains(err.Error(), "only the chosen transport") {
+		t.Fatalf("expected the modes in the message, got %q", err.Error())
 	}
 }

@@ -40,7 +40,14 @@ type JourneyRequest struct {
 	// transfer between stops) is unaffected. If these routes alone can't
 	// connect the origin and destination, no itinerary is returned.
 	OnlyRouteIDs []string
-	Realtime     *gtfsrealtime.Realtime `json:"-"`
+	// AllowedRouteTypes, when non-empty, restricts every transit leg to routes
+	// whose GTFS route_type is in the list (e.g. {3} = bus only, {2, 4} = train
+	// or ferry). Combined with OnlyRouteIDs, a route must pass both.
+	AllowedRouteTypes []int
+	// MinTransferSec is extra time added to every change of vehicle, on top of
+	// the usual one-minute minimum - for riders who don't want a rushed change.
+	MinTransferSec int
+	Realtime       *gtfsrealtime.Realtime `json:"-"`
 }
 
 type JourneyLeg struct {
@@ -209,8 +216,9 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		routeMap[route.RouteId] = route
 	}
 
-	onlyRoutes := routeSetOf(req.OnlyRouteIDs)
-	transferGraph := v.stopTransferGraph(stopMap, req.IncludeChildren)
+	onlyRoutes := allowedRouteSet(routeMap, req.OnlyRouteIDs, req.AllowedRouteTypes)
+	transferGraph := transferGraphAtSpeed(v.stopTransferGraph(stopMap, req.IncludeChildren), req.WalkSpeedKmph)
+	transferGapSec := minDirectTransferSeconds + req.MinTransferSec
 
 	// buildPlans runs one RAPTOR scan and turns it into itineraries. `banned`
 	// skips trips on those routes; `fromSec` (0 = use the request's own time)
@@ -224,7 +232,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			scanAt = dayStart.Add(time.Duration(fromSec) * time.Second)
 		}
 
-		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, scanSec, req.MaxTransfers, req.WalkSpeedKmph, banned, onlyRoutes)
+		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, scanSec, req.MaxTransfers, req.WalkSpeedKmph, transferGapSec, banned, onlyRoutes)
 
 		candidateLimit := expandedCandidateLimit(req.MaxResults)
 		bestCandidates := selectBestDestinations(nearbyEndStops, arrival, scanSec, req.WalkSpeedKmph, candidateLimit)
@@ -309,6 +317,7 @@ func raptorDepartScan(
 	nearbyStartStops []StopWithDistance,
 	departSec, maxTransfers int,
 	walkSpeedKmph float64,
+	transferGapSec int,
 	bannedRoutes map[string]bool,
 	onlyRoutes map[string]bool,
 ) (map[string]int, map[string]stopPredecessor) {
@@ -343,7 +352,7 @@ func raptorDepartScan(
 			for _, stopTime := range tripTimes {
 				if !boarded {
 					if stopTime.TripUsable && stopTime.Boardable && updated[stopTime.StopID] &&
-						canBoardTransitAtStop(arr(stopTime.StopID), stopTime.DepartureSec, round > 0) {
+						canBoardTransitAtStop(arr(stopTime.StopID), stopTime.DepartureSec, round > 0, transferGapSec) {
 						boarded = true
 						boardStopID = stopTime.StopID
 						boardDepartSec = stopTime.DepartureSec
@@ -590,6 +599,12 @@ func normalizeJourneyRequest(req JourneyRequest) JourneyRequest {
 		req.MaxResults = req.MinResults
 	}
 	req.OnlyRouteIDs = cleanRouteIDs(req.OnlyRouteIDs)
+	if req.MinTransferSec < 0 {
+		req.MinTransferSec = 0
+	}
+	if req.MinTransferSec > 900 {
+		req.MinTransferSec = 900
+	}
 	return req
 }
 
@@ -626,6 +641,35 @@ func routeSetOf(ids []string) map[string]bool {
 	return set
 }
 
+// allowedRouteSet combines the OnlyRouteIDs allow-list with the
+// AllowedRouteTypes mode filter into one allow-list for the scans. nil means
+// no restriction. When the mode filter matches no route at all the set holds a
+// single impossible ID, so the scan boards nothing rather than everything.
+func allowedRouteSet(routeMap map[string]Route, onlyRouteIDs []string, allowedTypes []int) map[string]bool {
+	only := routeSetOf(onlyRouteIDs)
+	if len(allowedTypes) == 0 {
+		return only
+	}
+	types := make(map[int]bool, len(allowedTypes))
+	for _, t := range allowedTypes {
+		types[t] = true
+	}
+	set := make(map[string]bool)
+	for id, route := range routeMap {
+		if !types[route.RouteType] {
+			continue
+		}
+		if len(only) > 0 && !only[id] {
+			continue
+		}
+		set[id] = true
+	}
+	if len(set) == 0 {
+		set[""] = true
+	}
+	return set
+}
+
 // routeAllowed reports whether a trip on routeID may be boarded given an
 // allow-list (onlyRoutes, nil/empty = no restriction) and a deny-list
 // (bannedRoutes, nil/empty = nothing banned).
@@ -643,6 +687,9 @@ func routeAllowed(routeID string, onlyRoutes, bannedRoutes map[string]bool) bool
 // of OnlyRouteIDs when the request has one - RAPTOR couldn't connect the two
 // points while restricted to those routes alone.
 func noOnlyRouteJourneyError(req JourneyRequest) error {
+	if len(req.AllowedRouteTypes) > 0 {
+		return errors.New("no journey found using only the chosen transport - it may not connect these two locations within the allowed walking distance")
+	}
 	if len(req.OnlyRouteIDs) > 0 {
 		return errors.New("no journey found using only the selected routes - they may not connect these two locations within the allowed walking distance")
 	}
@@ -679,7 +726,9 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		routeMap[route.RouteId] = route
 	}
 
-	onlyRoutes := routeSetOf(req.OnlyRouteIDs)
+	onlyRoutes := allowedRouteSet(routeMap, req.OnlyRouteIDs, req.AllowedRouteTypes)
+	transferGraph := transferGraphAtSpeed(v.stopTransferGraph(stopMap, req.IncludeChildren), req.WalkSpeedKmph)
+	transferGapSec := minDirectTransferSeconds + req.MinTransferSec
 	latest := make(map[string]int, len(stopMap))
 	successor := make(map[string]stopSuccessor, len(stopMap))
 	updated := make(map[string]bool, len(stopMap))
@@ -727,7 +776,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 					isTransfer := round > 0
 					if stopTime.TripUsable && stopTime.Alightable &&
 						updated[stopTime.StopID] &&
-						canAlightForTransitConnection(stopTime.ArrivalSec, latest[stopTime.StopID], isTransfer) {
+						canAlightForTransitConnection(stopTime.ArrivalSec, latest[stopTime.StopID], isTransfer, transferGapSec) {
 						alightPossible = true
 						downstreamStopID = stopTime.StopID
 						downstreamArriveSec = stopTime.ArrivalSec
@@ -760,7 +809,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 			for id := range nextUpdated {
 				transitUpdated = append(transitUpdated, id)
 			}
-			relaxFootTransfersArriveAt(transitUpdated, v.stopTransferGraph(stopMap, req.IncludeChildren), latest, successor, nextUpdated)
+			relaxFootTransfersArriveAt(transitUpdated, transferGraph, latest, successor, nextUpdated)
 		}
 
 		if len(nextUpdated) == 0 {
@@ -848,18 +897,20 @@ func expandedCandidateLimit(maxResults int) int {
 	return maxResults * 3
 }
 
-func canBoardTransitAtStop(arrivalSec, departureSec int, isTransfer bool) bool {
+// transferGapSec is the minimum change time for a transfer - normally
+// minDirectTransferSeconds, more when the request asks for unhurried changes.
+func canBoardTransitAtStop(arrivalSec, departureSec int, isTransfer bool, transferGapSec int) bool {
 	requiredGap := 0
 	if isTransfer {
-		requiredGap = minDirectTransferSeconds
+		requiredGap = transferGapSec
 	}
 	return arrivalSec+requiredGap <= departureSec
 }
 
-func canAlightForTransitConnection(arrivalSec, latestAllowedSec int, isTransfer bool) bool {
+func canAlightForTransitConnection(arrivalSec, latestAllowedSec int, isTransfer bool, transferGapSec int) bool {
 	requiredGap := 0
 	if isTransfer {
-		requiredGap = minDirectTransferSeconds
+		requiredGap = transferGapSec
 	}
 	return arrivalSec+requiredGap <= latestAllowedSec
 }
@@ -876,7 +927,8 @@ func canAlightForTransitConnection(arrivalSec, latestAllowedSec int, isTransfer 
 type stopTransfer struct {
 	ToStopID string
 	WalkSec  int
-	rare     bool // target is a ferry/rail stop - never trimmed from the candidate list
+	DistKm   float64 // 0 for a same-station interchange (fixed WalkSec)
+	rare     bool    // target is a ferry/rail stop - never trimmed from the candidate list
 }
 
 const (
@@ -1006,6 +1058,7 @@ func buildStopTransferGraph(stopMap map[string]Stop) map[string][]stopTransfer {
 					near = append(near, stopTransfer{
 						ToStopID: otherID,
 						WalkSec:  walkDurationSeconds(dKm, footTransferWalkSpeedKm) + footTransferBufferSec,
+						DistKm:   dKm,
 						rare:     o.StopType != "" && o.StopType != "bus",
 					})
 				}
@@ -1035,6 +1088,38 @@ func buildStopTransferGraph(stopMap map[string]Stop) map[string][]stopTransfer {
 		graph[id] = near
 	}
 	return graph
+}
+
+// footTransferSpeed is the walking speed for a change between stops: the usual
+// footTransferWalkSpeedKm, or the rider's own pace when they walk slower.
+func footTransferSpeed(walkSpeedKmph float64) float64 {
+	if walkSpeedKmph > 0 && walkSpeedKmph < footTransferWalkSpeedKm {
+		return walkSpeedKmph
+	}
+	return footTransferWalkSpeedKm
+}
+
+// transferGraphAtSpeed returns the (shared, memoised) transfer graph re-timed
+// for a rider slower than footTransferWalkSpeedKm, so they're never given a
+// change of stop timed for a faster walker. The shared graph is returned
+// untouched at the normal pace; otherwise a re-timed copy is built.
+func transferGraphAtSpeed(graph map[string][]stopTransfer, walkSpeedKmph float64) map[string][]stopTransfer {
+	speed := footTransferSpeed(walkSpeedKmph)
+	if speed >= footTransferWalkSpeedKm {
+		return graph
+	}
+	out := make(map[string][]stopTransfer, len(graph))
+	for id, edges := range graph {
+		retimed := make([]stopTransfer, len(edges))
+		for i, tr := range edges {
+			if tr.DistKm > 0 {
+				tr.WalkSec = walkDurationSeconds(tr.DistKm, speed) + footTransferBufferSec
+			}
+			retimed[i] = tr
+		}
+		out[id] = retimed
+	}
+	return out
 }
 
 // relaxFootTransfers extends a RAPTOR depart-after round: from every stop whose
@@ -2058,7 +2143,7 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 				departTime = legs[len(legs)-1].ArrivalTime
 			}
 			dKm := calculateDistance(fromStop.StopLat, fromStop.StopLon, toStop.StopLat, toStop.StopLon)
-			walkSecs := walkDurationSeconds(dKm, footTransferWalkSpeedKm) + footTransferBufferSec
+			walkSecs := walkDurationSeconds(dKm, footTransferSpeed(walkSpeedKmph)) + footTransferBufferSec
 			legs = append(legs, JourneyLeg{
 				Mode:          "walk",
 				FromStop:      &fromStop,
