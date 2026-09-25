@@ -533,6 +533,9 @@ func (v Database) refreshDatabaseData() error {
 		return fmt.Errorf("failed to write new data to the database: %w", err)
 	}
 
+	if err := tidyHeadsigns(tx); err != nil {
+		return err
+	}
 	if err := v.populateStopNgrams(tx); err != nil {
 		return err
 	}

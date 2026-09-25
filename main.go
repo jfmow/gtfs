@@ -47,6 +47,10 @@ func New(url string, apiKey ApiKey, databaseName string, tz *time.Location, mail
 		if err := database.createIndexesTx(); err != nil {
 			log.Printf("gtfs: failed to create indexes for %s: %v", databaseName, err)
 		}
+		// Data imported before headsigns were tidied on import.
+		if err := tidyHeadsigns(database.db); err != nil {
+			log.Printf("gtfs: failed to tidy headsigns for %s: %v", databaseName, err)
+		}
 	case err != nil && database.hasCoreData():
 		// feed_info is missing / unparseable (some feeds don't ship it) but the
 		// core tables are populated - don't pay a full rebuild on every single
@@ -54,6 +58,10 @@ func New(url string, apiKey ApiKey, databaseName string, tz *time.Location, mail
 		fmt.Printf("gtfs: %s: can't read feed_end_date (%v); keeping existing data, daily refresh will update\n", databaseName, err)
 		if err := database.createIndexesTx(); err != nil {
 			log.Printf("gtfs: failed to create indexes for %s: %v", databaseName, err)
+		}
+		// Data imported before headsigns were tidied on import.
+		if err := tidyHeadsigns(database.db); err != nil {
+			log.Printf("gtfs: failed to tidy headsigns for %s: %v", databaseName, err)
 		}
 	default:
 		fmt.Println("Feed data is not up to date: " + databaseName)
