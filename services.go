@@ -102,8 +102,10 @@ func (v Database) GetActiveTrips(stopID, departureTimeFilter string, date time.T
 	JOIN stop_times st ON t.trip_id = st.trip_id
 	JOIN stops s ON st.stop_id = s.stop_id
 	JOIN routes r ON t.route_id = r.route_id
-	WHERE (st.drop_off_type = 0 OR st.drop_off_type IS NULL)
-  	AND (st.pickup_type = 0 OR st.pickup_type IS NULL)
+	-- Somewhere you can board. Not drop_off_type: feeds like Metlink mark a
+	-- trip's first stop pickup-only (drop_off_type = 1), and that's exactly
+	-- where most of its departures are.
+	WHERE (st.pickup_type IS NULL OR st.pickup_type != 1)
 	`, dayColumn)
 
 	if departureTimeFilter != "" {
@@ -296,8 +298,9 @@ func (v Database) GetServiceByTripAndStop(tripID, stopId, departureTimeFilter st
 		JOIN routes r ON t.route_id = r.route_id
 		WHERE t.trip_id = ? -- Filter by trip_id
 		AND st.stop_id = ? -- Filter by stop_id
-		AND st.pickup_type != 1 -- Exclude drop_off_only stops
-		AND st.drop_off_type != 1 -- Exclude pick_up_only stops
+		-- Only a stop the trip doesn't serve at all is excluded - a
+		-- pickup-only origin or drop-off-only terminus is still on it.
+		AND NOT (COALESCE(st.pickup_type, 0) = 1 AND COALESCE(st.drop_off_type, 0) = 1)
 	`
 
 	if departureTimeFilter != "" {

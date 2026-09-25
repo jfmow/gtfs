@@ -200,8 +200,8 @@ func (v Database) GetServicesStopsByTrip(tripId string) ([]string, error) {
 			stop_times 
 		WHERE 
 			trip_id = ?	
-		AND (drop_off_type = 0 OR drop_off_type IS NULL)
-  		AND (pickup_type = 1 OR pickup_type = 0 OR pickup_type IS NULL)
+		-- Every stop the trip serves, incl. a pickup-only origin.
+		AND NOT (COALESCE(pickup_type, 0) = 1 AND COALESCE(drop_off_type, 0) = 1)
 
 	`
 
