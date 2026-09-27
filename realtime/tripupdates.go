@@ -42,7 +42,7 @@ func (v Realtime) GetTripUpdates() (TripUpdatesMap, error) {
 		startTimeStr := trip.GetStartTime()
 
 		// Parse start date + time
-		startDateTime, err := time.Parse("20060102 15:04:05", startDateStr+" "+startTimeStr)
+		startDateTime, err := parseTripStart(startDateStr, startTimeStr, v.localTimeZone)
 		if err != nil {
 			continue // skip malformed
 		}
@@ -58,8 +58,7 @@ func (v Realtime) GetTripUpdates() (TripUpdatesMap, error) {
 		}
 
 		existingTrip := existing.GetTrip()
-		existingDateTime, err := time.Parse("20060102 15:04:05",
-			existingTrip.GetStartDate()+" "+existingTrip.GetStartTime())
+		existingDateTime, err := parseTripStart(existingTrip.GetStartDate(), existingTrip.GetStartTime(), v.localTimeZone)
 		if err != nil {
 			continue
 		}
@@ -234,4 +233,21 @@ func (trips TripUpdatesMap) ByTripID(tripID string) (*proto.TripUpdate, error) {
 		return nil, errors.New("no trip update found for trip id")
 	}
 	return trip, nil
+}
+
+// parseTripStart turns a trip descriptor's start_date + start_time into an
+// instant in loc. start_time is a GTFS clock: it can pass 24:00:00 and counts
+// from "noon minus 12h" of start_date (an hour off midnight on a daylight-saving
+// change day), so it can't go through time.Parse.
+func parseTripStart(startDate, startTime string, loc *time.Location) (time.Time, error) {
+	day, err := time.ParseInLocation("20060102", startDate, loc)
+	if err != nil {
+		return time.Time{}, err
+	}
+	var h, m, s int
+	if _, err := fmt.Sscanf(startTime, "%d:%d:%d", &h, &m, &s); err != nil {
+		return time.Time{}, err
+	}
+	dayStart := time.Date(day.Year(), day.Month(), day.Day(), 12, 0, 0, 0, loc).Add(-12 * time.Hour)
+	return dayStart.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute + time.Duration(s)*time.Second), nil
 }

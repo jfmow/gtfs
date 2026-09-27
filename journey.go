@@ -188,7 +188,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 	}
 
 	departAt := req.DepartAt.In(v.timeZone)
-	dayStart := time.Date(departAt.Year(), departAt.Month(), departAt.Day(), 0, 0, 0, 0, v.timeZone)
+	dayStart := serviceDayStart(departAt, v.timeZone)
 	departSec := int(departAt.Sub(dayStart).Seconds())
 
 	stopMap, err := v.GetStopsMap(req.IncludeChildren)
@@ -698,7 +698,7 @@ func noOnlyRouteJourneyError(req JourneyRequest) error {
 
 func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan, error) {
 	arriveAt := req.ArriveAt.In(v.timeZone)
-	dayStart := time.Date(arriveAt.Year(), arriveAt.Month(), arriveAt.Day(), 0, 0, 0, 0, v.timeZone)
+	dayStart := serviceDayStart(arriveAt, v.timeZone)
 	arriveSec := int(arriveAt.Sub(dayStart).Seconds())
 
 	stopMap, err := v.GetStopsMap(req.IncludeChildren)
@@ -1205,8 +1205,25 @@ const tripStopTimesMemoTTL = 30 * time.Second
 
 var tripStopTimesMemos sync.Map // database name -> *tripStopTimesMemo
 
+// serviceDayStart returns the instant GTFS stop_times are measured from on t's
+// calendar day: "noon minus 12h", per the GTFS spec. That is local midnight on
+// most days, but on a daylight-saving change day it is an hour off midnight
+// (23:00 the night before when clocks go forward). Anchoring to midnight
+// instead shifts every time that day by an hour.
+func serviceDayStart(t time.Time, loc *time.Location) time.Time {
+	t = t.In(loc)
+	return time.Date(t.Year(), t.Month(), t.Day(), 12, 0, 0, 0, loc).Add(-12 * time.Hour)
+}
+
+// serviceDayNoon maps a serviceDayStart anchor back to noon on its service day,
+// for reading the calendar date/weekday (the anchor itself can fall on the
+// previous date).
+func serviceDayNoon(dayStart time.Time) time.Time {
+	return dayStart.Add(12 * time.Hour)
+}
+
 func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsrealtime.Realtime) (map[string][]tripStopTime, error) {
-	day := dayStart.Format("20060102")
+	day := serviceDayNoon(dayStart).Format("20060102")
 	mi, _ := tripStopTimesMemos.LoadOrStore(v.name, &tripStopTimesMemo{})
 	m := mi.(*tripStopTimesMemo)
 
@@ -1226,7 +1243,7 @@ func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsreal
 }
 
 func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrealtime.Realtime) (map[string][]tripStopTime, error) {
-	weekday := strings.ToLower(dayStart.Weekday().String()) // "monday", "tuesday", etc.
+	weekday := strings.ToLower(serviceDayNoon(dayStart).Weekday().String()) // "monday", "tuesday", etc.
 
 	query := fmt.Sprintf(`
 	WITH active_services AS (
@@ -1271,7 +1288,7 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 	ORDER BY st.trip_id, st.stop_sequence
 	`, weekday)
 
-	day := dayStart.Format("20060102")
+	day := serviceDayNoon(dayStart).Format("20060102")
 	today := time.Now().In(v.timeZone).Format("20060102")
 
 	rows, err := v.db.Query(query, day, day, day, day)
