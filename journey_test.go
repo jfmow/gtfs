@@ -693,3 +693,38 @@ func TestNoJourneyErrorMentionsTheModeFilter(t *testing.T) {
 		t.Fatalf("expected the modes in the message, got %q", err.Error())
 	}
 }
+
+func TestRankingPrefersDirectWithinTransferPenalty(t *testing.T) {
+	base := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
+	plan := func(id string, depMin, arrMin, transfers int) JourneyPlan {
+		dep := base.Add(time.Duration(depMin) * time.Minute)
+		arr := base.Add(time.Duration(arrMin) * time.Minute)
+		return JourneyPlan{ID: id, DepartureTime: dep, ArrivalTime: arr, TotalDuration: arr.Sub(dep), Transfers: transfers,
+			Legs: []JourneyLeg{{Mode: "transit", TripID: id}}}
+	}
+
+	// Leave at 8:00: the direct bus gets in 6 min after the one-change option.
+	leaveAt := planRanking{ref: base}
+	got := dedupePlansByTransitService([]JourneyPlan{plan("change", 0, 30, 1), plan("direct", 0, 36, 0)}, 0, leaveAt)
+	if got[0].ID != "direct" {
+		t.Fatalf("leave-at: want direct first, got %s", got[0].ID)
+	}
+	// ...but not when it's more than the penalty slower.
+	got = dedupePlansByTransitService([]JourneyPlan{plan("change", 0, 30, 1), plan("direct", 0, 45, 0)}, 0, leaveAt)
+	if got[0].ID != "change" {
+		t.Fatalf("leave-at: want change first when direct is 15 min slower, got %s", got[0].ID)
+	}
+
+	// Arrive by 9:00: the direct bus means leaving 6 min earlier.
+	arriveBy := planRanking{ref: base.Add(time.Hour), arriveBy: true}
+	got = dedupePlansByTransitService([]JourneyPlan{plan("change", 26, 58, 1), plan("direct", 20, 57, 0)}, 0, arriveBy)
+	if got[0].ID != "direct" {
+		t.Fatalf("arrive-by: want direct first, got %s", got[0].ID)
+	}
+}
+
+func TestNormalizeJourneyRequestDefaultWalkSpeed(t *testing.T) {
+	if got := normalizeJourneyRequest(JourneyRequest{}).WalkSpeedKmph; got != DefaultWalkSpeedKmph {
+		t.Fatalf("default walk speed = %v, want %v", got, DefaultWalkSpeedKmph)
+	}
+}

@@ -220,11 +220,12 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 	transferGraph := transferGraphAtSpeed(v.stopTransferGraph(stopMap, req.IncludeChildren), req.WalkSpeedKmph)
 	transferGapSec := minDirectTransferSeconds + req.MinTransferSec
 
-	// buildPlans runs one RAPTOR scan and turns it into itineraries. `banned`
-	// skips trips on those routes; `fromSec` (0 = use the request's own time)
-	// overrides the departure so the diversity pass can ask for "the next
-	// service" on a low-frequency corridor.
-	buildPlans := func(banned map[string]bool, fromSec int) []JourneyPlan {
+	// buildPlansWithin runs one RAPTOR scan and turns it into itineraries.
+	// `banned` skips trips on those routes; `fromSec` (0 = use the request's
+	// own time) overrides the departure so the diversity pass can ask for "the
+	// next service" on a low-frequency corridor; `maxTransfers` caps the rounds
+	// (0 = direct services only).
+	buildPlansWithin := func(banned map[string]bool, fromSec, maxTransfers int) []JourneyPlan {
 		scanSec := departSec
 		scanAt := departAt
 		if fromSec > 0 {
@@ -232,7 +233,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			scanAt = dayStart.Add(time.Duration(fromSec) * time.Second)
 		}
 
-		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, scanSec, req.MaxTransfers, req.WalkSpeedKmph, transferGapSec, banned, onlyRoutes)
+		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, scanSec, maxTransfers, req.WalkSpeedKmph, transferGapSec, banned, onlyRoutes)
 
 		candidateLimit := expandedCandidateLimit(req.MaxResults)
 		bestCandidates := selectBestDestinations(nearbyEndStops, arrival, scanSec, req.WalkSpeedKmph, candidateLimit)
@@ -250,7 +251,7 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			// Guard against the round loop's occasional over-count (a foot leg can
 			// smuggle in one more boarding than MaxTransfers): recount from the
 			// final legs and drop anything over budget.
-			if tc := countTransfers(legs); tc > req.MaxTransfers {
+			if tc := countTransfers(legs); tc > maxTransfers {
 				continue
 			}
 			arrivalTime := legs[len(legs)-1].ArrivalTime
@@ -274,23 +275,34 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		}
 		return plans
 	}
+	buildPlans := func(banned map[string]bool, fromSec int) []JourneyPlan {
+		return buildPlansWithin(banned, fromSec, req.MaxTransfers)
+	}
 
 	plans := buildPlans(nil, 0)
+	// RAPTOR keeps one earliest arrival per stop, so a direct service that
+	// gets in a couple of minutes after a two-bus option never surfaces. Scan
+	// direct-only as well and let the ranking's transfer penalty choose.
+	if req.MaxTransfers > 0 {
+		plans = append(plans, buildPlansWithin(nil, 0, 0)...)
+	}
 	if len(plans) == 0 {
 		return nil, noOnlyRouteJourneyError(req)
 	}
 
+	rank := planRanking{ref: departAt}
+
 	// Collapse the raw candidates (which all tend to share one route spine)
 	// before deciding whether we need more variety.
-	plans = dedupePlansByTransitService(plans, 0)
+	plans = dedupePlansByTransitService(plans, 0, rank)
 
 	// Diversity pass: RAPTOR keeps only the single earliest arrival per stop, so
 	// every candidate plan tends to share one spine. Re-run with routes banned to
 	// pull in genuinely different options, and if the corridor is thin, add the
 	// next departures so the rider still gets at least MinResults choices.
-	plans = diversifyPlans(plans, dayStart, buildPlans, req.MinResults, req.MaxResults)
+	plans = diversifyPlans(plans, dayStart, buildPlans, req.MinResults, req.MaxResults, rank)
 
-	plans = dedupePlansByTransitService(plans, req.MaxResults)
+	plans = dedupePlansByTransitService(plans, req.MaxResults, rank)
 	if len(plans) == 0 {
 		return nil, errors.New("no journey legs available")
 	}
@@ -439,6 +451,7 @@ func diversifyPlans(
 	dayStart time.Time,
 	buildPlans func(banned map[string]bool, fromSec int) []JourneyPlan,
 	minResults, maxResults int,
+	rank planRanking,
 ) []JourneyPlan {
 	if len(plans) == 0 {
 		return plans
@@ -454,7 +467,7 @@ func diversifyPlans(
 		return plans
 	}
 
-	sort.SliceStable(plans, func(i, j int) bool { return plans[i].TotalDuration < plans[j].TotalDuration })
+	sort.SliceStable(plans, func(i, j int) bool { return rank.cost(plans[i]) < rank.cost(plans[j]) })
 
 	haveSignature := map[string]bool{}
 	for _, p := range plans {
@@ -580,7 +593,7 @@ func normalizeJourneyRequest(req JourneyRequest) JourneyRequest {
 		req.MaxWalkKm = 1.0
 	}
 	if req.WalkSpeedKmph <= 0 {
-		req.WalkSpeedKmph = 4.8
+		req.WalkSpeedKmph = DefaultWalkSpeedKmph
 	}
 	// Keep an explicit zero transfer request ("direct service only") intact.
 	if req.MaxTransfers < 0 {
@@ -729,136 +742,148 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 	onlyRoutes := allowedRouteSet(routeMap, req.OnlyRouteIDs, req.AllowedRouteTypes)
 	transferGraph := transferGraphAtSpeed(v.stopTransferGraph(stopMap, req.IncludeChildren), req.WalkSpeedKmph)
 	transferGapSec := minDirectTransferSeconds + req.MinTransferSec
-	latest := make(map[string]int, len(stopMap))
-	successor := make(map[string]stopSuccessor, len(stopMap))
-	updated := make(map[string]bool, len(stopMap))
-	endStopDistances := make(map[string]float64, len(nearbyEndStops))
-	const negInf = -1
-	for stopID := range stopMap {
-		latest[stopID] = negInf
-	}
-
-	for _, candidate := range nearbyEndStops {
-		walkSeconds := walkDurationSeconds(candidate.Distance, req.WalkSpeedKmph)
-		timeAtStop := arriveSec - walkSeconds
-		if timeAtStop < 0 {
-			continue
+	// scan runs the reverse RAPTOR loop within a transfer budget (0 = direct
+	// services only) and turns it into itineraries.
+	scan := func(maxTransfers int) []JourneyPlan {
+		latest := make(map[string]int, len(stopMap))
+		successor := make(map[string]stopSuccessor, len(stopMap))
+		updated := make(map[string]bool, len(stopMap))
+		endStopDistances := make(map[string]float64, len(nearbyEndStops))
+		const negInf = -1
+		for stopID := range stopMap {
+			latest[stopID] = negInf
 		}
-		if timeAtStop > latest[candidate.Stop.StopId] {
-			latest[candidate.Stop.StopId] = timeAtStop
-			updated[candidate.Stop.StopId] = true
-			endStopDistances[candidate.Stop.StopId] = candidate.Distance
-			successor[candidate.Stop.StopId] = stopSuccessor{
-				ToStopID:  "",
-				TripID:    "",
-				RouteID:   "",
-				DepartSec: timeAtStop,
-				ArriveSec: arriveSec,
-				Mode:      "walk-destination",
-			}
-		}
-	}
 
-	// inside planJourneysRaptorArriveAt (arrive-by reverse scan)
-	for round := 0; round <= req.MaxTransfers; round++ {
-		nextUpdated := make(map[string]bool)
-		for _, tripTimes := range trips {
-			if len(tripTimes) > 0 && !routeAllowed(tripTimes[0].RouteID, onlyRoutes, nil) {
+		for _, candidate := range nearbyEndStops {
+			walkSeconds := walkDurationSeconds(candidate.Distance, req.WalkSpeedKmph)
+			timeAtStop := arriveSec - walkSeconds
+			if timeAtStop < 0 {
 				continue
 			}
-			alightPossible := false
-			downstreamStopID := ""
-			downstreamArriveSec := 0
-			downstreamScheduledArriveSec := 0
-			for i := len(tripTimes) - 1; i >= 0; i-- {
-				stopTime := tripTimes[i]
-				if !alightPossible {
-					isTransfer := round > 0
-					if stopTime.TripUsable && stopTime.Alightable &&
-						updated[stopTime.StopID] &&
-						canAlightForTransitConnection(stopTime.ArrivalSec, latest[stopTime.StopID], isTransfer, transferGapSec) {
-						alightPossible = true
-						downstreamStopID = stopTime.StopID
-						downstreamArriveSec = stopTime.ArrivalSec
-						downstreamScheduledArriveSec = stopTime.ScheduledArrivalSec
-					}
+			if timeAtStop > latest[candidate.Stop.StopId] {
+				latest[candidate.Stop.StopId] = timeAtStop
+				updated[candidate.Stop.StopId] = true
+				endStopDistances[candidate.Stop.StopId] = candidate.Distance
+				successor[candidate.Stop.StopId] = stopSuccessor{
+					ToStopID:  "",
+					TripID:    "",
+					RouteID:   "",
+					DepartSec: timeAtStop,
+					ArriveSec: arriveSec,
+					Mode:      "walk-destination",
+				}
+			}
+		}
+
+		// inside planJourneysRaptorArriveAt (arrive-by reverse scan)
+		for round := 0; round <= maxTransfers; round++ {
+			nextUpdated := make(map[string]bool)
+			for _, tripTimes := range trips {
+				if len(tripTimes) > 0 && !routeAllowed(tripTimes[0].RouteID, onlyRoutes, nil) {
 					continue
 				}
-
-				if stopTime.TripUsable && stopTime.Boardable && stopTime.DepartureSec <= downstreamArriveSec && stopTime.DepartureSec > latest[stopTime.StopID] {
-					latest[stopTime.StopID] = stopTime.DepartureSec
-					successor[stopTime.StopID] = stopSuccessor{
-						ToStopID:           downstreamStopID,
-						TripID:             stopTime.TripID,
-						RouteID:            stopTime.RouteID,
-						DepartSec:          stopTime.DepartureSec,
-						ArriveSec:          downstreamArriveSec,
-						ScheduledDepartSec: stopTime.ScheduledDepartureSec,
-						ScheduledArriveSec: downstreamScheduledArriveSec,
-						RealtimeStatus:     stopTime.RealtimeStatus,
-						TripUsable:         stopTime.TripUsable,
-						Mode:               "transit",
+				alightPossible := false
+				downstreamStopID := ""
+				downstreamArriveSec := 0
+				downstreamScheduledArriveSec := 0
+				for i := len(tripTimes) - 1; i >= 0; i-- {
+					stopTime := tripTimes[i]
+					if !alightPossible {
+						isTransfer := round > 0
+						if stopTime.TripUsable && stopTime.Alightable &&
+							updated[stopTime.StopID] &&
+							canAlightForTransitConnection(stopTime.ArrivalSec, latest[stopTime.StopID], isTransfer, transferGapSec) {
+							alightPossible = true
+							downstreamStopID = stopTime.StopID
+							downstreamArriveSec = stopTime.ArrivalSec
+							downstreamScheduledArriveSec = stopTime.ScheduledArrivalSec
+						}
+						continue
 					}
-					nextUpdated[stopTime.StopID] = true
+
+					if stopTime.TripUsable && stopTime.Boardable && stopTime.DepartureSec <= downstreamArriveSec && stopTime.DepartureSec > latest[stopTime.StopID] {
+						latest[stopTime.StopID] = stopTime.DepartureSec
+						successor[stopTime.StopID] = stopSuccessor{
+							ToStopID:           downstreamStopID,
+							TripID:             stopTime.TripID,
+							RouteID:            stopTime.RouteID,
+							DepartSec:          stopTime.DepartureSec,
+							ArriveSec:          downstreamArriveSec,
+							ScheduledDepartSec: stopTime.ScheduledDepartureSec,
+							ScheduledArriveSec: downstreamScheduledArriveSec,
+							RealtimeStatus:     stopTime.RealtimeStatus,
+							TripUsable:         stopTime.TripUsable,
+							Mode:               "transit",
+						}
+						nextUpdated[stopTime.StopID] = true
+					}
 				}
 			}
-		}
 
-		if round < req.MaxTransfers && len(nextUpdated) > 0 {
-			transitUpdated := make([]string, 0, len(nextUpdated))
-			for id := range nextUpdated {
-				transitUpdated = append(transitUpdated, id)
+			if round < maxTransfers && len(nextUpdated) > 0 {
+				transitUpdated := make([]string, 0, len(nextUpdated))
+				for id := range nextUpdated {
+					transitUpdated = append(transitUpdated, id)
+				}
+				relaxFootTransfersArriveAt(transitUpdated, transferGraph, latest, successor, nextUpdated)
 			}
-			relaxFootTransfersArriveAt(transitUpdated, transferGraph, latest, successor, nextUpdated)
+
+			if len(nextUpdated) == 0 {
+				break
+			}
+			updated = nextUpdated
 		}
 
-		if len(nextUpdated) == 0 {
-			break
+		candidateLimit := expandedCandidateLimit(req.MaxResults)
+		candidates := selectBestOriginsArriveAt(nearbyStartStops, latest, req.WalkSpeedKmph, candidateLimit)
+		if len(candidates) == 0 {
+			return nil
 		}
-		updated = nextUpdated
+
+		var plans []JourneyPlan
+		for _, candidate := range candidates {
+			startTimeAtStop := latest[candidate.Stop.Stop.StopId]
+			legs, transfers, transferStops := buildJourneyLegsArriveAt(candidate.Stop, candidate.DepartSec, startTimeAtStop, successor, stopMap, routeMap, dayStart, req.WalkSpeedKmph, req.StartLat, req.StartLon, req.EndLat, req.EndLon, endStopDistances)
+			if len(legs) == 0 {
+				continue
+			}
+			legs = mergeAdjacentWalkLegs(legs)
+			legs = deferOriginWalk(legs)
+			departAt := dayStart.Add(time.Duration(candidate.DepartSec) * time.Second)
+			if len(legs) > 0 && legs[0].Mode == "walk" {
+				departAt = legs[0].DepartureTime
+			}
+			arrivalTime := legs[len(legs)-1].ArrivalTime
+			plan := JourneyPlan{
+				StartLat:      req.StartLat,
+				StartLon:      req.StartLon,
+				EndLat:        req.EndLat,
+				EndLon:        req.EndLon,
+				DepartureTime: departAt,
+				ArrivalTime:   arrivalTime,
+				TotalDuration: arrivalTime.Sub(departAt),
+				Transfers:     transfers,
+				TransferStops: transferStops,
+				Legs:          legs,
+				ID:            uuid.NewString(),
+			}
+			plans = append(plans, plan)
+		}
+		return plans
 	}
 
-	candidateLimit := expandedCandidateLimit(req.MaxResults)
-	candidates := selectBestOriginsArriveAt(nearbyStartStops, latest, req.WalkSpeedKmph, candidateLimit)
-	if len(candidates) == 0 {
+	plans := scan(req.MaxTransfers)
+	// RAPTOR keeps one latest departure per stop, so a direct service that
+	// leaves a couple of minutes before a two-bus option never surfaces. Scan
+	// direct-only as well and let the ranking's transfer penalty choose.
+	if req.MaxTransfers > 0 {
+		plans = append(plans, scan(0)...)
+	}
+	if len(plans) == 0 {
 		return nil, noOnlyRouteJourneyError(req)
 	}
 
-	var plans []JourneyPlan
-	for _, candidate := range candidates {
-		startTimeAtStop := latest[candidate.Stop.Stop.StopId]
-		legs, transfers, transferStops := buildJourneyLegsArriveAt(candidate.Stop, candidate.DepartSec, startTimeAtStop, successor, stopMap, routeMap, dayStart, req.WalkSpeedKmph, req.StartLat, req.StartLon, req.EndLat, req.EndLon, endStopDistances)
-		if len(legs) == 0 {
-			continue
-		}
-		legs = mergeAdjacentWalkLegs(legs)
-		legs = deferOriginWalk(legs)
-		departAt := dayStart.Add(time.Duration(candidate.DepartSec) * time.Second)
-		if len(legs) > 0 && legs[0].Mode == "walk" {
-			departAt = legs[0].DepartureTime
-		}
-		arrivalTime := legs[len(legs)-1].ArrivalTime
-		plan := JourneyPlan{
-			StartLat:      req.StartLat,
-			StartLon:      req.StartLon,
-			EndLat:        req.EndLat,
-			EndLon:        req.EndLon,
-			DepartureTime: departAt,
-			ArrivalTime:   arrivalTime,
-			TotalDuration: arrivalTime.Sub(departAt),
-			Transfers:     transfers,
-			TransferStops: transferStops,
-			Legs:          legs,
-			ID:            uuid.NewString(),
-		}
-		plans = append(plans, plan)
-	}
-
-	if len(plans) == 0 {
-		return nil, errors.New("no journey legs available")
-	}
-
-	plans = dedupePlansByTransitService(plans, req.MaxResults)
+	plans = dedupePlansByTransitService(plans, req.MaxResults, planRanking{ref: arriveAt, arriveBy: true})
 	if len(plans) == 0 {
 		return nil, errors.New("no journey legs available")
 	}
@@ -1878,25 +1903,57 @@ func selectBestOriginsArriveAt(candidates []StopWithDistance, latest map[string]
 	return results
 }
 
-func dedupePlansByTransitService(plans []JourneyPlan, maxResults int) []JourneyPlan {
+// DefaultWalkSpeedKmph is the walking pace used when a request doesn't give
+// one - a relaxed 4 km/h rather than the textbook 4.8, which left riders
+// short of time once crossings, hills and finding the stop were counted.
+const DefaultWalkSpeedKmph = 4.0
+
+// transferPenalty is how much extra time a change of vehicle "costs" when
+// ranking itineraries: a direct service up to this much slower per avoided
+// change still ranks first.
+const transferPenalty = 10 * time.Minute
+
+// planRanking orders itineraries by the time they take out of the rider's day
+// plus transferPenalty per change. For depart-after that's arrival minus the
+// requested departure; for arrive-by it's the requested arrival minus when the
+// rider has to leave - so a direct bus that means leaving five minutes
+// earlier still beats a tighter two-bus option.
+type planRanking struct {
+	ref      time.Time
+	arriveBy bool
+}
+
+func (r planRanking) cost(p JourneyPlan) time.Duration {
+	span := p.TotalDuration
+	if !r.ref.IsZero() {
+		if r.arriveBy {
+			span = r.ref.Sub(p.DepartureTime)
+		} else {
+			span = p.ArrivalTime.Sub(r.ref)
+		}
+	}
+	return span + time.Duration(p.Transfers)*transferPenalty
+}
+
+func (r planRanking) less(a, b JourneyPlan) bool {
+	if ca, cb := r.cost(a), r.cost(b); ca != cb {
+		return ca < cb
+	}
+	if a.Transfers != b.Transfers {
+		return a.Transfers < b.Transfers
+	}
+	if wa, wb := totalWalkDistance(a), totalWalkDistance(b); wa != wb {
+		return wa < wb
+	}
+	return a.ArrivalTime.Before(b.ArrivalTime)
+}
+
+func dedupePlansByTransitService(plans []JourneyPlan, maxResults int, rank planRanking) []JourneyPlan {
 	if len(plans) <= 1 {
 		return plans
 	}
 
-	sort.SliceStable(plans, func(i, j int) bool {
-		if plans[i].TotalDuration != plans[j].TotalDuration {
-			return plans[i].TotalDuration < plans[j].TotalDuration
-		}
-		if plans[i].Transfers != plans[j].Transfers {
-			return plans[i].Transfers < plans[j].Transfers
-		}
-		walkI := totalWalkDistance(plans[i])
-		walkJ := totalWalkDistance(plans[j])
-		if walkI != walkJ {
-			return walkI < walkJ
-		}
-		return plans[i].ArrivalTime.Before(plans[j].ArrivalTime)
-	})
+	sort.SliceStable(plans, func(i, j int) bool { return rank.less(plans[i], plans[j]) })
 
 	byService := make(map[string]JourneyPlan, len(plans))
 	for _, plan := range plans {
@@ -1911,20 +1968,7 @@ func dedupePlansByTransitService(plans []JourneyPlan, maxResults int) []JourneyP
 		result = append(result, plan)
 	}
 
-	sort.SliceStable(result, func(i, j int) bool {
-		if result[i].TotalDuration != result[j].TotalDuration {
-			return result[i].TotalDuration < result[j].TotalDuration
-		}
-		if result[i].Transfers != result[j].Transfers {
-			return result[i].Transfers < result[j].Transfers
-		}
-		walkI := totalWalkDistance(result[i])
-		walkJ := totalWalkDistance(result[j])
-		if walkI != walkJ {
-			return walkI < walkJ
-		}
-		return result[i].ArrivalTime.Before(result[j].ArrivalTime)
-	})
+	sort.SliceStable(result, func(i, j int) bool { return rank.less(result[i], result[j]) })
 
 	if maxResults > 0 && len(result) > maxResults {
 		result = result[:maxResults]
