@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
@@ -1213,17 +1214,26 @@ func relaxFootTransfersArriveAt(
 	}
 }
 
-// tripStopTimesMemo caches one built loadTripStopTimes result per database, for
-// a short window. Every /services/plan request rebuilds the same ~500k-row map
-// from scratch (SQL scan + realtime overlay), which is the dominant per-request
-// allocation; concurrent plan requests within the TTL now share one read-only
-// copy instead of each materialising their own. Callers MUST NOT mutate the
-// returned map or its slices (the RAPTOR scan only reads them).
+// tripStopTimesMemo caches the planner's per-day trip stop times per database,
+// in two layers:
+//
+//   - static: the day's schedule straight from SQL (~2 s to build for Auckland).
+//     It only changes when the feed refreshes (which drops the memo), so it's
+//     kept until the service day changes; a feed refresh drops the memo.
+//   - data: static with the realtime overlay applied. Rebuilt every
+//     tripStopTimesMemoTTL, but that's cheap - a shallow map copy plus fresh
+//     slices for only the trips realtime actually touches.
+//
+// Callers MUST NOT mutate the returned map or its slices (the RAPTOR scan only
+// reads them): unadjusted trips share their slice with the static layer.
 type tripStopTimesMemo struct {
 	mu      sync.Mutex
 	day     string
 	builtAt time.Time
 	data    map[string][]tripStopTime
+
+	staticDay string
+	static    map[string][]tripStopTime
 }
 
 const tripStopTimesMemoTTL = 30 * time.Second
@@ -1259,15 +1269,95 @@ func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsreal
 		return m.data, nil
 	}
 
-	built, err := v.buildTripStopTimes(dayStart, realtimeClient)
-	if err != nil {
+	if err := v.ensureStaticTripStopTimesLocked(m, dayStart, day); err != nil {
 		return nil, err
 	}
+
+	realtimeAdjustments := map[string]realtimeTripAdjustment{}
+	if realtimeClient != nil {
+		realtimeAdjustments = loadRealtimeTripAdjustments(realtimeClient)
+	}
+	today := time.Now().In(v.timeZone).Format("20060102")
+	built := applyRealtimeToTripStopTimes(m.static, realtimeAdjustments, day, today)
+
 	m.data, m.day, m.builtAt = built, day, time.Now()
 	return built, nil
 }
 
+// ensureStaticTripStopTimesLocked (re)builds m's static layer for `day` if it
+// holds another day or nothing. m.mu must be held.
+func (v Database) ensureStaticTripStopTimesLocked(m *tripStopTimesMemo, dayStart time.Time, day string) error {
+	if m.static != nil && m.staticDay == day {
+		return nil
+	}
+	// Drop the old day before building the next so two days' worth of stop
+	// times are never held at once.
+	m.static, m.data = nil, nil
+	static, err := v.buildStaticTripStopTimes(dayStart)
+	if err != nil {
+		return err
+	}
+	m.static, m.staticDay = static, day
+	return nil
+}
+
+// EnableJourneyPlannerWarmup keeps the journey planner's caches built ahead of
+// requests, so no rider pays for them: today's scheduled stop times (~2 s to
+// build for Auckland) and the stop transfer graph. It warms once now, again
+// after every feed refresh, and checks each minute for a new service day or an
+// expired transfer graph. Plans use child stops (IncludeChildren), matching
+// how the backend calls the planner.
+func (v Database) EnableJourneyPlannerWarmup() {
+	go func() {
+		refreshed := v.refreshNotifier.Subscribe()
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			v.warmJourneyPlanner()
+			select {
+			case <-refreshed:
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func (v Database) warmJourneyPlanner() {
+	now := time.Now().In(v.timeZone)
+	dayStart := serviceDayStart(now, v.timeZone)
+	mi, _ := tripStopTimesMemos.LoadOrStore(v.name, &tripStopTimesMemo{})
+	m := mi.(*tripStopTimesMemo)
+	m.mu.Lock()
+	err := v.ensureStaticTripStopTimesLocked(m, dayStart, serviceDayNoon(dayStart).Format("20060102"))
+	m.mu.Unlock()
+	if err != nil {
+		log.Printf("gtfs: journey planner warmup for %s: %v", v.name, err)
+	}
+
+	if stopMap, err := v.GetStopsMap(true); err == nil {
+		v.stopTransferGraph(stopMap, true)
+	}
+}
+
+// buildTripStopTimes builds one day's trip stop times with realtime applied,
+// bypassing the memo.
 func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrealtime.Realtime) (map[string][]tripStopTime, error) {
+	static, err := v.buildStaticTripStopTimes(dayStart)
+	if err != nil {
+		return nil, err
+	}
+	realtimeAdjustments := map[string]realtimeTripAdjustment{}
+	if realtimeClient != nil {
+		realtimeAdjustments = loadRealtimeTripAdjustments(realtimeClient)
+	}
+	day := serviceDayNoon(dayStart).Format("20060102")
+	today := time.Now().In(v.timeZone).Format("20060102")
+	return applyRealtimeToTripStopTimes(static, realtimeAdjustments, day, today), nil
+}
+
+// buildStaticTripStopTimes loads one service day's scheduled stop times from
+// SQL, grouped by trip and in stop_sequence order. No realtime is applied.
+func (v Database) buildStaticTripStopTimes(dayStart time.Time) (map[string][]tripStopTime, error) {
 	weekday := strings.ToLower(serviceDayNoon(dayStart).Weekday().String()) // "monday", "tuesday", etc.
 
 	query := fmt.Sprintf(`
@@ -1314,7 +1404,6 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 	`, weekday)
 
 	day := serviceDayNoon(dayStart).Format("20060102")
-	today := time.Now().In(v.timeZone).Format("20060102")
 
 	rows, err := v.db.Query(query, day, day, day, day)
 	if err != nil {
@@ -1323,10 +1412,6 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 	defer rows.Close()
 
 	trips := make(map[string][]tripStopTime)
-	realtimeAdjustments := map[string]realtimeTripAdjustment{}
-	if realtimeClient != nil {
-		realtimeAdjustments = loadRealtimeTripAdjustments(realtimeClient)
-	}
 
 	for rows.Next() {
 		var tripID, routeID, stopID, arrivalTime, departureTime string
@@ -1355,12 +1440,63 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 			departureSec = arrivalSec
 		}
 
-		realtimeStatus := "scheduled"
-		tripUsable := true
-		scheduledArrivalSec := arrivalSec
-		scheduledDepartureSec := departureSec
+		trips[tripID] = append(trips[tripID], tripStopTime{
+			StopID:                stopID,
+			StopSequence:          sequence,
+			ArrivalSec:            arrivalSec,
+			DepartureSec:          departureSec,
+			RouteID:               routeID,
+			TripID:                tripID,
+			ArrivalTime:           arrivalTime,
+			DepartureTime:         departureTime,
+			ScheduledArrivalSec:   arrivalSec,
+			ScheduledDepartureSec: departureSec,
+			RealtimeStatus:        "scheduled",
+			TripUsable:            true,
+			Boardable:             pickupType == 0,
+			Alightable:            dropOffType == 0,
+		})
+	}
 
-		if adj, ok := realtimeAdjustments[tripID]; ok && shouldApplyRealtimeAdjustment(adj, day, today) {
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(trips) == 0 {
+		return nil, errors.New("no trip times found for active services")
+	}
+
+	// Rows arrive ORDER BY trip_id, stop_sequence, so each slice is already in
+	// sequence order - clamp any out-of-order feed times.
+	for tripID := range trips {
+		enforceMonotonicStopTimes(trips[tripID])
+	}
+
+	return trips, nil
+}
+
+// applyRealtimeToTripStopTimes returns static with the realtime adjustments for
+// service day `day` applied. It never mutates static: the result is a shallow
+// copy of the map in which only adjusted trips get a fresh slice, so it costs
+// O(trips + adjusted stops) rather than a full rebuild.
+func applyRealtimeToTripStopTimes(static map[string][]tripStopTime, realtimeAdjustments map[string]realtimeTripAdjustment, day, today string) map[string][]tripStopTime {
+	trips := make(map[string][]tripStopTime, len(static))
+	for tripID, stopTimes := range static {
+		trips[tripID] = stopTimes
+	}
+
+	for tripID, adj := range realtimeAdjustments {
+		scheduled, ok := static[tripID]
+		if !ok || !shouldApplyRealtimeAdjustment(adj, day, today) {
+			continue
+		}
+		adjusted := make([]tripStopTime, len(scheduled))
+		for i, stopTime := range scheduled {
+			stopID, sequence := stopTime.StopID, stopTime.StopSequence
+			scheduledArrivalSec, scheduledDepartureSec := stopTime.ScheduledArrivalSec, stopTime.ScheduledDepartureSec
+			arrivalSec, departureSec := scheduledArrivalSec, scheduledDepartureSec
+			realtimeStatus := stopTime.RealtimeStatus
+			tripUsable := stopTime.TripUsable
 
 			// Apply trip-level delay first
 			arrivalSec += adj.tripDelay
@@ -1404,41 +1540,18 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 					realtimeStatus = "on_time"
 				}
 			}
+
+			stopTime.ArrivalSec = clampNonNegative(arrivalSec)
+			stopTime.DepartureSec = clampNonNegative(departureSec)
+			stopTime.RealtimeStatus = realtimeStatus
+			stopTime.TripUsable = tripUsable
+			adjusted[i] = stopTime
 		}
-
-		trips[tripID] = append(trips[tripID], tripStopTime{
-			StopID:                stopID,
-			StopSequence:          sequence,
-			ArrivalSec:            clampNonNegative(arrivalSec),
-			DepartureSec:          clampNonNegative(departureSec),
-			RouteID:               routeID,
-			TripID:                tripID,
-			ArrivalTime:           arrivalTime,
-			DepartureTime:         departureTime,
-			ScheduledArrivalSec:   scheduledArrivalSec,
-			ScheduledDepartureSec: scheduledDepartureSec,
-			RealtimeStatus:        realtimeStatus,
-			TripUsable:            tripUsable,
-			Boardable:             pickupType == 0,
-			Alightable:            dropOffType == 0,
-		})
+		enforceMonotonicStopTimes(adjusted)
+		trips[tripID] = adjusted
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	if len(trips) == 0 {
-		return nil, errors.New("no trip times found for active services")
-	}
-
-	// Rows arrive ORDER BY trip_id, stop_sequence, so each slice is already in
-	// sequence order - clamp any realtime-adjusted times back into order.
-	for tripID := range trips {
-		enforceMonotonicStopTimes(trips[tripID])
-	}
-
-	return trips, nil
+	return trips
 }
 
 func clampNonNegative(value int) int {
@@ -2489,7 +2602,79 @@ func buildWalkFeature(osrmURL string, startLat, startLon, endLat, endLon float64
 	return straightLineWalkFeature(startLat, startLon, endLat, endLon)
 }
 
+// osrmWalkCache remembers OSRM walking routes, since the same walks (a saved
+// place to its stop, a change between two stops) come up plan after plan and
+// each one is a 150-300 ms round-trip. Keyed to ~1 m. Only real OSRM routes are
+// cached, never the straight-line fallback.
+var osrmWalkCache = struct {
+	mu      sync.Mutex
+	entries map[string]osrmWalkCacheEntry
+}{entries: map[string]osrmWalkCacheEntry{}}
+
+type osrmWalkCacheEntry struct {
+	feature  map[string]interface{}
+	cachedAt time.Time
+}
+
+const (
+	osrmWalkCacheMax = 2000
+	osrmWalkCacheTTL = 24 * time.Hour
+)
+
 func osrmWalkFeature(osrmURL string, startLat, startLon, endLat, endLon float64) (map[string]interface{}, bool) {
+	key := fmt.Sprintf("%s|%.5f,%.5f;%.5f,%.5f", osrmURL, startLat, startLon, endLat, endLon)
+	osrmWalkCache.mu.Lock()
+	entry, ok := osrmWalkCache.entries[key]
+	osrmWalkCache.mu.Unlock()
+	if ok && time.Since(entry.cachedAt) < osrmWalkCacheTTL {
+		return cloneWalkFeature(entry.feature), true
+	}
+
+	feature, ok := fetchOsrmWalkFeature(osrmURL, startLat, startLon, endLat, endLon)
+	if !ok {
+		return nil, false
+	}
+
+	osrmWalkCache.mu.Lock()
+	if len(osrmWalkCache.entries) >= osrmWalkCacheMax {
+		// Drop expired entries, then (still full) an arbitrary tenth.
+		for k, e := range osrmWalkCache.entries {
+			if time.Since(e.cachedAt) >= osrmWalkCacheTTL {
+				delete(osrmWalkCache.entries, k)
+			}
+		}
+		for k := range osrmWalkCache.entries {
+			if len(osrmWalkCache.entries) < osrmWalkCacheMax*9/10 {
+				break
+			}
+			delete(osrmWalkCache.entries, k)
+		}
+	}
+	osrmWalkCache.entries[key] = osrmWalkCacheEntry{feature: feature, cachedAt: time.Now()}
+	osrmWalkCache.mu.Unlock()
+
+	return cloneWalkFeature(feature), true
+}
+
+// cloneWalkFeature copies a cached feature's maps so a caller can tag its
+// properties without touching the cache. The coordinates are shared and
+// read-only.
+func cloneWalkFeature(feature map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(feature))
+	for k, val := range feature {
+		if m, ok := val.(map[string]interface{}); ok {
+			copied := make(map[string]interface{}, len(m))
+			for mk, mv := range m {
+				copied[mk] = mv
+			}
+			val = copied
+		}
+		out[k] = val
+	}
+	return out
+}
+
+func fetchOsrmWalkFeature(osrmURL string, startLat, startLon, endLat, endLon float64) (map[string]interface{}, bool) {
 	normalized := strings.TrimRight(osrmURL, "/")
 	endpoint := fmt.Sprintf("%s/route/v1/foot/%f,%f;%f,%f", normalized, startLon, startLat, endLon, endLat)
 	query := url.Values{}

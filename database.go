@@ -576,8 +576,9 @@ func (v Database) refreshDatabaseData() error {
 
 	fmt.Println("Data updated successfully.")
 
-	// The fresh feed may change today's schedule - drop the short-lived
-	// loadTripStopTimes memo so the next plan rebuilds against the new data.
+	// The fresh feed may change today's schedule - drop the loadTripStopTimes
+	// memo (static schedule + realtime overlay) so the next plan rebuilds
+	// against the new data.
 	tripStopTimesMemos.Delete(v.name)
 
 	v.refreshNotifier.broadcast()

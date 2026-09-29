@@ -3,6 +3,8 @@ package gtfs
 import (
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -726,5 +728,64 @@ func TestRankingPrefersDirectWithinTransferPenalty(t *testing.T) {
 func TestNormalizeJourneyRequestDefaultWalkSpeed(t *testing.T) {
 	if got := normalizeJourneyRequest(JourneyRequest{}).WalkSpeedKmph; got != DefaultWalkSpeedKmph {
 		t.Fatalf("default walk speed = %v, want %v", got, DefaultWalkSpeedKmph)
+	}
+}
+
+func TestApplyRealtimeToTripStopTimesLeavesStaticUntouched(t *testing.T) {
+	static := map[string][]tripStopTime{
+		"late": {
+			{TripID: "late", StopID: "a", StopSequence: 1, ArrivalSec: 100, DepartureSec: 100, ScheduledArrivalSec: 100, ScheduledDepartureSec: 100, RealtimeStatus: "scheduled", TripUsable: true},
+			{TripID: "late", StopID: "b", StopSequence: 2, ArrivalSec: 200, DepartureSec: 200, ScheduledArrivalSec: 200, ScheduledDepartureSec: 200, RealtimeStatus: "scheduled", TripUsable: true},
+		},
+		"gone":  {{TripID: "gone", StopID: "a", StopSequence: 1, ArrivalSec: 50, DepartureSec: 50, ScheduledArrivalSec: 50, ScheduledDepartureSec: 50, RealtimeStatus: "scheduled", TripUsable: true}},
+		"plain": {{TripID: "plain", StopID: "a", StopSequence: 1, ArrivalSec: 70, DepartureSec: 70, ScheduledArrivalSec: 70, ScheduledDepartureSec: 70, RealtimeStatus: "scheduled", TripUsable: true}},
+	}
+	adjustments := map[string]realtimeTripAdjustment{
+		"late": {hasRealtime: true, tripDelay: 60, stopBySeq: map[int]realtimeStopAdjustment{}, stopByID: map[string]realtimeStopAdjustment{}},
+		"gone": {hasRealtime: true, tripCanceled: true, stopBySeq: map[int]realtimeStopAdjustment{}, stopByID: map[string]realtimeStopAdjustment{}},
+	}
+
+	got := applyRealtimeToTripStopTimes(static, adjustments, "20260930", "20260930")
+
+	if got["late"][1].ArrivalSec != 260 || got["late"][1].RealtimeStatus != "delayed" {
+		t.Fatalf("delay not applied: %+v", got["late"][1])
+	}
+	if got["gone"][0].TripUsable {
+		t.Fatalf("cancellation not applied: %+v", got["gone"][0])
+	}
+	if &got["plain"][0] != &static["plain"][0] {
+		t.Fatalf("unadjusted trip should share the static slice")
+	}
+	if static["late"][1].ArrivalSec != 200 || static["late"][1].RealtimeStatus != "scheduled" || !static["gone"][0].TripUsable {
+		t.Fatalf("static schedule was mutated: %+v %+v", static["late"][1], static["gone"][0])
+	}
+
+	// A different service day ignores the date-less realtime entirely.
+	future := applyRealtimeToTripStopTimes(static, adjustments, "20261001", "20260930")
+	if future["late"][1].ArrivalSec != 200 || !future["gone"][0].TripUsable {
+		t.Fatalf("realtime leaked onto another day: %+v %+v", future["late"][1], future["gone"][0])
+	}
+}
+
+func TestOsrmWalkFeatureIsCached(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		fmt.Fprint(w, `{"code":"Ok","routes":[{"geometry":{"type":"LineString","coordinates":[[174.1,-36.1],[174.2,-36.2]]},"distance":120,"duration":90}]}`)
+	}))
+	defer srv.Close()
+
+	first := buildWalkFeature(srv.URL, -36.1, 174.1, -36.2, 174.2)
+	first["properties"].(map[string]interface{})["from_stop_id"] = "tagged"
+	second := buildWalkFeature(srv.URL, -36.1, 174.1, -36.2, 174.2)
+
+	if calls != 1 {
+		t.Fatalf("OSRM called %d times, want 1", calls)
+	}
+	if _, leaked := second["properties"].(map[string]interface{})["from_stop_id"]; leaked {
+		t.Fatalf("a caller's property tag leaked into the cache")
+	}
+	if second["properties"].(map[string]interface{})["distance_meters"] != 120.0 {
+		t.Fatalf("cached feature lost its properties: %+v", second["properties"])
 	}
 }
