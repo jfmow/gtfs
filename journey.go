@@ -68,6 +68,11 @@ type JourneyLeg struct {
 	RealtimeStatus         string    `json:"realtime_status,omitempty"`
 	DelaySeconds           int       `json:"delay_seconds,omitempty"`
 	TripUsable             bool      `json:"trip_usable"`
+	// VehicleTracked is true when the realtime vehicle-positions feed has a
+	// vehicle reporting on this leg's trip at plan time. RealtimeStatus alone
+	// can't say this: feeds publish trip updates (and so "on_time") for trips
+	// hours before any vehicle is assigned to them.
+	VehicleTracked bool `json:"vehicle_tracked"`
 }
 
 type JourneyPlan struct {
@@ -176,6 +181,52 @@ func (v Database) PlanJourneyRaptor(req JourneyRequest) (*[]JourneyPlan, error) 
 
 // PlanJourneysRaptor computes multiple journey options between two coordinates using a RAPTOR-style scan.
 func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) {
+	plans, err := v.planJourneysRaptor(req)
+	if err != nil || req.Realtime == nil {
+		return plans, err
+	}
+	if vehicles, vErr := req.Realtime.GetVehicles(); vErr == nil {
+		markVehicleTracked(plans, vehicles, time.Now().In(v.timeZone), v.timeZone)
+	}
+	return plans, nil
+}
+
+// markVehicleTracked sets JourneyLeg.VehicleTracked on each transit leg whose
+// trip has a vehicle reporting. A trip ID can repeat across service days, so a
+// vehicle only counts for the leg's own service day: a vehicle's start_date
+// must be the leg's departure date (or the day before, for a small-hours leg on
+// a trip running past midnight); a vehicle without one only counts for a leg
+// departing today.
+func markVehicleTracked(plans []JourneyPlan, vehicles gtfsrealtime.VehiclesMap, now time.Time, loc *time.Location) {
+	today := now.Format("20060102")
+	for p := range plans {
+		for l := range plans[p].Legs {
+			leg := &plans[p].Legs[l]
+			if leg.Mode != "transit" || leg.TripID == "" {
+				continue
+			}
+			vehicle, ok := vehicles[leg.TripID]
+			if !ok {
+				continue
+			}
+			depart := leg.ScheduledDepartureTime
+			if depart.IsZero() {
+				depart = leg.DepartureTime
+			}
+			depart = depart.In(loc)
+			legDay := depart.Format("20060102")
+			startDate := vehicle.GetTrip().GetStartDate()
+			if startDate == "" {
+				leg.VehicleTracked = legDay == today
+			} else {
+				pastMidnight := depart.Hour() < 6 && startDate == depart.AddDate(0, 0, -1).Format("20060102")
+				leg.VehicleTracked = startDate == legDay || pastMidnight
+			}
+		}
+	}
+}
+
+func (v Database) planJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) {
 	req = normalizeJourneyRequest(req)
 
 	if req.DepartAt.IsZero() && req.ArriveAt.IsZero() {
