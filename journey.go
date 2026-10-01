@@ -395,14 +395,10 @@ func raptorDepartScan(
 	arr := func(id string) int { return arrival[id] }
 
 	for _, candidate := range nearbyStartStops {
-		// The walk leg itself ends at walkArrive, but the stop only counts as
-		// reached (for boarding) once the platform buffer has also elapsed, so
-		// the first service is never one the rider would arrive just in time for.
-		walkArrive := departSec + walkDurationSeconds(candidate.Distance, walkSpeedKmph)
-		t := walkArrive + originWalkBufferSeconds
+		t := departSec + walkDurationSeconds(candidate.Distance, walkSpeedKmph)
 		if t < arr(candidate.Stop.StopId) {
 			arrival[candidate.Stop.StopId] = t
-			predecessor[candidate.Stop.StopId] = stopPredecessor{DepartSec: departSec, ArriveSec: walkArrive, Mode: "walk-origin"}
+			predecessor[candidate.Stop.StopId] = stopPredecessor{DepartSec: departSec, ArriveSec: t, Mode: "walk-origin"}
 			updated[candidate.Stop.StopId] = true
 		}
 	}
@@ -629,7 +625,7 @@ func dropRedundantLeadingHop(legs []JourneyLeg, nearbyStartStops []StopWithDista
 	}
 	// Would the direct origin walk still make route B's departure?
 	arriveByWalk := legs[0].DepartureTime.Add(time.Duration(walkDurationSeconds(boardDist, walkSpeedKmph)) * time.Second)
-	if arriveByWalk.Add(originWalkBufferSeconds * time.Second).After(next.DepartureTime) {
+	if arriveByWalk.After(next.DepartureTime) {
 		return legs
 	}
 	newWalk := JourneyLeg{
@@ -1911,7 +1907,7 @@ func preferCloserOriginStopOnSameTrip(legs []JourneyLeg, nearbyStartStops []Stop
 		}
 
 		walkSeconds := walkDurationSeconds(candidate.Distance, walkSpeedKmph)
-		if departSec+walkSeconds+originWalkBufferSeconds > stopTime.DepartureSec {
+		if departSec+walkSeconds > stopTime.DepartureSec {
 			continue
 		}
 		if candidate.Distance >= originalDistance {
@@ -2039,7 +2035,7 @@ func selectBestOriginsArriveAt(candidates []StopWithDistance, latest map[string]
 			continue
 		}
 		walkSeconds := walkDurationSeconds(candidate.Distance, walkSpeedKmph)
-		departSec := latestAtStop - walkSeconds - originWalkBufferSeconds
+		departSec := latestAtStop - walkSeconds
 		if departSec < 0 {
 			continue
 		}
@@ -2304,12 +2300,7 @@ func buildJourneyLegsArriveAt(startStop StopWithDistance, departSec int, startSt
 	}
 
 	departAt := dayStart.Add(time.Duration(departSec) * time.Second)
-	// The walk ends after its own duration; the rest of the gap up to
-	// startStopTimeSec (at least originWalkBufferSeconds) is time at the stop.
-	startStopTime := departAt.Add(time.Duration(walkDurationSeconds(startStop.Distance, walkSpeedKmph)) * time.Second)
-	if latest := dayStart.Add(time.Duration(startStopTimeSec) * time.Second); startStopTime.After(latest) {
-		startStopTime = latest
-	}
+	startStopTime := dayStart.Add(time.Duration(startStopTimeSec) * time.Second)
 
 	walkLeg := JourneyLeg{
 		Mode:          "walk",
@@ -2442,9 +2433,7 @@ func reverseLegs(legs []JourneyLeg) {
 }
 
 // The rider should reach their first boarding stop this many seconds before the
-// train leaves: no less (the planners only pick a first service the origin walk
-// makes with this much to spare) and no more (deferOriginWalk trims anything
-// longer, since it's dead time on a platform).
+// train leaves, not earlier - anything more is dead time on a platform.
 const originWalkBufferSeconds = 120
 
 // deferOriginWalk pushes a leading "walk to the first stop" leg as late as
