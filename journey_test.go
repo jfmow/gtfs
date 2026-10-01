@@ -789,3 +789,68 @@ func TestOsrmWalkFeatureIsCached(t *testing.T) {
 		t.Fatalf("cached feature lost its properties: %+v", second["properties"])
 	}
 }
+
+func TestRaptorDepartScanKeepsOriginWalkBuffer(t *testing.T) {
+	// 0.4 km at 4.8 km/h = 5 min: leaving 8:00 the rider reaches A at 8:05.
+	// The 8:06 bus is only 1 min after that - too tight to count as catchable -
+	// so the plan must take the 8:08 bus instead.
+	departSec := 8 * 3600
+	trips := map[string][]tripStopTime{
+		"tight": {
+			{TripID: "tight", RouteID: "r", StopID: "A", DepartureSec: departSec + 6*60, TripUsable: true, Boardable: true, Alightable: true},
+			{TripID: "tight", RouteID: "r", StopID: "B", ArrivalSec: departSec + 16*60, TripUsable: true, Boardable: true, Alightable: true},
+		},
+		"ok": {
+			{TripID: "ok", RouteID: "r", StopID: "A", DepartureSec: departSec + 8*60, TripUsable: true, Boardable: true, Alightable: true},
+			{TripID: "ok", RouteID: "r", StopID: "B", ArrivalSec: departSec + 20*60, TripUsable: true, Boardable: true, Alightable: true},
+		},
+	}
+	stopMap := map[string]Stop{
+		"A": {StopId: "A", StopLat: -36.84, StopLon: 174.77},
+		"B": {StopId: "B", StopLat: -36.83, StopLon: 174.80},
+	}
+	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.4}}
+
+	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, departSec, 0, 4.8, minDirectTransferSeconds, nil, nil)
+
+	if pred["B"].TripID != "ok" || arrival["B"] != departSec+20*60 {
+		t.Fatalf("expected the 8:08 bus (arrive 8:20), got trip %q arriving %d", pred["B"].TripID, arrival["B"])
+	}
+	// The walk leg itself still ends when the rider actually reaches the stop.
+	if got, want := pred["A"].ArriveSec, departSec+5*60; got != want {
+		t.Fatalf("walk-origin ArriveSec = %d, want %d (buffer must not lengthen the walk)", got, want)
+	}
+
+	// Exactly the buffer to spare is fine.
+	trips["tight"][0].DepartureSec = departSec + 5*60 + originWalkBufferSeconds
+	_, pred = raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, departSec, 0, 4.8, minDirectTransferSeconds, nil, nil)
+	if pred["B"].TripID != "tight" {
+		t.Fatalf("a bus leaving exactly %ds after the walk should be catchable, got %q", originWalkBufferSeconds, pred["B"].TripID)
+	}
+}
+
+func TestArriveAtOriginWalkKeepsBuffer(t *testing.T) {
+	dayStart := time.Date(2026, 3, 23, 0, 0, 0, 0, time.UTC)
+	stop := Stop{StopId: "A", StopLat: -36.84, StopLon: 174.77}
+	cand := StopWithDistance{Stop: stop, Distance: 0.4} // 5 min walk at 4.8 km/h
+	boardSec := 8*3600 + 10*60
+
+	origins := selectBestOriginsArriveAt([]StopWithDistance{cand}, map[string]int{"A": boardSec}, 4.8, 0)
+	if len(origins) != 1 {
+		t.Fatalf("expected one origin, got %d", len(origins))
+	}
+	if got, want := origins[0].DepartSec, boardSec-5*60-originWalkBufferSeconds; got != want {
+		t.Fatalf("leave at %d, want %d (walk + buffer before boarding)", got, want)
+	}
+
+	legs, _, _ := buildJourneyLegsArriveAt(cand, origins[0].DepartSec, boardSec, map[string]stopSuccessor{}, map[string]Stop{"A": stop}, nil, dayStart, 4.8, 0, 0, 0, 0, nil)
+	if len(legs) == 0 || legs[0].Mode != "walk" {
+		t.Fatalf("expected a leading walk leg, got %+v", legs)
+	}
+	if legs[0].Duration != 5*time.Minute {
+		t.Fatalf("walk duration = %v, want 5m (buffer is time at the stop, not walking)", legs[0].Duration)
+	}
+	if spare := dayStart.Add(time.Duration(boardSec) * time.Second).Sub(legs[0].ArrivalTime); spare != originWalkBufferSeconds*time.Second {
+		t.Fatalf("time at stop before boarding = %v, want %ds", spare, originWalkBufferSeconds)
+	}
+}
