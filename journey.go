@@ -271,6 +271,10 @@ func (v Database) planJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 	onlyRoutes := allowedRouteSet(routeMap, req.OnlyRouteIDs, req.AllowedRouteTypes)
 	transferGraph := transferGraphAtSpeed(v.stopTransferGraph(stopMap, req.IncludeChildren), req.WalkSpeedKmph)
 	transferGapSec := minDirectTransferSeconds + req.MinTransferSec
+	// The rider gets to their first stop originWalkBufferSeconds before it
+	// leaves. Dropped to 0 only when no journey at all allows it (e.g. the last
+	// service of the night is about to go).
+	originGapSec := originWalkBufferSeconds
 
 	// buildPlansWithin runs one RAPTOR scan and turns it into itineraries.
 	// `banned` skips trips on those routes; `fromSec` (0 = use the request's
@@ -285,7 +289,7 @@ func (v Database) planJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			scanAt = dayStart.Add(time.Duration(fromSec) * time.Second)
 		}
 
-		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, scanSec, maxTransfers, req.WalkSpeedKmph, transferGapSec, banned, onlyRoutes)
+		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, scanSec, maxTransfers, req.WalkSpeedKmph, originGapSec, transferGapSec, banned, onlyRoutes)
 
 		candidateLimit := expandedCandidateLimit(req.MaxResults)
 		bestCandidates := selectBestDestinations(nearbyEndStops, arrival, scanSec, req.WalkSpeedKmph, candidateLimit)
@@ -296,10 +300,10 @@ func (v Database) planJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			if len(legs) == 0 {
 				continue
 			}
-			legs = preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, scanAt, dayStart, req.WalkSpeedKmph)
-			legs = dropRedundantLeadingHop(legs, nearbyStartStops, trips, req.WalkSpeedKmph, dayStart)
+			legs = preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, scanAt, dayStart, req.WalkSpeedKmph, originGapSec)
+			legs = dropRedundantLeadingHop(legs, nearbyStartStops, trips, req.WalkSpeedKmph, dayStart, originGapSec)
 			legs = mergeAdjacentWalkLegs(legs)
-			legs = deferOriginWalk(legs)
+			legs = deferOriginWalk(legs, scanAt)
 			// Guard against the round loop's occasional over-count (a foot leg can
 			// smuggle in one more boarding than MaxTransfers): recount from the
 			// final legs and drop anything over budget.
@@ -331,12 +335,23 @@ func (v Database) planJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		return buildPlansWithin(banned, fromSec, req.MaxTransfers)
 	}
 
-	plans := buildPlans(nil, 0)
 	// RAPTOR keeps one earliest arrival per stop, so a direct service that
 	// gets in a couple of minutes after a two-bus option never surfaces. Scan
 	// direct-only as well and let the ranking's transfer penalty choose.
-	if req.MaxTransfers > 0 {
-		plans = append(plans, buildPlansWithin(nil, 0, 0)...)
+	initialPlans := func() []JourneyPlan {
+		plans := buildPlans(nil, 0)
+		if req.MaxTransfers > 0 {
+			plans = append(plans, buildPlansWithin(nil, 0, 0)...)
+		}
+		return plans
+	}
+	plans := initialPlans()
+	if len(plans) == 0 {
+		// Nothing leaves enough time at the first stop - offer the tight
+		// connection rather than no journey (the diversity pass below then
+		// runs tight too).
+		originGapSec = 0
+		plans = initialPlans()
 	}
 	if len(plans) == 0 {
 		return nil, noOnlyRouteJourneyError(req)
@@ -381,7 +396,7 @@ func raptorDepartScan(
 	nearbyStartStops []StopWithDistance,
 	departSec, maxTransfers int,
 	walkSpeedKmph float64,
-	transferGapSec int,
+	originGapSec, transferGapSec int,
 	bannedRoutes map[string]bool,
 	onlyRoutes map[string]bool,
 ) (map[string]int, map[string]stopPredecessor) {
@@ -405,6 +420,12 @@ func raptorDepartScan(
 
 	for round := 0; round <= maxTransfers; round++ {
 		nextUpdated := make(map[string]bool)
+		// Round 0 boards at the stops walked to from the origin; later rounds
+		// are transfers.
+		boardGapSec := transferGapSec
+		if round == 0 {
+			boardGapSec = originGapSec
+		}
 		for _, tripTimes := range trips {
 			if len(tripTimes) > 0 && !routeAllowed(tripTimes[0].RouteID, onlyRoutes, bannedRoutes) {
 				continue
@@ -416,7 +437,7 @@ func raptorDepartScan(
 			for _, stopTime := range tripTimes {
 				if !boarded {
 					if stopTime.TripUsable && stopTime.Boardable && updated[stopTime.StopID] &&
-						canBoardTransitAtStop(arr(stopTime.StopID), stopTime.DepartureSec, round > 0, transferGapSec) {
+						canBoardTransitAtStop(arr(stopTime.StopID), stopTime.DepartureSec, true, boardGapSec) {
 						boarded = true
 						boardStopID = stopTime.StopID
 						boardDepartSec = stopTime.DepartureSec
@@ -597,7 +618,7 @@ func diversifyPlans(
 // route B - but route B's trip also called at, or right by, where they boarded A,
 // early enough to catch. The A leg saved nothing. Splice it out and let the
 // origin walk go straight to B's boarding stop.
-func dropRedundantLeadingHop(legs []JourneyLeg, nearbyStartStops []StopWithDistance, trips map[string][]tripStopTime, walkSpeedKmph float64, dayStart time.Time) []JourneyLeg {
+func dropRedundantLeadingHop(legs []JourneyLeg, nearbyStartStops []StopWithDistance, trips map[string][]tripStopTime, walkSpeedKmph float64, dayStart time.Time, originGapSec int) []JourneyLeg {
 	if len(legs) < 4 || legs[0].Mode != "walk" || legs[1].Mode != "transit" || legs[3].Mode != "transit" {
 		return legs
 	}
@@ -625,7 +646,7 @@ func dropRedundantLeadingHop(legs []JourneyLeg, nearbyStartStops []StopWithDista
 	}
 	// Would the direct origin walk still make route B's departure?
 	arriveByWalk := legs[0].DepartureTime.Add(time.Duration(walkDurationSeconds(boardDist, walkSpeedKmph)) * time.Second)
-	if arriveByWalk.After(next.DepartureTime) {
+	if arriveByWalk.Add(time.Duration(originGapSec) * time.Second).After(next.DepartureTime) {
 		return legs
 	}
 	newWalk := JourneyLeg{
@@ -900,7 +921,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 				continue
 			}
 			legs = mergeAdjacentWalkLegs(legs)
-			legs = deferOriginWalk(legs)
+			legs = deferOriginWalk(legs, time.Time{})
 			departAt := dayStart.Add(time.Duration(candidate.DepartSec) * time.Second)
 			if len(legs) > 0 && legs[0].Mode == "walk" {
 				departAt = legs[0].DepartureTime
@@ -1847,7 +1868,7 @@ func walkDurationSeconds(distanceKm, speedKmph float64) int {
 	return int(math.Round((distanceKm / speedKmph) * 3600))
 }
 
-func preferCloserOriginStopOnSameTrip(legs []JourneyLeg, nearbyStartStops []StopWithDistance, trips map[string][]tripStopTime, stopMap map[string]Stop, departAt, dayStart time.Time, walkSpeedKmph float64) []JourneyLeg {
+func preferCloserOriginStopOnSameTrip(legs []JourneyLeg, nearbyStartStops []StopWithDistance, trips map[string][]tripStopTime, stopMap map[string]Stop, departAt, dayStart time.Time, walkSpeedKmph float64, originGapSec int) []JourneyLeg {
 	if len(legs) < 2 {
 		return legs
 	}
@@ -1907,7 +1928,7 @@ func preferCloserOriginStopOnSameTrip(legs []JourneyLeg, nearbyStartStops []Stop
 		}
 
 		walkSeconds := walkDurationSeconds(candidate.Distance, walkSpeedKmph)
-		if departSec+walkSeconds > stopTime.DepartureSec {
+		if departSec+walkSeconds+originGapSec > stopTime.DepartureSec {
 			continue
 		}
 		if candidate.Distance >= originalDistance {
@@ -2433,21 +2454,27 @@ func reverseLegs(legs []JourneyLeg) {
 }
 
 // The rider should reach their first boarding stop this many seconds before the
-// train leaves, not earlier - anything more is dead time on a platform.
+// service leaves: enough not to miss it, not so much it's dead time on a
+// platform. The depart-at scan only boards a first service that leaves this
+// much time, unless no journey can (see planJourneysRaptor).
 const originWalkBufferSeconds = 120
 
-// deferOriginWalk pushes a leading "walk to the first stop" leg as late as
-// possible: the rider leaves just in time to catch their first service (plus a
-// small platform buffer) rather than immediately, so a big schedule gap isn't
-// shown as time spent standing at the stop. The walk's duration is fixed, so
-// only its start/end shift; the journey's arrival is unchanged. The arrive-by
-// planner already does the equivalent for the final walk.
-func deferOriginWalk(legs []JourneyLeg) []JourneyLeg {
+// deferOriginWalk moves a leading "walk to the first stop" leg so it reaches
+// the stop originWalkBufferSeconds before the first service leaves: later when
+// there's a big schedule gap (so it isn't shown as time standing at the stop),
+// earlier when the walk was planned to arrive right on the departure (the
+// arrive-by planner). It never starts before notBefore (the requested departure;
+// zero for arrive-by). The walk's duration is fixed, so only its start/end
+// shift; the journey's arrival is unchanged.
+func deferOriginWalk(legs []JourneyLeg, notBefore time.Time) []JourneyLeg {
 	if len(legs) < 2 || legs[0].Mode != "walk" || legs[1].Mode != "transit" {
 		return legs
 	}
 	slack := legs[1].DepartureTime.Sub(legs[0].ArrivalTime) - originWalkBufferSeconds*time.Second
-	if slack <= 0 {
+	if !notBefore.IsZero() && legs[0].DepartureTime.Add(slack).Before(notBefore) {
+		slack = notBefore.Sub(legs[0].DepartureTime)
+	}
+	if slack == 0 {
 		return legs
 	}
 	legs[0].DepartureTime = legs[0].DepartureTime.Add(slack)

@@ -59,7 +59,7 @@ func TestPreferCloserOriginStopOnSameTrip(t *testing.T) {
 		"downtown": {StopId: "downtown", StopName: "Downtown"},
 	}
 
-	updated := preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, departAt, dayStart, 4.8)
+	updated := preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, departAt, dayStart, 4.8, 0)
 
 	if got := updated[0].ToStop.StopId; got != "close" {
 		t.Fatalf("expected walk leg to end at close stop, got %q", got)
@@ -124,7 +124,7 @@ func TestPreferCloserOriginStopOnSameTripKeepsOriginalWhenLaterStopUnreachable(t
 		"downtown": {StopId: "downtown", StopName: "Downtown"},
 	}
 
-	updated := preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, departAt, dayStart, 4.8)
+	updated := preferCloserOriginStopOnSameTrip(legs, nearbyStartStops, trips, stopMap, departAt, dayStart, 4.8, 0)
 
 	if got := updated[0].ToStop.StopId; got != "far" {
 		t.Fatalf("expected original stop to remain when closer stop is unreachable, got %q", got)
@@ -258,7 +258,7 @@ func TestDeferOriginWalkRemovesLeadingWait(t *testing.T) {
 		{Mode: "walk", DepartureTime: day.Add(19*time.Hour + 42*time.Minute), ArrivalTime: day.Add(19*time.Hour + 51*time.Minute), Duration: walkDur},
 		{Mode: "transit", DepartureTime: trainDep, ArrivalTime: trainDep.Add(18 * time.Minute), Duration: 18 * time.Minute},
 	}
-	out := deferOriginWalk(legs)
+	out := deferOriginWalk(legs, day.Add(19*time.Hour+42*time.Minute))
 
 	wantArrive := trainDep.Add(-originWalkBufferSeconds * time.Second) // 20:18
 	if !out[0].ArrivalTime.Equal(wantArrive) {
@@ -271,14 +271,52 @@ func TestDeferOriginWalkRemovesLeadingWait(t *testing.T) {
 		t.Fatalf("walk duration changed: %v", out[0].ArrivalTime.Sub(out[0].DepartureTime))
 	}
 
-	// A tight connection (well under the buffer) is left untouched.
+	// A tight connection (well under the buffer) can't start before the
+	// requested departure, so it's left untouched.
 	tight := []JourneyLeg{
 		{Mode: "walk", DepartureTime: day, ArrivalTime: day.Add(walkDur), Duration: walkDur},
 		{Mode: "transit", DepartureTime: day.Add(walkDur + 30*time.Second), ArrivalTime: day.Add(walkDur + 20*time.Minute)},
 	}
-	tightOut := deferOriginWalk(tight)
+	tightOut := deferOriginWalk(tight, day)
 	if !tightOut[0].DepartureTime.Equal(day) {
 		t.Fatalf("expected a tight connection's walk left at its original start, got %v", tightOut[0].DepartureTime)
+	}
+
+	// Arrive-by (no lower bound): a walk planned to land on the departure is
+	// moved earlier so the rider still gets the buffer.
+	arriveBy := []JourneyLeg{
+		{Mode: "walk", DepartureTime: trainDep.Add(-walkDur), ArrivalTime: trainDep, Duration: walkDur},
+		{Mode: "transit", DepartureTime: trainDep, ArrivalTime: trainDep.Add(18 * time.Minute)},
+	}
+	abOut := deferOriginWalk(arriveBy, time.Time{})
+	if !abOut[0].ArrivalTime.Equal(wantArrive) || abOut[0].ArrivalTime.Sub(abOut[0].DepartureTime) != walkDur {
+		t.Fatalf("expected arrive-by walk %v-%v, got %v-%v", wantArrive.Add(-walkDur), wantArrive, abOut[0].DepartureTime, abOut[0].ArrivalTime)
+	}
+}
+
+func TestRaptorDepartScanFirstBoardingNeedsOriginGap(t *testing.T) {
+	// The origin is the stop itself. The 08:00:30 bus leaves 30 s after the
+	// rider gets there; the 08:05 one leaves 5 min after.
+	stopMap := map[string]Stop{
+		"o": {StopId: "o", StopLat: -36.85, StopLon: 174.76},
+		"d": {StopId: "d", StopLat: -36.86, StopLon: 174.77},
+	}
+	mk := func(trip string, dep int) []tripStopTime {
+		return []tripStopTime{
+			{TripID: trip, RouteID: trip, StopID: "o", ArrivalSec: dep, DepartureSec: dep, TripUsable: true, Boardable: true, Alightable: true},
+			{TripID: trip, RouteID: trip, StopID: "d", ArrivalSec: dep + 600, DepartureSec: dep + 600, TripUsable: true, Boardable: true, Alightable: true},
+		}
+	}
+	trips := map[string][]tripStopTime{"tight": mk("tight", 8*3600+30), "later": mk("later", 8*3600+300)}
+	near := []StopWithDistance{{Stop: stopMap["o"], Distance: 0}}
+
+	_, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 8*3600, 2, 4.8, originWalkBufferSeconds, minDirectTransferSeconds, nil, nil)
+	if pred["d"].TripID != "later" {
+		t.Fatalf("expected the 2-min origin gap to skip the 30 s bus, got %q", pred["d"].TripID)
+	}
+	_, pred = raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 8*3600, 2, 4.8, 0, minDirectTransferSeconds, nil, nil)
+	if pred["d"].TripID != "tight" {
+		t.Fatalf("expected the tight fallback to catch the 30 s bus, got %q", pred["d"].TripID)
 	}
 }
 
@@ -361,7 +399,7 @@ func TestRaptorDepartScanRespectsPickupDropoff(t *testing.T) {
 	}
 	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.05}}
 
-	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds, nil, nil)
+	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, 0, minDirectTransferSeconds, nil, nil)
 
 	if arrival["B"] != 8*3600+12*60 {
 		t.Fatalf("expected to ride ferry A->B, arrival[B]=%d", arrival["B"])
@@ -372,7 +410,7 @@ func TestRaptorDepartScanRespectsPickupDropoff(t *testing.T) {
 
 	// And a rider starting at B must NOT be able to board the ferry there.
 	nearB := []StopWithDistance{{Stop: stopMap["B"], Distance: 0.05}}
-	arrival2, _ := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, nearB, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds, nil, nil)
+	arrival2, _ := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, nearB, 7*3600+55*60, 2, 4.8, 0, minDirectTransferSeconds, nil, nil)
 	if arrival2["A"] != math.MaxInt32 {
 		t.Fatalf("should not be able to board at set-down-only stop B; arrival[A]=%d", arrival2["A"])
 	}
@@ -527,7 +565,7 @@ func TestRaptorDepartScanOnlyRoutesRestrictsBoarding(t *testing.T) {
 	}
 	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.05}}
 
-	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds, nil, map[string]bool{"71": true})
+	arrival, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, 0, minDirectTransferSeconds, nil, map[string]bool{"71": true})
 	if arrival["B"] != 8*3600+15*60 {
 		t.Fatalf("expected onlyRoutes to force the slower route 71 trip, arrival[B]=%d", arrival["B"])
 	}
@@ -633,7 +671,7 @@ func TestRaptorDepartScanModeFilterSkipsOtherModes(t *testing.T) {
 	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.05}}
 
 	only := allowedRouteSet(routeMap, nil, []int{3})
-	_, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds, nil, only)
+	_, pred := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, 0, minDirectTransferSeconds, nil, only)
 	if pred["B"].RouteID != "bus70" {
 		t.Fatalf("expected the bus, got route %q", pred["B"].RouteID)
 	}
@@ -657,11 +695,11 @@ func TestRaptorDepartScanMinTransferSecRejectsRushedChange(t *testing.T) {
 	}
 	near := []StopWithDistance{{Stop: stopMap["A"], Distance: 0.05}}
 
-	arrival, _ := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds, nil, nil)
+	arrival, _ := raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, 0, minDirectTransferSeconds, nil, nil)
 	if arrival["B"] != 8*3600+20*60 {
 		t.Fatalf("expected the normal two-minute change to work, arrival[B]=%d", arrival["B"])
 	}
-	arrival, _ = raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, minDirectTransferSeconds+180, nil, nil)
+	arrival, _ = raptorDepartScan(trips, stopMap, map[string][]stopTransfer{}, near, 7*3600+55*60, 2, 4.8, 0, minDirectTransferSeconds+180, nil, nil)
 	if arrival["B"] != math.MaxInt32 {
 		t.Fatalf("expected the rushed change to be rejected, arrival[B]=%d", arrival["B"])
 	}
