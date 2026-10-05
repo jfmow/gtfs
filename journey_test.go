@@ -832,10 +832,17 @@ func TestApplyRealtimeIgnoresEarlyBeforeTripStarts(t *testing.T) {
 		t.Fatalf("delay dropped before the trip started: %+v", got["t"][1])
 	}
 
-	// No GPS, but the trip updates have moved past the first stop: started.
+	// Before the start time, predictions past the first stop don't make it
+	// started - AT publishes them for every upcoming trip.
 	progressed := early(false)
 	progressed["t"].stopBySeq[2] = realtimeStopAdjustment{arrivalDelay: -240, departureDelay: -240}
-	if got := applyRealtimeToTripStopTimes(static, progressed, "20260930", "20260930", 950); got["t"][1].ArrivalSec != 1060 {
+	if got := applyRealtimeToTripStopTimes(static, progressed, "20260930", "20260930", 950); got["t"][1].ArrivalSec != 1300 {
+		t.Fatalf("early applied before the start time: %+v", got["t"][1])
+	}
+
+	// No GPS after the start, but the trip updates have moved past the first
+	// stop: started.
+	if got := applyRealtimeToTripStopTimes(static, progressed, "20260930", "20260930", 1005); got["t"][1].ArrivalSec != 1060 {
 		t.Fatalf("early ignored for a trip the updates show under way: %+v", got["t"][1])
 	}
 
@@ -846,8 +853,23 @@ func TestApplyRealtimeIgnoresEarlyBeforeTripStarts(t *testing.T) {
 		t.Fatalf("early applied from a first-stop-only update: %+v", got["t"][1])
 	}
 
-	// A vehicle on the trip, or no vehicle long after the start: trusted.
-	if got := applyRealtimeToTripStopTimes(static, early(true), "20260930", "20260930", 950); got["t"][1].ArrivalSec != 1060 {
+	// A vehicle already on the trip before its start time (finishing the
+	// previous one) still can't make it early.
+	if got := applyRealtimeToTripStopTimes(static, early(true), "20260930", "20260930", 950); got["t"][1].ArrivalSec != 1300 {
+		t.Fatalf("early applied before the start time with a vehicle: %+v", got["t"][1])
+	}
+
+	// The trip update's start_time wins over the timetable.
+	described := early(true)
+	adj := described["t"]
+	adj.startTimeSec, adj.hasStartTime = 900, true
+	described["t"] = adj
+	if got := applyRealtimeToTripStopTimes(static, described, "20260930", "20260930", 950); got["t"][1].ArrivalSec != 1060 {
+		t.Fatalf("early ignored after the trip update's start time: %+v", got["t"][1])
+	}
+
+	// A vehicle on the trip after its start, or no vehicle long after: trusted.
+	if got := applyRealtimeToTripStopTimes(static, early(true), "20260930", "20260930", 1005); got["t"][1].ArrivalSec != 1060 {
 		t.Fatalf("early ignored with a vehicle on the trip: %+v", got["t"][1])
 	}
 	if got := applyRealtimeToTripStopTimes(static, early(false), "20260930", "20260930", 1000+notStartedGraceSeconds); got["t"][1].ArrivalSec != 1060 {

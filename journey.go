@@ -156,6 +156,11 @@ type realtimeTripAdjustment struct {
 	// hasVehicle is true when the vehicle feed has a vehicle on this trip.
 	// Without one the trip hasn't started (see tripNotStarted).
 	hasVehicle bool
+
+	// startTimeSec is the trip descriptor's start_time in seconds from the
+	// service-day start, when hasStartTime.
+	startTimeSec int
+	hasStartTime bool
 }
 type journeyCandidate struct {
 	Stop       StopWithDistance
@@ -1648,19 +1653,30 @@ func applyRealtimeToTripStopTimes(static map[string][]tripStopTime, realtimeAdju
 // dropout mid-trip, so the feed's predictions are trusted again.
 const notStartedGraceSeconds = 10 * 60
 
-// tripNotStarted reports whether the trip hasn't left its first stop yet: no
-// vehicle is on it, the trip updates say nothing about any later stop, and its
-// scheduled start is still ahead (or only just passed). Before then an "early"
-// prediction is the feed carrying over the previous trip's running (AT does
-// this) - a bus doesn't leave its first stop ahead of the timetable, so
-// nothing downstream can be early either. A vehicle without GPS still reports
-// its progress through the trip updates, so it counts as started once those
-// move past the first stop.
+// tripNotStarted reports whether the trip hasn't left its first stop yet.
+// Before the trip's start time (the trip update's start_time, else its
+// scheduled first departure) that's always so, whatever the feed says: AT
+// assigns a vehicle and publishes predictions for every later stop well ahead
+// of a trip, carrying over the previous trip's running, but a bus doesn't
+// leave its first stop ahead of the timetable, so nothing downstream can be
+// early either. For a short grace after the start it's still not started
+// while no vehicle is on it and the trip updates say nothing about a later
+// stop (a vehicle without GPS still reports its progress through those).
 func tripNotStarted(adj realtimeTripAdjustment, scheduled []tripStopTime, nowSec int) bool {
-	if adj.hasVehicle || len(scheduled) == 0 {
+	if len(scheduled) == 0 {
 		return false
 	}
 	first := scheduled[0]
+	startSec := first.ScheduledDepartureSec
+	if adj.hasStartTime {
+		startSec = adj.startTimeSec
+	}
+	if nowSec < startSec {
+		return true
+	}
+	if adj.hasVehicle {
+		return false
+	}
 	for seq := range adj.stopBySeq {
 		if seq > first.StopSequence {
 			return false
@@ -1671,7 +1687,7 @@ func tripNotStarted(adj realtimeTripAdjustment, scheduled []tripStopTime, nowSec
 			return false
 		}
 	}
-	return nowSec < first.ScheduledDepartureSec+notStartedGraceSeconds
+	return nowSec < startSec+notStartedGraceSeconds
 }
 
 func clampNonNegative(value int) int {
@@ -1800,6 +1816,9 @@ func loadRealtimeTripAdjustments(client *gtfsrealtime.Realtime) map[string]realt
 			hasRealtime:  true,
 			startDate:    update.GetTrip().GetStartDate(), // NEW
 			hasVehicle:   vehicles[tripID] != nil,
+		}
+		if startSec, err := parseTimeToSeconds(update.GetTrip().GetStartTime()); err == nil {
+			adj.startTimeSec, adj.hasStartTime = startSec, true
 		}
 
 		for _, stu := range update.GetStopTimeUpdate() {
