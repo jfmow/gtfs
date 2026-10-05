@@ -22,13 +22,12 @@ func (v Realtime) GetTripUpdates() (TripUpdatesMap, error) {
 	v.tripUpdatesCache.mu.Lock()
 	defer v.tripUpdatesCache.mu.Unlock()
 
-	if len(v.tripUpdatesCache.data) >= 1 && v.tripUpdatesCache.lastUpdated.Add(v.refreshPeriod).After(time.Now()) {
-		return v.tripUpdatesCache.data, nil
-	}
-
-	result, err := fetchProto(v.tripUpdatesUrl, v.apiHeader, v.apiKey)
+	result, fetchedAt, err := v.tripUpdatesFeed.get(time.Now())
 	if err != nil {
 		return nil, err
+	}
+	if v.tripUpdatesCache.data != nil && fetchedAt.Equal(v.tripUpdatesCache.lastUpdated) {
+		return v.tripUpdatesCache.data, nil // nothing newer from the feed
 	}
 
 	var updates = make(TripUpdatesMap)
@@ -36,6 +35,9 @@ func (v Realtime) GetTripUpdates() (TripUpdatesMap, error) {
 
 	for _, i := range result {
 		tripUpdate := i.GetTripUpdate()
+		if tripUpdate == nil {
+			continue // a combined feed's vehicles/alerts
+		}
 		trip := tripUpdate.GetTrip()
 		tripId := trip.GetTripId()
 		startDateStr := trip.GetStartDate()
@@ -107,9 +109,8 @@ func (v Realtime) GetTripUpdates() (TripUpdatesMap, error) {
 		}
 	}
 
-	now = time.Now()
-	v.tripUpdatesCache.lastUpdated = now
-	v.addTripUpdateHistory(v.tripUpdatesCache.data, now)
+	v.tripUpdatesCache.lastUpdated = fetchedAt
+	v.addTripUpdateHistory(v.tripUpdatesCache.data, fetchedAt)
 
 	return v.tripUpdatesCache.data, nil
 }

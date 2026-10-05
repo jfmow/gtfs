@@ -21,26 +21,27 @@ func (v Realtime) GetVehicles() (VehiclesMap, error) {
 	v.vehiclesCache.mu.Lock()
 	defer v.vehiclesCache.mu.Unlock()
 
-	if len(v.vehiclesCache.data) >= 1 && v.vehiclesCache.lastUpdated.Add(v.refreshPeriod).After(time.Now()) {
-		return v.vehiclesCache.data, nil
-	}
-
-	result, err := fetchProto(v.vehiclesUrl, v.apiHeader, v.apiKey)
+	result, fetchedAt, err := v.vehiclesFeed.get(time.Now())
 	if err != nil {
 		return nil, err
+	}
+	if v.vehiclesCache.data != nil && fetchedAt.Equal(v.vehiclesCache.lastUpdated) {
+		return v.vehiclesCache.data, nil // nothing newer from the feed
 	}
 
 	var vehicles = make(VehiclesMap)
 
 	for _, i := range result {
+		if i.GetVehicle() == nil {
+			continue // a combined feed's trip updates/alerts
+		}
 		tripId := i.GetVehicle().GetTrip().GetTripId()
 		vehicles[tripId] = i.GetVehicle()
 	}
 
 	v.vehiclesCache.data = vehicles
-	now := time.Now()
-	v.vehiclesCache.lastUpdated = now
-	v.addVehicleHistory(vehicles, now)
+	v.vehiclesCache.lastUpdated = fetchedAt
+	v.addVehicleHistory(vehicles, fetchedAt)
 
 	return vehicles, nil
 }

@@ -22,23 +22,25 @@ func (v Realtime) GetAlerts() (AlertMap, error) {
 	v.alertsCache.mu.Lock()
 	defer v.alertsCache.mu.Unlock()
 
-	if len(v.alertsCache.data) >= 1 && v.alertsCache.lastUpdated.Add(v.refreshPeriod).After(time.Now()) {
-		return v.alertsCache.data, nil
-	}
-
-	result, err := fetchProto(v.alertsUrl, v.apiHeader, v.apiKey)
+	result, fetchedAt, err := v.alertsFeed.get(time.Now())
 	if err != nil {
 		return nil, err
+	}
+	if v.alertsCache.data != nil && fetchedAt.Equal(v.alertsCache.lastUpdated) {
+		return v.alertsCache.data, nil // nothing newer from the feed
 	}
 
 	var alerts AlertMap = make(AlertMap)
 
 	for _, i := range result {
+		if i.GetAlert() == nil {
+			continue // a combined feed's vehicles/trip updates
+		}
 		alerts[i.GetId()] = i.Alert
 	}
 
 	v.alertsCache.data = alerts
-	v.alertsCache.lastUpdated = time.Now()
+	v.alertsCache.lastUpdated = fetchedAt
 
 	return alerts, nil
 }
