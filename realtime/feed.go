@@ -52,6 +52,9 @@ func newFeedFetcher(url, apiHeader, apiKey string, period time.Duration) *feedFe
 // backoff is in effect. Callers compare fetchedAt with their own to tell
 // whether there's anything new to rebuild from.
 func (f *feedFetcher) get(now time.Time) ([]*proto.FeedEntity, time.Time, error) {
+	if f == nil {
+		return nil, time.Time{}, ErrNoRealtime
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 

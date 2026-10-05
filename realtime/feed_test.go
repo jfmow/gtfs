@@ -172,3 +172,20 @@ func TestCombinedClientSplitsEntityTypes(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+func TestDisabledClient(t *testing.T) {
+	v := NewDisabledClient(*time.UTC)
+	if _, err := v.GetVehicles(); !errors.Is(err, ErrNoRealtime) {
+		t.Fatalf("GetVehicles err = %v, want ErrNoRealtime", err)
+	}
+	if _, err := v.GetTripUpdates(); !errors.Is(err, ErrNoRealtime) {
+		t.Fatalf("GetTripUpdates err = %v, want ErrNoRealtime", err)
+	}
+	if _, err := v.GetAlerts(); !errors.Is(err, ErrNoRealtime) {
+		t.Fatalf("GetAlerts err = %v, want ErrNoRealtime", err)
+	}
+	v.EnableTripHistory()
+	if len(v.GetTripHistory()) != 0 {
+		t.Fatal("expected no trip history")
+	}
+}

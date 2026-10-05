@@ -22,6 +22,16 @@ func hashKey(data string) string {
 
 var urlRegex = regexp.MustCompile(`^(http:\/\/www\.|https:\/\/www\.|http:\/\/|https:\/\/|\/|\/\/)?[A-z0-9_-]*?[:]?[A-z0-9_-]*?[@]?[A-z0-9]+([\-\.]{1}[a-z0-9]+)*\.[a-z]{2,5}(:[0-9]{1,5})?(\/.*)?$`)
 
+// ErrNoRealtime is returned by every getter on a client made with
+// NewDisabledClient.
+var ErrNoRealtime = errors.New("realtime not available for this feed")
+
+// NewDisabledClient returns a Realtime for a region that publishes no GTFS-RT
+// feeds: it never makes a request and every getter returns ErrNoRealtime.
+func NewDisabledClient(localTimeZone time.Location) Realtime {
+	return newRealtime("", nil, nil, nil, localTimeZone)
+}
+
 // NewClient reads vehicles, trip updates and alerts from three separate feed
 // URLs. Each URL is requested at most once per refreshPeriod.
 func NewClient(apiKey string, apiHeader string, refreshPeriod time.Duration, vehiclesUrl, tripUpdatesUrl, alertsUrl string, localTimeZone time.Location) (Realtime, error) {
