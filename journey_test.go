@@ -783,7 +783,7 @@ func TestApplyRealtimeToTripStopTimesLeavesStaticUntouched(t *testing.T) {
 		"gone": {hasRealtime: true, tripCanceled: true, stopBySeq: map[int]realtimeStopAdjustment{}, stopByID: map[string]realtimeStopAdjustment{}},
 	}
 
-	got := applyRealtimeToTripStopTimes(static, adjustments, "20260930", "20260930")
+	got := applyRealtimeToTripStopTimes(static, adjustments, "20260930", "20260930", 1000)
 
 	if got["late"][1].ArrivalSec != 260 || got["late"][1].RealtimeStatus != "delayed" {
 		t.Fatalf("delay not applied: %+v", got["late"][1])
@@ -799,9 +799,59 @@ func TestApplyRealtimeToTripStopTimesLeavesStaticUntouched(t *testing.T) {
 	}
 
 	// A different service day ignores the date-less realtime entirely.
-	future := applyRealtimeToTripStopTimes(static, adjustments, "20261001", "20260930")
+	future := applyRealtimeToTripStopTimes(static, adjustments, "20261001", "20260930", -86400)
 	if future["late"][1].ArrivalSec != 200 || !future["gone"][0].TripUsable {
 		t.Fatalf("realtime leaked onto another day: %+v %+v", future["late"][1], future["gone"][0])
+	}
+}
+
+func TestApplyRealtimeIgnoresEarlyBeforeTripStarts(t *testing.T) {
+	static := map[string][]tripStopTime{
+		"t": {
+			{TripID: "t", StopID: "a", StopSequence: 1, ArrivalSec: 1000, DepartureSec: 1000, ScheduledArrivalSec: 1000, ScheduledDepartureSec: 1000, RealtimeStatus: "scheduled", TripUsable: true},
+			{TripID: "t", StopID: "b", StopSequence: 2, ArrivalSec: 1300, DepartureSec: 1300, ScheduledArrivalSec: 1300, ScheduledDepartureSec: 1300, RealtimeStatus: "scheduled", TripUsable: true},
+		},
+	}
+	early := func(hasVehicle bool) map[string]realtimeTripAdjustment {
+		return map[string]realtimeTripAdjustment{
+			"t": {hasRealtime: true, hasVehicle: hasVehicle, tripDelay: -240, stopBySeq: map[int]realtimeStopAdjustment{}, stopByID: map[string]realtimeStopAdjustment{}},
+		}
+	}
+
+	// No vehicle yet, just before the scheduled start: stays on the timetable.
+	got := applyRealtimeToTripStopTimes(static, early(false), "20260930", "20260930", 950)
+	if got["t"][1].ArrivalSec != 1300 || got["t"][1].RealtimeStatus != "on_time" {
+		t.Fatalf("early applied before the trip started: %+v", got["t"][1])
+	}
+
+	// Lateness still applies before the start.
+	late := map[string]realtimeTripAdjustment{
+		"t": {hasRealtime: true, tripDelay: 120, stopBySeq: map[int]realtimeStopAdjustment{}, stopByID: map[string]realtimeStopAdjustment{}},
+	}
+	if got := applyRealtimeToTripStopTimes(static, late, "20260930", "20260930", 950); got["t"][1].ArrivalSec != 1420 {
+		t.Fatalf("delay dropped before the trip started: %+v", got["t"][1])
+	}
+
+	// No GPS, but the trip updates have moved past the first stop: started.
+	progressed := early(false)
+	progressed["t"].stopBySeq[2] = realtimeStopAdjustment{arrivalDelay: -240, departureDelay: -240}
+	if got := applyRealtimeToTripStopTimes(static, progressed, "20260930", "20260930", 950); got["t"][1].ArrivalSec != 1060 {
+		t.Fatalf("early ignored for a trip the updates show under way: %+v", got["t"][1])
+	}
+
+	// Updates only for the first stop are still the carried-over prediction.
+	atOrigin := early(false)
+	atOrigin["t"].stopByID["a"] = realtimeStopAdjustment{arrivalDelay: -240, departureDelay: -240}
+	if got := applyRealtimeToTripStopTimes(static, atOrigin, "20260930", "20260930", 950); got["t"][1].ArrivalSec != 1300 {
+		t.Fatalf("early applied from a first-stop-only update: %+v", got["t"][1])
+	}
+
+	// A vehicle on the trip, or no vehicle long after the start: trusted.
+	if got := applyRealtimeToTripStopTimes(static, early(true), "20260930", "20260930", 950); got["t"][1].ArrivalSec != 1060 {
+		t.Fatalf("early ignored with a vehicle on the trip: %+v", got["t"][1])
+	}
+	if got := applyRealtimeToTripStopTimes(static, early(false), "20260930", "20260930", 1000+notStartedGraceSeconds); got["t"][1].ArrivalSec != 1060 {
+		t.Fatalf("early ignored long after the start: %+v", got["t"][1])
 	}
 }
 

@@ -152,6 +152,10 @@ type realtimeTripAdjustment struct {
 
 	// NEW
 	startDate string
+
+	// hasVehicle is true when the vehicle feed has a vehicle on this trip.
+	// Without one the trip hasn't started (see tripNotStarted).
+	hasVehicle bool
 }
 type journeyCandidate struct {
 	Stop       StopWithDistance
@@ -1349,8 +1353,9 @@ func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsreal
 	if realtimeClient != nil {
 		realtimeAdjustments = loadRealtimeTripAdjustments(realtimeClient)
 	}
-	today := time.Now().In(v.timeZone).Format("20060102")
-	built := applyRealtimeToTripStopTimes(m.static, realtimeAdjustments, day, today)
+	now := time.Now().In(v.timeZone)
+	today := now.Format("20060102")
+	built := applyRealtimeToTripStopTimes(m.static, realtimeAdjustments, day, today, int(now.Sub(dayStart).Seconds()))
 
 	m.data, m.day, m.builtAt = built, day, time.Now()
 	return built, nil
@@ -1423,8 +1428,9 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 		realtimeAdjustments = loadRealtimeTripAdjustments(realtimeClient)
 	}
 	day := serviceDayNoon(dayStart).Format("20060102")
-	today := time.Now().In(v.timeZone).Format("20060102")
-	return applyRealtimeToTripStopTimes(static, realtimeAdjustments, day, today), nil
+	now := time.Now().In(v.timeZone)
+	today := now.Format("20060102")
+	return applyRealtimeToTripStopTimes(static, realtimeAdjustments, day, today, int(now.Sub(dayStart).Seconds())), nil
 }
 
 // buildStaticTripStopTimes loads one service day's scheduled stop times from
@@ -1550,8 +1556,9 @@ func (v Database) buildStaticTripStopTimes(dayStart time.Time) (map[string][]tri
 // applyRealtimeToTripStopTimes returns static with the realtime adjustments for
 // service day `day` applied. It never mutates static: the result is a shallow
 // copy of the map in which only adjusted trips get a fresh slice, so it costs
-// O(trips + adjusted stops) rather than a full rebuild.
-func applyRealtimeToTripStopTimes(static map[string][]tripStopTime, realtimeAdjustments map[string]realtimeTripAdjustment, day, today string) map[string][]tripStopTime {
+// O(trips + adjusted stops) rather than a full rebuild. nowSec is the current
+// time in seconds from `day`'s service-day start (negative for a future day).
+func applyRealtimeToTripStopTimes(static map[string][]tripStopTime, realtimeAdjustments map[string]realtimeTripAdjustment, day, today string, nowSec int) map[string][]tripStopTime {
 	trips := make(map[string][]tripStopTime, len(static))
 	for tripID, stopTimes := range static {
 		trips[tripID] = stopTimes
@@ -1562,6 +1569,7 @@ func applyRealtimeToTripStopTimes(static map[string][]tripStopTime, realtimeAdju
 		if !ok || !shouldApplyRealtimeAdjustment(adj, day, today) {
 			continue
 		}
+		notStarted := tripNotStarted(adj, scheduled, nowSec)
 		adjusted := make([]tripStopTime, len(scheduled))
 		for i, stopTime := range scheduled {
 			stopID, sequence := stopTime.StopID, stopTime.StopSequence
@@ -1613,6 +1621,15 @@ func applyRealtimeToTripStopTimes(static map[string][]tripStopTime, realtimeAdju
 				}
 			}
 
+			if notStarted {
+				// It can't run ahead of a timetable it hasn't started yet.
+				arrivalSec = max(arrivalSec, scheduledArrivalSec)
+				departureSec = max(departureSec, scheduledDepartureSec)
+				if realtimeStatus == "early" {
+					realtimeStatus = "on_time"
+				}
+			}
+
 			stopTime.ArrivalSec = clampNonNegative(arrivalSec)
 			stopTime.DepartureSec = clampNonNegative(departureSec)
 			stopTime.RealtimeStatus = realtimeStatus
@@ -1624,6 +1641,37 @@ func applyRealtimeToTripStopTimes(static map[string][]tripStopTime, realtimeAdju
 	}
 
 	return trips
+}
+
+// How long past its scheduled start a trip with no vehicle on it is still
+// treated as not started. Beyond this a missing vehicle is more likely a GPS
+// dropout mid-trip, so the feed's predictions are trusted again.
+const notStartedGraceSeconds = 10 * 60
+
+// tripNotStarted reports whether the trip hasn't left its first stop yet: no
+// vehicle is on it, the trip updates say nothing about any later stop, and its
+// scheduled start is still ahead (or only just passed). Before then an "early"
+// prediction is the feed carrying over the previous trip's running (AT does
+// this) - a bus doesn't leave its first stop ahead of the timetable, so
+// nothing downstream can be early either. A vehicle without GPS still reports
+// its progress through the trip updates, so it counts as started once those
+// move past the first stop.
+func tripNotStarted(adj realtimeTripAdjustment, scheduled []tripStopTime, nowSec int) bool {
+	if adj.hasVehicle || len(scheduled) == 0 {
+		return false
+	}
+	first := scheduled[0]
+	for seq := range adj.stopBySeq {
+		if seq > first.StopSequence {
+			return false
+		}
+	}
+	for stopID := range adj.stopByID {
+		if stopID != first.StopID {
+			return false
+		}
+	}
+	return nowSec < first.ScheduledDepartureSec+notStartedGraceSeconds
 }
 
 func clampNonNegative(value int) int {
@@ -1735,6 +1783,9 @@ func loadRealtimeTripAdjustments(client *gtfsrealtime.Realtime) map[string]realt
 	}
 
 	result := make(map[string]realtimeTripAdjustment, len(updates))
+	// Vehicles are optional; without them every trip looks unstarted until
+	// its grace runs out, which only ever drops "early" predictions.
+	vehicles, _ := client.GetVehicles()
 
 	for tripID, update := range updates {
 		if update == nil {
@@ -1748,6 +1799,7 @@ func loadRealtimeTripAdjustments(client *gtfsrealtime.Realtime) map[string]realt
 			stopByID:     map[string]realtimeStopAdjustment{},
 			hasRealtime:  true,
 			startDate:    update.GetTrip().GetStartDate(), // NEW
+			hasVehicle:   vehicles[tripID] != nil,
 		}
 
 		for _, stu := range update.GetStopTimeUpdate() {
