@@ -189,3 +189,32 @@ func TestDisabledClient(t *testing.T) {
 		t.Fatal("expected no trip history")
 	}
 }
+
+func TestGetUntrippedVehiclesKeepsTriplessUnits(t *testing.T) {
+	u := &fakeUpstream{entities: []*proto.FeedEntity{
+		unit("lead", "AMP        580", "t1", -36.84, 174.76, 10, 0, 100),
+		unit("trail", "AMP        581", "", -36.8405, 174.76, 10, 0, 100),
+		unit("stabled", "AMP        415", "", -36.86, 174.57, 0, 0, 100),
+		unit("nowhere", "AMP        999", "", 0, 0, 0, 0, 100),
+	}}
+	rt, err := NewCombinedClient("", "", 20*time.Second, "https://example.com/feed", *time.UTC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.vehiclesFeed.fetch = u.fetch
+
+	untripped, err := rt.GetUntrippedVehicles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, vp := range untripped {
+		ids = append(ids, vp.GetVehicle().GetId())
+	}
+	if len(ids) != 2 || ids[0] != "trail" || ids[1] != "stabled" {
+		t.Fatalf("untripped = %v, want [trail stabled] (no position-less units)", ids)
+	}
+	if vehicles, _ := rt.GetVehicles(); len(vehicles) != 2 { // "t1" plus every tripless unit collapsed on ""
+		t.Fatalf("vehicles = %d entries, want 2", len(vehicles))
+	}
+}
