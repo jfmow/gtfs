@@ -12,6 +12,10 @@ type vehiclesCache struct {
 	mu          sync.Mutex
 	data        VehiclesMap
 	lastUpdated time.Time
+
+	// Inferred from each poll; see Consists.
+	consists     Consists
+	consistPairs map[string]*consistPair
 }
 
 type VehiclesMap map[string]*proto.VehiclePosition
@@ -41,6 +45,7 @@ func (v Realtime) GetVehicles() (VehiclesMap, error) {
 
 	v.vehiclesCache.data = vehicles
 	v.vehiclesCache.lastUpdated = fetchedAt
+	v.updateConsists(result, fetchedAt)
 	v.addVehicleHistory(vehicles, fetchedAt)
 
 	return vehicles, nil
