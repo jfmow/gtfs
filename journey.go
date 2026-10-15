@@ -324,6 +324,7 @@ func (v Database) planJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 			if legs[0].Mode == "walk" {
 				planDeparture = legs[0].DepartureTime
 			}
+			legs = dropNegligibleOriginWalk(legs)
 			plans = append(plans, JourneyPlan{
 				StartLat:      req.StartLat,
 				StartLon:      req.StartLon,
@@ -935,6 +936,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 			if len(legs) > 0 && legs[0].Mode == "walk" {
 				departAt = legs[0].DepartureTime
 			}
+			legs = dropNegligibleOriginWalk(legs)
 			arrivalTime := legs[len(legs)-1].ArrivalTime
 			plan := JourneyPlan{
 				StartLat:      req.StartLat,
@@ -2551,6 +2553,29 @@ func deferOriginWalk(legs []JourneyLeg, notBefore time.Time) []JourneyLeg {
 	legs[0].DepartureTime = legs[0].DepartureTime.Add(slack)
 	legs[0].ArrivalTime = legs[0].ArrivalTime.Add(slack)
 	return legs
+}
+
+// dropNegligibleOriginWalk removes a first walk leg that only reaches the stop
+// the rider is already at ("walk 1 min · 20 m" to the stop they're standing
+// at) - every client would otherwise show it in the itinerary, on the map and
+// in the Live Activity. Uses the same footTransferMinKm "effectively the same
+// pole" cut-off as transfers. A walk to a different platform is kept: the
+// rider still has to move. The plan keeps its departure time (callers read it
+// before dropping), so "Departs" doesn't change.
+func dropNegligibleOriginWalk(legs []JourneyLeg) []JourneyLeg {
+	if len(legs) < 2 || legs[0].Mode != "walk" || legs[1].Mode != "transit" {
+		return legs
+	}
+	walk := legs[0]
+	if walk.DistanceKm > footTransferMinKm || walk.ArrivalTime.Sub(walk.DepartureTime) > 2*time.Minute {
+		return legs
+	}
+	if walk.ToStop != nil && walk.ToStop.PlatformNumber != "" {
+		if walk.FromStop == nil || walk.FromStop.PlatformNumber != walk.ToStop.PlatformNumber {
+			return legs
+		}
+	}
+	return legs[1:]
 }
 
 // populateRouteGeoJSON fills in RouteGeoJSON for each plan, one goroutine per
