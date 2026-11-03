@@ -38,19 +38,41 @@ func (v Realtime) GetVehicles() (VehiclesMap, error) {
 
 	var vehicles = make(VehiclesMap)
 	var untripped []*proto.VehiclePosition
+	// Trips more than one unit claims, with every claimant in feed order.
+	// Operators leave a parked bus signed on to a trip while another bus
+	// runs it, so the same trip id can arrive twice.
+	contested := make(map[string][]*proto.VehiclePosition)
 
 	for _, i := range result {
-		if i.GetVehicle() == nil {
+		vp := i.GetVehicle()
+		if vp == nil {
 			continue // a combined feed's trip updates/alerts
 		}
-		tripId := i.GetVehicle().GetTrip().GetTripId()
+		tripId := vp.GetTrip().GetTripId()
 		if tripId == "" {
-			pos := i.GetVehicle().GetPosition()
+			pos := vp.GetPosition()
 			if pos != nil && (pos.GetLatitude() != 0 || pos.GetLongitude() != 0) {
-				untripped = append(untripped, i.GetVehicle())
+				untripped = append(untripped, vp)
 			}
+			vehicles[tripId] = vp
+			continue
 		}
-		vehicles[tripId] = i.GetVehicle()
+		existing, ok := vehicles[tripId]
+		if !ok {
+			vehicles[tripId] = vp
+			continue
+		}
+		if _, seen := contested[tripId]; !seen {
+			contested[tripId] = []*proto.VehiclePosition{existing}
+		}
+		contested[tripId] = append(contested[tripId], vp)
+	}
+
+	if len(contested) > 0 {
+		assigned := v.tripUpdateVehicleIDs(contested)
+		for tripId, claimants := range contested {
+			vehicles[tripId] = pickTripVehicle(claimants, assigned[tripId])
+		}
 	}
 
 	v.vehiclesCache.data = vehicles
@@ -60,6 +82,47 @@ func (v Realtime) GetVehicles() (VehiclesMap, error) {
 	v.addVehicleHistory(vehicles, fetchedAt)
 
 	return vehicles, nil
+}
+
+// tripUpdateVehicleIDs returns, for each contested trip, the vehicle id its
+// trip update says is running it - the operator's own assignment, which a
+// stale sign-on on another unit doesn't change. Trips whose update names no
+// vehicle (or that have no update) are left out.
+func (v Realtime) tripUpdateVehicleIDs(contested map[string][]*proto.VehiclePosition) map[string]string {
+	assigned := make(map[string]string)
+	if v.tripUpdatesFeed == nil {
+		return assigned
+	}
+	updates, err := v.GetTripUpdates()
+	if err != nil {
+		return assigned
+	}
+	for tripId := range contested {
+		if id := updates[tripId].GetVehicle().GetId(); id != "" {
+			assigned[tripId] = id
+		}
+	}
+	return assigned
+}
+
+// pickTripVehicle chooses which of the units claiming one trip is running it:
+// the unit the trip update names, else the one that reported most recently,
+// else the first in the feed.
+func pickTripVehicle(claimants []*proto.VehiclePosition, assignedID string) *proto.VehiclePosition {
+	if assignedID != "" {
+		for _, vp := range claimants {
+			if vp.GetVehicle().GetId() == assignedID {
+				return vp
+			}
+		}
+	}
+	best := claimants[0]
+	for _, vp := range claimants[1:] {
+		if vp.GetTimestamp() > best.GetTimestamp() {
+			best = vp
+		}
+	}
+	return best
 }
 
 // GetUntrippedVehicles returns the units in the latest vehicle feed that report
