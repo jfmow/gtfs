@@ -410,7 +410,7 @@ func (v Database) planJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 	}
 	plans = diversifyPlans(plans, dayStart, banScan, laterScan, req.MinResults, req.MaxResults, rank)
 
-	plans = dedupePlansByTransitService(dropFarWorsePlans(pruneDominatedPlans(plans), rank), req.MaxResults, rank)
+	plans = dedupePlansByTransitService(dropFarWorsePlans(dropLongWaitPlans(pruneDominatedPlans(plans)), rank), req.MaxResults, rank)
 	if len(plans) == 0 {
 		return nil, errors.New("no journey legs available")
 	}
@@ -1006,7 +1006,7 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		return nil, noOnlyRouteJourneyError(req)
 	}
 
-	plans = dedupePlansByTransitService(dropFarWorsePlans(pruneDominatedPlans(plans), rank), req.MaxResults, rank)
+	plans = dedupePlansByTransitService(dropFarWorsePlans(dropLongWaitPlans(pruneDominatedPlans(plans)), rank), req.MaxResults, rank)
 	if len(plans) == 0 {
 		return nil, errors.New("no journey legs available")
 	}
@@ -1467,6 +1467,7 @@ func (v Database) ensureStaticDayLocked(m *tripStopTimesMemo, dayStart time.Time
 	if err != nil {
 		return nil, err
 	}
+	static = v.withOvernightTrips(static, dayStart)
 	e := &memoDay{static: newPlannerDay(static), lastUsed: time.Now()}
 	m.days[day] = e
 	return e, nil
@@ -1524,6 +1525,7 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 	if err != nil {
 		return nil, err
 	}
+	static = v.withOvernightTrips(static, dayStart)
 	realtimeAdjustments := map[string]realtimeTripAdjustment{}
 	if realtimeClient != nil {
 		realtimeAdjustments = loadRealtimeTripAdjustments(realtimeClient)
@@ -1537,6 +1539,13 @@ func (v Database) buildTripStopTimes(dayStart time.Time, realtimeClient *gtfsrea
 // buildStaticTripStopTimes loads one service day's scheduled stop times from
 // SQL, grouped by trip and in stop_sequence order. No realtime is applied.
 func (v Database) buildStaticTripStopTimes(dayStart time.Time) (map[string][]tripStopTime, error) {
+	return v.queryTripStopTimes(dayStart, false)
+}
+
+// queryTripStopTimes loads a service day's stop times; pastMidnightOnly keeps
+// just the trips still running after midnight (a stop time of 24:00:00 or
+// later - hours may not be zero-padded, so the hour is compared as a number).
+func (v Database) queryTripStopTimes(dayStart time.Time, pastMidnightOnly bool) (map[string][]tripStopTime, error) {
 	weekday := strings.ToLower(serviceDayNoon(dayStart).Weekday().String()) // "monday", "tuesday", etc.
 
 	query := fmt.Sprintf(`
@@ -1580,8 +1589,9 @@ func (v Database) buildStaticTripStopTimes(dayStart time.Time) (map[string][]tri
 	FROM stop_times st
 	JOIN trips t ON st.trip_id = t.trip_id
 	JOIN adjusted_services a ON t.service_id = a.service_id
+	%s
 	ORDER BY st.trip_id, st.stop_sequence
-	`, weekday)
+	`, weekday, pastMidnightFilter(pastMidnightOnly))
 
 	day := serviceDayNoon(dayStart).Format("20060102")
 
@@ -1670,7 +1680,7 @@ func (v Database) buildStaticTripStopTimes(dayStart time.Time) (map[string][]tri
 		return nil, err
 	}
 
-	if len(trips) == 0 {
+	if len(trips) == 0 && !pastMidnightOnly {
 		return nil, errors.New("no trip times found for active services")
 	}
 
@@ -1693,84 +1703,98 @@ func applyRealtimeToTripStopTimes(static map[string][]tripStopTime, realtimeAdju
 	for tripID, stopTimes := range static {
 		trips[tripID] = stopTimes
 	}
+	prevDay := previousServiceDay(day)
 
 	for tripID, adj := range realtimeAdjustments {
-		scheduled, ok := static[tripID]
-		if !ok || !shouldApplyRealtimeAdjustment(adj, day, today) {
-			continue
+		if scheduled, ok := static[tripID]; ok && shouldApplyRealtimeAdjustment(adj, day, today) {
+			trips[tripID] = adjustTripStopTimes(scheduled, adj, nowSec)
 		}
-		notStarted := tripNotStarted(adj, scheduled, nowSec)
-		adjusted := make([]tripStopTime, len(scheduled))
-		for i, stopTime := range scheduled {
-			stopID, sequence := stopTime.StopID, stopTime.StopSequence
-			scheduledArrivalSec, scheduledDepartureSec := stopTime.ScheduledArrivalSec, stopTime.ScheduledDepartureSec
-			arrivalSec, departureSec := scheduledArrivalSec, scheduledDepartureSec
-			realtimeStatus := stopTime.RealtimeStatus
-			tripUsable := stopTime.TripUsable
+		// The previous service day's run of this trip, after midnight (see
+		// overnightTrips): its update carries that day's start date, and its
+		// start time counts from that day.
+		if scheduled, ok := static[tripID+overnightSuffix]; ok && prevDay != "" && shouldApplyRealtimeAdjustment(adj, prevDay, today) {
+			shifted := adj
+			if shifted.hasStartTime {
+				shifted.startTimeSec -= 24 * 3600
+			}
+			trips[tripID+overnightSuffix] = adjustTripStopTimes(scheduled, shifted, nowSec)
+		}
+	}
 
-			// Apply trip-level delay first
-			arrivalSec += adj.tripDelay
-			departureSec += adj.tripDelay
+	return trips
+}
 
-			if adj.tripCanceled {
+// adjustTripStopTimes is one trip's stop times with its realtime update applied.
+func adjustTripStopTimes(scheduled []tripStopTime, adj realtimeTripAdjustment, nowSec int) []tripStopTime {
+	notStarted := tripNotStarted(adj, scheduled, nowSec)
+	adjusted := make([]tripStopTime, len(scheduled))
+	for i, stopTime := range scheduled {
+		stopID, sequence := stopTime.StopID, stopTime.StopSequence
+		scheduledArrivalSec, scheduledDepartureSec := stopTime.ScheduledArrivalSec, stopTime.ScheduledDepartureSec
+		arrivalSec, departureSec := scheduledArrivalSec, scheduledDepartureSec
+		realtimeStatus := stopTime.RealtimeStatus
+		tripUsable := stopTime.TripUsable
+
+		// Apply trip-level delay first
+		arrivalSec += adj.tripDelay
+		departureSec += adj.tripDelay
+
+		if adj.tripCanceled {
+			tripUsable = false
+			realtimeStatus = "canceled"
+		} else if adj.tripDelay > 0 {
+			realtimeStatus = "delayed"
+		} else if adj.tripDelay < 0 {
+			realtimeStatus = "early"
+		} else {
+			realtimeStatus = "on_time"
+		}
+
+		// Stop-specific overrides
+		stopAdj := realtimeStopAdjustment{}
+		hasStopAdj := false
+
+		if specific, found := adj.stopBySeq[sequence]; found {
+			stopAdj = specific
+			hasStopAdj = true
+		} else if specific, found := adj.stopByID[stopID]; found {
+			stopAdj = specific
+			hasStopAdj = true
+		}
+
+		if hasStopAdj {
+			arrivalSec = scheduledArrivalSec + stopAdj.arrivalDelay
+			departureSec = scheduledDepartureSec + stopAdj.departureDelay
+
+			if stopAdj.skipped {
 				tripUsable = false
-				realtimeStatus = "canceled"
-			} else if adj.tripDelay > 0 {
+				realtimeStatus = "skipped"
+			} else if stopAdj.arrivalDelay > 0 || stopAdj.departureDelay > 0 {
 				realtimeStatus = "delayed"
-			} else if adj.tripDelay < 0 {
+			} else if stopAdj.arrivalDelay < 0 || stopAdj.departureDelay < 0 {
 				realtimeStatus = "early"
 			} else {
 				realtimeStatus = "on_time"
 			}
-
-			// Stop-specific overrides
-			stopAdj := realtimeStopAdjustment{}
-			hasStopAdj := false
-
-			if specific, found := adj.stopBySeq[sequence]; found {
-				stopAdj = specific
-				hasStopAdj = true
-			} else if specific, found := adj.stopByID[stopID]; found {
-				stopAdj = specific
-				hasStopAdj = true
-			}
-
-			if hasStopAdj {
-				arrivalSec = scheduledArrivalSec + stopAdj.arrivalDelay
-				departureSec = scheduledDepartureSec + stopAdj.departureDelay
-
-				if stopAdj.skipped {
-					tripUsable = false
-					realtimeStatus = "skipped"
-				} else if stopAdj.arrivalDelay > 0 || stopAdj.departureDelay > 0 {
-					realtimeStatus = "delayed"
-				} else if stopAdj.arrivalDelay < 0 || stopAdj.departureDelay < 0 {
-					realtimeStatus = "early"
-				} else {
-					realtimeStatus = "on_time"
-				}
-			}
-
-			if notStarted {
-				// It can't run ahead of a timetable it hasn't started yet.
-				arrivalSec = max(arrivalSec, scheduledArrivalSec)
-				departureSec = max(departureSec, scheduledDepartureSec)
-				if realtimeStatus == "early" {
-					realtimeStatus = "on_time"
-				}
-			}
-
-			stopTime.ArrivalSec = clampNonNegative(arrivalSec)
-			stopTime.DepartureSec = clampNonNegative(departureSec)
-			stopTime.RealtimeStatus = realtimeStatus
-			stopTime.TripUsable = tripUsable
-			adjusted[i] = stopTime
 		}
-		enforceMonotonicStopTimes(adjusted)
-		trips[tripID] = adjusted
-	}
 
-	return trips
+		if notStarted {
+			// It can't run ahead of a timetable it hasn't started yet.
+			arrivalSec = max(arrivalSec, scheduledArrivalSec)
+			departureSec = max(departureSec, scheduledDepartureSec)
+			if realtimeStatus == "early" {
+				realtimeStatus = "on_time"
+			}
+		}
+
+		stopTime.ArrivalSec = clampNonNegative(arrivalSec)
+		stopTime.DepartureSec = clampNonNegative(departureSec)
+		stopTime.RealtimeStatus = realtimeStatus
+		stopTime.TripUsable = tripUsable
+		adjusted[i] = stopTime
+	}
+	enforceMonotonicStopTimes(adjusted)
+	return adjusted
 }
 
 // How long past its scheduled start a trip with no vehicle on it is still
@@ -2086,7 +2110,7 @@ func preferCloserOriginStopOnSameTrip(legs []JourneyLeg, nearbyStartStops []Stop
 		return legs
 	}
 
-	tripTimes, ok := trips[firstTransit.TripID]
+	tripTimes, ok := tripTimesForLeg(trips, firstTransit, dayStart)
 	if !ok || len(tripTimes) == 0 {
 		return legs
 	}
