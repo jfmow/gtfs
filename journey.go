@@ -48,7 +48,16 @@ type JourneyRequest struct {
 	// MinTransferSec is extra time added to every change of vehicle, on top of
 	// the usual one-minute minimum - for riders who don't want a rushed change.
 	MinTransferSec int
-	Realtime       *gtfsrealtime.Realtime `json:"-"`
+	// Accessible plans for easier access: no stop or trip the feed marks as
+	// not wheelchair accessible, at most accessibleMaxWalkKm to and from
+	// stops, changes only within a station or between stops a few metres
+	// apart, and accessibleExtraGap more time at each change.
+	Accessible bool
+	// StraightWalks skips the OSRM walking routes: walk legs are drawn as
+	// straight lines and plans come back WalkRoutesPending, for the caller to
+	// fill later with AddWalkRoutes (only for the plan someone opens).
+	StraightWalks bool
+	Realtime      *gtfsrealtime.Realtime `json:"-"`
 }
 
 type JourneyLeg struct {
@@ -88,6 +97,13 @@ type JourneyPlan struct {
 	Legs          []JourneyLeg
 	RouteGeoJSON  map[string]interface{}
 	ID            string
+	// LeaveLater is the same journey with a later first ride that still makes
+	// the same connection, so the rider arrives at the same time and waits
+	// less on the way (depart-after plans only).
+	LeaveLater *JourneyPlan `json:",omitempty"`
+	// WalkRoutesPending says the walk legs in RouteGeoJSON are straight lines
+	// still to be replaced by walking routes (see AddWalkRoutes).
+	WalkRoutesPending bool `json:",omitempty"`
 }
 
 type tripStopTime struct {
@@ -97,8 +113,6 @@ type tripStopTime struct {
 	DepartureSec          int
 	RouteID               string
 	TripID                string
-	ArrivalTime           string
-	DepartureTime         string
 	ScheduledArrivalSec   int
 	ScheduledDepartureSec int
 	RealtimeStatus        string
@@ -109,6 +123,8 @@ type tripStopTime struct {
 	// trip so a through-rider can pass it.
 	Boardable  bool
 	Alightable bool
+	// Access is the trip's GTFS wheelchair_accessible (0 unknown, 1 yes, 2 no).
+	Access int8
 }
 
 type stopPredecessor struct {
@@ -195,7 +211,14 @@ func (v Database) PlanJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		return plans, err
 	}
 	if vehicles, vErr := req.Realtime.GetVehicles(); vErr == nil {
-		markVehicleTracked(plans, vehicles, time.Now().In(v.timeZone), v.timeZone)
+		now := time.Now().In(v.timeZone)
+		markVehicleTracked(plans, vehicles, now, v.timeZone)
+		for i := range plans {
+			if later := plans[i].LeaveLater; later != nil {
+				// The copy shares later's Legs, so this marks them in place.
+				markVehicleTracked([]JourneyPlan{*later}, vehicles, now, v.timeZone)
+			}
+		}
 	}
 	return plans, nil
 }
@@ -264,48 +287,38 @@ func (v Database) planJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		return nil, errors.New("no nearby stops found for start or end")
 	}
 
-	trips, err := v.loadTripStopTimes(dayStart, req.Realtime)
+	day, err := v.loadPlannerDay(dayStart, req.Realtime)
 	if err != nil {
 		return nil, err
 	}
-	routes, err := v.GetRoutes()
+	trips := day.trips
+	routeMap, err := v.routeMapCached()
 	if err != nil {
 		return nil, err
-	}
-	routeMap := make(map[string]Route, len(routes))
-	for _, route := range routes {
-		routeMap[route.RouteId] = route
 	}
 
 	onlyRoutes := allowedRouteSet(routeMap, req.OnlyRouteIDs, req.AllowedRouteTypes)
-	transferGraph := transferGraphAtSpeed(v.stopTransferGraph(stopMap, req.IncludeChildren), req.WalkSpeedKmph)
-	transferGapSec := minDirectTransferSeconds + req.MinTransferSec
-	// The rider gets to their first stop originWalkBufferSeconds before it
-	// leaves. Dropped to 0 only when no journey at all allows it (e.g. the last
-	// service of the night is about to go).
-	originGapSec := originWalkBufferSeconds
+	transferGraph := v.requestGraph(req, stopMap)
+	rules := v.newScanRules(req, stopMap, onlyRoutes)
 
-	// buildPlansWithin runs one RAPTOR scan and turns it into itineraries.
-	// `banned` skips trips on those routes; `fromSec` (0 = use the request's
-	// own time) overrides the departure so the diversity pass can ask for "the
-	// next service" on a low-frequency corridor; `maxTransfers` caps the rounds
-	// (0 = direct services only).
-	buildPlansWithin := func(banned map[string]bool, fromSec, maxTransfers int) []JourneyPlan {
-		scanSec := departSec
-		scanAt := departAt
-		if fromSec > 0 {
-			scanSec = fromSec
-			scanAt = dayStart.Add(time.Duration(fromSec) * time.Second)
-		}
-
-		arrival, predecessor := raptorDepartScan(trips, stopMap, transferGraph, nearbyStartStops, scanSec, maxTransfers, req.WalkSpeedKmph, originGapSec, transferGapSec, banned, onlyRoutes)
-
-		candidateLimit := expandedCandidateLimit(req.MaxResults)
-		bestCandidates := selectBestDestinations(nearbyEndStops, arrival, scanSec, req.WalkSpeedKmph, candidateLimit)
+	// plansFrom turns labels into itineraries: `arrival` is the arrival at
+	// each stop, chainOf reads back the journey to a stop.
+	plansFrom := func(arrival map[string]int, chainOf func(stopID string) map[string]stopPredecessor, scanSec, maxTransfers, limit int, originGapSec int) []JourneyPlan {
+		scanAt := dayStart.Add(time.Duration(scanSec) * time.Second)
+		chains := map[string]map[string]stopPredecessor{}
+		byRide := reachedByRide(nearbyEndStops, func(id string) bool {
+			if arrival[id] == infSec {
+				return false
+			}
+			c := chainOf(id)
+			chains[id] = c
+			return c != nil && c[id].Mode == "transit"
+		})
+		bestCandidates := selectBestDestinations(byRide, arrival, scanSec, req.WalkSpeedKmph, limit)
 
 		var plans []JourneyPlan
 		for _, candidate := range bestCandidates {
-			legs, transfers, transferStops := buildJourneyLegs(candidate.Stop, candidate.ArrivalSec, predecessor, stopMap, routeMap, scanAt, dayStart, req.WalkSpeedKmph, req.StartLat, req.StartLon)
+			legs, transfers, transferStops := buildJourneyLegs(candidate.Stop, candidate.ArrivalSec, chains[candidate.Stop.Stop.StopId], stopMap, routeMap, scanAt, dayStart, req.WalkSpeedKmph, req.StartLat, req.StartLon)
 			if len(legs) == 0 {
 				continue
 			}
@@ -341,27 +354,36 @@ func (v Database) planJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 		}
 		return plans
 	}
-	buildPlans := func(banned map[string]bool, fromSec int) []JourneyPlan {
-		return buildPlansWithin(banned, fromSec, req.MaxTransfers)
-	}
 
-	// RAPTOR keeps one earliest arrival per stop, so a direct service that
-	// gets in a couple of minutes after a two-bus option never surfaces. Scan
-	// direct-only as well and let the ranking's transfer penalty choose.
-	initialPlans := func() []JourneyPlan {
-		plans := buildPlans(nil, 0)
-		if req.MaxTransfers > 0 {
-			plans = append(plans, buildPlansWithin(nil, 0, 0)...)
+	candidateLimit := expandedCandidateLimit(req.MaxResults)
+
+	// One scan answers both "best with up to MaxTransfers changes" and "best
+	// direct ride": RAPTOR's first round is exactly a direct-only search, and
+	// its labels are kept before the next round overwrites them. RAPTOR keeps
+	// one earliest arrival per stop, so a direct service a few minutes slower
+	// than a two-bus option would otherwise never surface; the ranking's
+	// transfer penalty then chooses.
+	scanOnce := func(banned map[string]bool, withDirect bool) []JourneyPlan {
+		r := *rules
+		r.banned = banned
+		scan := newDepartScan(day, stopMap, transferGraph, &r, nearbyEndStops, req.WalkSpeedKmph)
+		updated := scan.seed(nearbyStartStops, departSec)
+		directArrival := scan.run(updated, departSec, req.MaxTransfers, targetSlackSec, withDirect && req.MaxTransfers > 0)
+		plans := plansFrom(scan.arrival, scan.bestChain, departSec, req.MaxTransfers, candidateLimit, r.originGapSec)
+		if directArrival != nil {
+			direct := func(id string) map[string]stopPredecessor { return scan.chain(id, 1) }
+			plans = append(plans, plansFrom(directArrival, direct, departSec, 0, candidateLimit, r.originGapSec)...)
 		}
 		return plans
 	}
-	plans := initialPlans()
+
+	plans := scanOnce(nil, true)
 	if len(plans) == 0 {
 		// Nothing leaves enough time at the first stop - offer the tight
 		// connection rather than no journey (the diversity pass below then
 		// runs tight too).
-		originGapSec = 0
-		plans = initialPlans()
+		rules.originGapSec = 0
+		plans = scanOnce(nil, true)
 	}
 	if len(plans) == 0 {
 		return nil, noOnlyRouteJourneyError(req)
@@ -371,17 +393,30 @@ func (v Database) planJourneysRaptor(req JourneyRequest) ([]JourneyPlan, error) 
 
 	// Collapse the raw candidates (which all tend to share one route spine)
 	// before deciding whether we need more variety.
-	plans = dedupePlansByTransitService(plans, 0, rank)
+	plans = pruneDominatedPlans(dedupePlansByTransitService(plans, 0, rank))
 
 	// Diversity pass: RAPTOR keeps only the single earliest arrival per stop, so
 	// every candidate plan tends to share one spine. Re-run with routes banned to
 	// pull in genuinely different options, and if the corridor is thin, add the
 	// next departures so the rider still gets at least MinResults choices.
-	plans = diversifyPlans(plans, dayStart, buildPlans, req.MinResults, req.MaxResults, rank)
+	banScan := func(banned map[string]bool) []JourneyPlan { return scanOnce(banned, false) }
+	laterScan := func(fromSec int) []JourneyPlan {
+		scan := newDepartScan(day, stopMap, transferGraph, rules, nearbyEndStops, req.WalkSpeedKmph)
+		var found []JourneyPlan
+		scan.rangeScan(nearbyStartStops, fromSec, fromSec+laterWindowSec, req.MaxTransfers, laterMaxRuns, func(t int) {
+			found = append(found, plansFrom(scan.arrival, scan.bestChain, t, req.MaxTransfers, 1, rules.originGapSec)...)
+		})
+		return found
+	}
+	plans = diversifyPlans(plans, dayStart, banScan, laterScan, req.MinResults, req.MaxResults, rank)
 
-	plans = dedupePlansByTransitService(plans, req.MaxResults, rank)
+	plans = dedupePlansByTransitService(dropFarWorsePlans(pruneDominatedPlans(plans), rank), req.MaxResults, rank)
 	if len(plans) == 0 {
 		return nil, errors.New("no journey legs available")
+	}
+
+	for i := range plans {
+		plans[i].LeaveLater = leaveLaterOption(plans[i], day, rules, dayStart, routeMap, stopMap, req.WalkSpeedKmph)
 	}
 
 	// GeoJSON (walk legs in particular) is expensive - each walk leg costs a
@@ -410,85 +445,32 @@ func raptorDepartScan(
 	bannedRoutes map[string]bool,
 	onlyRoutes map[string]bool,
 ) (map[string]int, map[string]stopPredecessor) {
-	const inf = math.MaxInt32
-	arrival := make(map[string]int, len(stopMap))
-	predecessor := make(map[string]stopPredecessor, len(stopMap))
-	updated := make(map[string]bool, len(stopMap))
-	for stopID := range stopMap {
-		arrival[stopID] = inf
+	rules := &scanRules{
+		banned:       bannedRoutes,
+		only:         onlyRoutes,
+		originGapSec: originGapSec,
+		transferGap:  func(string) int { return transferGapSec },
 	}
-	arr := func(id string) int { return arrival[id] }
-
-	for _, candidate := range nearbyStartStops {
-		t := departSec + walkDurationSeconds(candidate.Distance, walkSpeedKmph)
-		if t < arr(candidate.Stop.StopId) {
-			arrival[candidate.Stop.StopId] = t
-			predecessor[candidate.Stop.StopId] = stopPredecessor{DepartSec: departSec, ArriveSec: t, Mode: "walk-origin"}
-			updated[candidate.Stop.StopId] = true
-		}
+	scan := newDepartScan(newPlannerDay(trips), stopMap, transferGraph, rules, nil, walkSpeedKmph)
+	scan.run(scan.seed(nearbyStartStops, departSec), departSec, maxTransfers, targetSlackSec, false)
+	best := make(map[string]stopPredecessor, len(scan.lastRound))
+	for id := range scan.lastRound {
+		best[id], _ = scan.best(id)
 	}
+	return scan.arrival, best
+}
 
-	for round := 0; round <= maxTransfers; round++ {
-		nextUpdated := make(map[string]bool)
-		// Round 0 boards at the stops walked to from the origin; later rounds
-		// are transfers.
-		boardGapSec := transferGapSec
-		if round == 0 {
-			boardGapSec = originGapSec
-		}
-		for _, tripTimes := range trips {
-			if len(tripTimes) > 0 && !routeAllowed(tripTimes[0].RouteID, onlyRoutes, bannedRoutes) {
-				continue
-			}
-			boarded := false
-			boardStopID := ""
-			boardDepartSec := 0
-			boardScheduledDepartSec := 0
-			for _, stopTime := range tripTimes {
-				if !boarded {
-					if stopTime.TripUsable && stopTime.Boardable && updated[stopTime.StopID] &&
-						canBoardTransitAtStop(arr(stopTime.StopID), stopTime.DepartureSec, true, boardGapSec) {
-						boarded = true
-						boardStopID = stopTime.StopID
-						boardDepartSec = stopTime.DepartureSec
-						boardScheduledDepartSec = stopTime.ScheduledDepartureSec
-					}
-					continue
-				}
-				if stopTime.TripUsable && stopTime.Alightable && stopTime.ArrivalSec >= boardDepartSec && stopTime.ArrivalSec < arr(stopTime.StopID) {
-					arrival[stopTime.StopID] = stopTime.ArrivalSec
-					predecessor[stopTime.StopID] = stopPredecessor{
-						FromStopID:         boardStopID,
-						TripID:             stopTime.TripID,
-						RouteID:            stopTime.RouteID,
-						DepartSec:          boardDepartSec,
-						ArriveSec:          stopTime.ArrivalSec,
-						ScheduledDepartSec: boardScheduledDepartSec,
-						ScheduledArriveSec: stopTime.ScheduledArrivalSec,
-						RealtimeStatus:     stopTime.RealtimeStatus,
-						TripUsable:         stopTime.TripUsable,
-						Mode:               "transit",
-					}
-					nextUpdated[stopTime.StopID] = true
-				}
-			}
-		}
-
-		if round < maxTransfers && len(nextUpdated) > 0 {
-			transitUpdated := make([]string, 0, len(nextUpdated))
-			for id := range nextUpdated {
-				transitUpdated = append(transitUpdated, id)
-			}
-			relaxFootTransfers(transitUpdated, transferGraph, arrival, predecessor, nextUpdated)
-		}
-
-		if len(nextUpdated) == 0 {
-			break
-		}
-		updated = nextUpdated
+// routeMapCached returns the routes by ID.
+func (v Database) routeMapCached() (map[string]Route, error) {
+	routes, err := v.GetRoutes()
+	if err != nil {
+		return nil, err
 	}
-
-	return arrival, predecessor
+	routeMap := make(map[string]Route, len(routes))
+	for _, route := range routes {
+		routeMap[route.RouteId] = route
+	}
+	return routeMap, nil
 }
 
 // countTransfers counts route changes across a finished leg list (a walk leg
@@ -532,7 +514,8 @@ func firstTransitDepartSec(plan JourneyPlan, dayStart time.Time) int {
 func diversifyPlans(
 	plans []JourneyPlan,
 	dayStart time.Time,
-	buildPlans func(banned map[string]bool, fromSec int) []JourneyPlan,
+	banScan func(banned map[string]bool) []JourneyPlan,
+	laterScan func(fromSec int) []JourneyPlan,
 	minResults, maxResults int,
 	rank planRanking,
 ) []JourneyPlan {
@@ -570,6 +553,9 @@ func diversifyPlans(
 	}
 
 	// Phase A - route banning. Routes from every current plan, best first.
+	// The scans don't depend on each other, so they run at once, and every
+	// alternative they find goes to the final ranking (which keeps the best
+	// MaxResults) instead of just the first few.
 	seenRoute := map[string]bool{}
 	var toBan []string
 	for _, p := range plans {
@@ -581,47 +567,141 @@ func diversifyPlans(
 		}
 	}
 	const maxExtraRuns = 6
-	if debugJourneyDiversity {
-		fmt.Fprintf(os.Stderr, "[diversify] base=%d target=%d toBan=%v\n", len(plans), target, toBan)
+	if len(toBan) > maxExtraRuns {
+		toBan = toBan[:maxExtraRuns]
 	}
+	banned := make([][]JourneyPlan, len(toBan))
+	var wg sync.WaitGroup
 	for i, routeID := range toBan {
-		if i >= maxExtraRuns || len(plans) >= target {
-			break
-		}
-		n := add(buildPlans(map[string]bool{routeID: true}, 0))
+		wg.Add(1)
+		go func(i int, routeID string) {
+			defer wg.Done()
+			banned[i] = banScan(map[string]bool{routeID: true})
+		}(i, routeID)
+	}
+	wg.Wait()
+	for i, cands := range banned {
+		n := add(cands)
 		if debugJourneyDiversity {
-			fmt.Fprintf(os.Stderr, "[diversify] ban %s -> +%d (now %d)\n", routeID, n, len(plans))
+			fmt.Fprintf(os.Stderr, "[diversify] ban %s -> +%d (now %d)\n", toBan[i], n, len(plans))
 		}
+	}
+	plans = pruneDominatedPlans(plans)
+	if len(plans) >= target {
+		return plans
 	}
 
-	// Phase B - next departures. Walk forward from the earliest first-transit
-	// departure we have, asking for the service after it each time, so a
-	// half-hourly corridor still yields "now", "the next one", "the one after".
+	// Phase B - next departures. One range scan over the window after the
+	// earliest first ride we have finds every later departure worth taking
+	// (leave later or arrive sooner than the others), so a half-hourly
+	// corridor still yields "now", "the next one", "the one after".
 	cursor := math.MaxInt32
 	for _, p := range plans {
 		if d := firstTransitDepartSec(p, dayStart); d > 0 && d < cursor {
 			cursor = d
 		}
 	}
-	for iter := 0; iter < 6 && len(plans) < target && cursor != math.MaxInt32; iter++ {
-		before := len(plans)
-		add(buildPlans(nil, cursor+60))
-		if len(plans) == before {
-			break
-		}
-		// Advance past the latest first-transit departure now in the set.
-		for _, p := range plans[before:] {
-			if d := firstTransitDepartSec(p, dayStart); d > cursor {
-				cursor = d
+	if cursor == math.MaxInt32 {
+		return plans
+	}
+	later := laterScan(cursor + 60)
+	sort.SliceStable(later, func(i, j int) bool { return later[i].DepartureTime.Before(later[j].DepartureTime) })
+	n := add(later)
+	if debugJourneyDiversity {
+		fmt.Fprintf(os.Stderr, "[diversify] range scan -> %d found, +%d (now %d)\n", len(later), n, len(plans))
+	}
+	return plans
+}
+
+// diversifyArriveBy is diversifyPlans for arrive-by: the same parallel route
+// bans, then "the one before" - arriving by just before the latest last ride
+// found so far, a few times - when the corridor is still thin.
+func diversifyArriveBy(
+	plans []JourneyPlan,
+	dayStart time.Time,
+	banScan func(banned map[string]bool) []JourneyPlan,
+	earlierScan func(arrSec int) []JourneyPlan,
+	minResults, maxResults int,
+) []JourneyPlan {
+	if len(plans) == 0 {
+		return plans
+	}
+	target := max(minResults, maxResults, 3)
+	if len(plans) >= target {
+		return plans
+	}
+	have := map[string]bool{}
+	for _, p := range plans {
+		have[transitServiceSignature(p)] = true
+	}
+	add := func(cands []JourneyPlan) {
+		for _, p := range cands {
+			if sig := transitServiceSignature(p); !have[sig] {
+				have[sig] = true
+				plans = append(plans, p)
 			}
-		}
-		if debugJourneyDiversity {
-			fmt.Fprintf(os.Stderr, "[diversify] next departures -> now %d, cursor %ds\n", len(plans), cursor)
 		}
 	}
 
+	seenRoute := map[string]bool{}
+	var toBan []string
+	for _, p := range plans {
+		for _, leg := range p.Legs {
+			if leg.Mode == "transit" && leg.RouteID != "" && !seenRoute[leg.RouteID] {
+				seenRoute[leg.RouteID] = true
+				toBan = append(toBan, leg.RouteID)
+			}
+		}
+	}
+	if len(toBan) > 6 {
+		toBan = toBan[:6]
+	}
+	results := make([][]JourneyPlan, len(toBan))
+	var wg sync.WaitGroup
+	for i, routeID := range toBan {
+		wg.Add(1)
+		go func(i int, routeID string) {
+			defer wg.Done()
+			results[i] = banScan(map[string]bool{routeID: true})
+		}(i, routeID)
+	}
+	wg.Wait()
+	for i, r := range results {
+		add(r)
+		if debugJourneyDiversity {
+			fmt.Fprintf(os.Stderr, "[diversify-arrive] ban %s -> %d found (now %d)\n", toBan[i], len(r), len(plans))
+		}
+	}
+	plans = pruneDominatedPlans(plans)
+	if debugJourneyDiversity {
+		fmt.Fprintf(os.Stderr, "[diversify-arrive] after prune %d\n", len(plans))
+	}
+
+	// The one before: arrive by a minute before the earliest arrival we have.
+	for iter := 0; iter < 3 && len(plans) < target; iter++ {
+		earliest := time.Time{}
+		for _, p := range plans {
+			if earliest.IsZero() || p.ArrivalTime.Before(earliest) {
+				earliest = p.ArrivalTime
+			}
+		}
+		before := len(plans)
+		add(earlierScan(int(earliest.Sub(dayStart).Seconds()) - 60))
+		if len(plans) == before {
+			break
+		}
+		plans = pruneDominatedPlans(plans)
+	}
 	return plans
 }
+
+// laterWindowSec / laterMaxRuns bound the diversity pass's range scan: how far
+// past the first ride it looks for later departures, and how many departure
+// times it tries.
+const (
+	laterWindowSec = 90 * 60
+	laterMaxRuns   = 40
+)
 
 // dropRedundantLeadingHop removes a pointless first transit leg: the rider boards
 // route A near the origin, rides a stop or two, then (after a short walk) boards
@@ -700,6 +780,14 @@ func normalizeJourneyRequest(req JourneyRequest) JourneyRequest {
 	}
 	if req.MinTransferSec > 900 {
 		req.MinTransferSec = 900
+	}
+	if req.Accessible {
+		if req.MaxWalkKm <= 0 || req.MaxWalkKm > accessibleMaxWalkKm {
+			req.MaxWalkKm = accessibleMaxWalkKm
+		}
+		if req.WalkSpeedKmph > accessibleWalkCapKmh {
+			req.WalkSpeedKmph = accessibleWalkCapKmh
+		}
 	}
 	return req
 }
@@ -809,116 +897,39 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		return nil, errors.New("no nearby stops found for start or end")
 	}
 
-	trips, err := v.loadTripStopTimes(dayStart, req.Realtime)
+	day, err := v.loadPlannerDay(dayStart, req.Realtime)
 	if err != nil {
 		return nil, err
 	}
-	routes, err := v.GetRoutes()
+	routeMap, err := v.routeMapCached()
 	if err != nil {
 		return nil, err
-	}
-	routeMap := make(map[string]Route, len(routes))
-	for _, route := range routes {
-		routeMap[route.RouteId] = route
 	}
 
 	onlyRoutes := allowedRouteSet(routeMap, req.OnlyRouteIDs, req.AllowedRouteTypes)
-	transferGraph := transferGraphAtSpeed(v.stopTransferGraph(stopMap, req.IncludeChildren), req.WalkSpeedKmph)
-	transferGapSec := minDirectTransferSeconds + req.MinTransferSec
-	// scan runs the reverse RAPTOR loop within a transfer budget (0 = direct
-	// services only) and turns it into itineraries.
-	scan := func(maxTransfers int) []JourneyPlan {
-		latest := make(map[string]int, len(stopMap))
-		successor := make(map[string]stopSuccessor, len(stopMap))
-		updated := make(map[string]bool, len(stopMap))
-		endStopDistances := make(map[string]float64, len(nearbyEndStops))
-		const negInf = -1
-		for stopID := range stopMap {
-			latest[stopID] = negInf
+	transferGraph := v.requestGraph(req, stopMap)
+	rules := v.newScanRules(req, stopMap, onlyRoutes)
+
+	endStopDistances := make(map[string]float64, len(nearbyEndStops))
+	for _, candidate := range nearbyEndStops {
+		if _, ok := endStopDistances[candidate.Stop.StopId]; !ok {
+			endStopDistances[candidate.Stop.StopId] = candidate.Distance
 		}
+	}
 
-		for _, candidate := range nearbyEndStops {
-			walkSeconds := walkDurationSeconds(candidate.Distance, req.WalkSpeedKmph)
-			timeAtStop := arriveSec - walkSeconds
-			if timeAtStop < 0 {
-				continue
-			}
-			if timeAtStop > latest[candidate.Stop.StopId] {
-				latest[candidate.Stop.StopId] = timeAtStop
-				updated[candidate.Stop.StopId] = true
-				endStopDistances[candidate.Stop.StopId] = candidate.Distance
-				successor[candidate.Stop.StopId] = stopSuccessor{
-					ToStopID:  "",
-					TripID:    "",
-					RouteID:   "",
-					DepartSec: timeAtStop,
-					ArriveSec: arriveSec,
-					Mode:      "walk-destination",
-				}
-			}
-		}
-
-		// inside planJourneysRaptorArriveAt (arrive-by reverse scan)
-		for round := 0; round <= maxTransfers; round++ {
-			nextUpdated := make(map[string]bool)
-			for _, tripTimes := range trips {
-				if len(tripTimes) > 0 && !routeAllowed(tripTimes[0].RouteID, onlyRoutes, nil) {
-					continue
-				}
-				alightPossible := false
-				downstreamStopID := ""
-				downstreamArriveSec := 0
-				downstreamScheduledArriveSec := 0
-				for i := len(tripTimes) - 1; i >= 0; i-- {
-					stopTime := tripTimes[i]
-					if !alightPossible {
-						isTransfer := round > 0
-						if stopTime.TripUsable && stopTime.Alightable &&
-							updated[stopTime.StopID] &&
-							canAlightForTransitConnection(stopTime.ArrivalSec, latest[stopTime.StopID], isTransfer, transferGapSec) {
-							alightPossible = true
-							downstreamStopID = stopTime.StopID
-							downstreamArriveSec = stopTime.ArrivalSec
-							downstreamScheduledArriveSec = stopTime.ScheduledArrivalSec
-						}
-						continue
-					}
-
-					if stopTime.TripUsable && stopTime.Boardable && stopTime.DepartureSec <= downstreamArriveSec && stopTime.DepartureSec > latest[stopTime.StopID] {
-						latest[stopTime.StopID] = stopTime.DepartureSec
-						successor[stopTime.StopID] = stopSuccessor{
-							ToStopID:           downstreamStopID,
-							TripID:             stopTime.TripID,
-							RouteID:            stopTime.RouteID,
-							DepartSec:          stopTime.DepartureSec,
-							ArriveSec:          downstreamArriveSec,
-							ScheduledDepartSec: stopTime.ScheduledDepartureSec,
-							ScheduledArriveSec: downstreamScheduledArriveSec,
-							RealtimeStatus:     stopTime.RealtimeStatus,
-							TripUsable:         stopTime.TripUsable,
-							Mode:               "transit",
-						}
-						nextUpdated[stopTime.StopID] = true
-					}
-				}
-			}
-
-			if round < maxTransfers && len(nextUpdated) > 0 {
-				transitUpdated := make([]string, 0, len(nextUpdated))
-				for id := range nextUpdated {
-					transitUpdated = append(transitUpdated, id)
-				}
-				relaxFootTransfersArriveAt(transitUpdated, transferGraph, latest, successor, nextUpdated)
-			}
-
-			if len(nextUpdated) == 0 {
-				break
-			}
-			updated = nextUpdated
-		}
-
+	// plansFrom turns one set of labels into itineraries.
+	plansFrom := func(latest map[string]int, chainOf func(stopID string) map[string]stopSuccessor) []JourneyPlan {
 		candidateLimit := expandedCandidateLimit(req.MaxResults)
-		candidates := selectBestOriginsArriveAt(nearbyStartStops, latest, req.WalkSpeedKmph, candidateLimit)
+		chains := map[string]map[string]stopSuccessor{}
+		byRide := reachedByRide(nearbyStartStops, func(id string) bool {
+			if latest[id] < 0 {
+				return false
+			}
+			c := chainOf(id)
+			chains[id] = c
+			return c != nil && c[id].Mode == "transit"
+		})
+		candidates := selectBestOriginsArriveAt(byRide, latest, req.WalkSpeedKmph, candidateLimit)
 		if len(candidates) == 0 {
 			return nil
 		}
@@ -926,11 +937,21 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		var plans []JourneyPlan
 		for _, candidate := range candidates {
 			startTimeAtStop := latest[candidate.Stop.Stop.StopId]
-			legs, transfers, transferStops := buildJourneyLegsArriveAt(candidate.Stop, candidate.DepartSec, startTimeAtStop, successor, stopMap, routeMap, dayStart, req.WalkSpeedKmph, req.StartLat, req.StartLon, req.EndLat, req.EndLon, endStopDistances)
+			legs, transfers, transferStops := buildJourneyLegsArriveAt(candidate.Stop, candidate.DepartSec, startTimeAtStop, chains[candidate.Stop.Stop.StopId], stopMap, routeMap, dayStart, req.WalkSpeedKmph, req.StartLat, req.StartLon, req.EndLat, req.EndLon, endStopDistances)
 			if len(legs) == 0 {
 				continue
 			}
 			legs = mergeAdjacentWalkLegs(legs)
+			// A stop's label can be replaced in a later round, so a chain read
+			// back from the labels can hold one ride more than the budget.
+			if countTransfers(legs) > req.MaxTransfers {
+				continue
+			}
+			// A change walk next to the origin walk merges into one longer
+			// walk; past the walking limit, it isn't a journey to offer.
+			if legs[0].Mode == "walk" && legs[0].DistanceKm > req.MaxWalkKm+footTransferMinKm {
+				continue
+			}
 			legs = deferOriginWalk(legs, time.Time{})
 			departAt := dayStart.Add(time.Duration(candidate.DepartSec) * time.Second)
 			if len(legs) > 0 && legs[0].Mode == "walk" {
@@ -956,18 +977,36 @@ func (v Database) planJourneysRaptorArriveAt(req JourneyRequest) ([]JourneyPlan,
 		return plans
 	}
 
-	plans := scan(req.MaxTransfers)
-	// RAPTOR keeps one latest departure per stop, so a direct service that
-	// leaves a couple of minutes before a two-bus option never surfaces. Scan
-	// direct-only as well and let the ranking's transfer penalty choose.
-	if req.MaxTransfers > 0 {
-		plans = append(plans, scan(0)...)
+	// scanOnce runs the reverse scan for arriving by arrSec with `banned`
+	// routes left out. Its first round is the direct-only answer (see the
+	// depart-after planner), kept when withDirect is set.
+	scanOnce := func(banned map[string]bool, arrSec int, withDirect bool) []JourneyPlan {
+		r := *rules
+		r.banned = banned
+		scanner := newArriveScan(day, stopMap, transferGraph, &r, nearbyStartStops, req.WalkSpeedKmph)
+		updated := scanner.seed(nearbyEndStops, arrSec)
+		directLatest := scanner.run(updated, arrSec, req.MaxTransfers, withDirect && req.MaxTransfers > 0)
+		plans := plansFrom(scanner.latest, scanner.bestChain)
+		if directLatest != nil {
+			direct := func(id string) map[string]stopSuccessor { return scanner.chain(id, 1) }
+			plans = append(plans, plansFrom(directLatest, direct)...)
+		}
+		return plans
 	}
+
+	rank := planRanking{ref: arriveAt, arriveBy: true}
+	plans := scanOnce(nil, arriveSec, true)
+	plans = pruneDominatedPlans(dedupePlansByTransitService(plans, 0, rank))
+	plans = diversifyArriveBy(plans, dayStart, func(banned map[string]bool) []JourneyPlan {
+		return scanOnce(banned, arriveSec, false)
+	}, func(arrSec int) []JourneyPlan {
+		return scanOnce(nil, arrSec, false)
+	}, req.MinResults, req.MaxResults)
 	if len(plans) == 0 {
 		return nil, noOnlyRouteJourneyError(req)
 	}
 
-	plans = dedupePlansByTransitService(plans, req.MaxResults, planRanking{ref: arriveAt, arriveBy: true})
+	plans = dedupePlansByTransitService(dropFarWorsePlans(pruneDominatedPlans(plans), rank), req.MaxResults, rank)
 	if len(plans) == 0 {
 		return nil, errors.New("no journey legs available")
 	}
@@ -1037,7 +1076,10 @@ type stopTransfer struct {
 	ToStopID string
 	WalkSec  int
 	DistKm   float64 // 0 for a same-station interchange (fixed WalkSec)
-	rare     bool    // target is a ferry/rail stop - never trimmed from the candidate list
+	// MinSec is the feed's transfers.txt minimum for this pair; WalkSec never
+	// drops below it, even when re-timed for a walker's pace.
+	MinSec int
+	rare   bool // target is a ferry/rail stop - never trimmed from the candidate list
 }
 
 const (
@@ -1050,12 +1092,12 @@ const (
 	footTransferBufferSec   = 30
 	footTransferWalkSpeedKm = 4.6 // slightly slower than the trip-planner default: street crossings, finding the stop
 	footTransferGridDeg     = 0.005
-	// Minimum change time for a same-station, different-platform transfer (e.g.
-	// crossing to the opposite platform at a through-station). Straight-line
-	// distance between platforms can be a few metres, but the rider still has
-	// to cross a bridge/underpass or wait for a level crossing, so a distance-
-	// scaled walk time understates it.
-	sameStationTransferSec = 120
+	// Walk for a same-station, different-platform transfer (e.g. crossing to
+	// the opposite platform at a through-station). Straight-line distance
+	// between platforms can be a few metres, but the rider still has to cross
+	// a bridge/underpass. Boarding the next train adds the platform's own
+	// interchange gap (railBoardGapSec, more at a big station) on top.
+	sameStationTransferSec = 60
 )
 
 type stopTransferGraphMemo struct {
@@ -1085,7 +1127,8 @@ func (v Database) stopTransferGraph(stopMap map[string]Stop, includeChildren boo
 		return m.data
 	}
 
-	m.data = buildStopTransferGraph(stopMap)
+	_, pairs := v.feedTransferTimes()
+	m.data = withFeedPairTimes(buildStopTransferGraph(stopMap), pairs)
 	m.key = key
 	m.builtAt = time.Now()
 	return m.data
@@ -1222,7 +1265,7 @@ func transferGraphAtSpeed(graph map[string][]stopTransfer, walkSpeedKmph float64
 		retimed := make([]stopTransfer, len(edges))
 		for i, tr := range edges {
 			if tr.DistKm > 0 {
-				tr.WalkSec = walkDurationSeconds(tr.DistKm, speed) + footTransferBufferSec
+				tr.WalkSec = max(walkDurationSeconds(tr.DistKm, speed)+footTransferBufferSec, tr.MinSec)
 			}
 			retimed[i] = tr
 		}
@@ -1310,14 +1353,24 @@ func relaxFootTransfersArriveAt(
 // Callers MUST NOT mutate the returned map or its slices (the RAPTOR scan only
 // reads them): unadjusted trips share their slice with the static layer.
 type tripStopTimesMemo struct {
-	mu      sync.Mutex
-	day     string
-	builtAt time.Time
-	data    map[string][]tripStopTime
-
-	staticDay string
-	static    map[string][]tripStopTime
+	mu   sync.Mutex
+	days map[string]*memoDay // service day (YYYYMMDD) -> its layers
 }
+
+type memoDay struct {
+	static   *plannerDay
+	data     *plannerDay // static + realtime, rebuilt after tripStopTimesMemoTTL
+	builtAt  time.Time
+	lastUsed time.Time
+}
+
+// plannerDaysKept is how many service days' stop times are held: today,
+// tomorrow (warmed in the evening) and one more, so planning another day no
+// longer throws today's away.
+const plannerDaysKept = 3
+
+// tomorrowWarmHour is the local hour from which tomorrow is warmed as well.
+const tomorrowWarmHour = 17
 
 const tripStopTimesMemoTTL = 30 * time.Second
 
@@ -1340,20 +1393,22 @@ func serviceDayNoon(dayStart time.Time) time.Time {
 	return dayStart.Add(12 * time.Hour)
 }
 
-func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsrealtime.Realtime) (map[string][]tripStopTime, error) {
+// loadPlannerDay returns the indexed stop times for the service day starting
+// at dayStart, with realtime applied (refreshed every tripStopTimesMemoTTL).
+func (v Database) loadPlannerDay(dayStart time.Time, realtimeClient *gtfsrealtime.Realtime) (*plannerDay, error) {
 	day := serviceDayNoon(dayStart).Format("20060102")
-	mi, _ := tripStopTimesMemos.LoadOrStore(v.name, &tripStopTimesMemo{})
-	m := mi.(*tripStopTimesMemo)
+	m := v.plannerMemo()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.data != nil && m.day == day && time.Since(m.builtAt) < tripStopTimesMemoTTL {
-		return m.data, nil
-	}
-
-	if err := v.ensureStaticTripStopTimesLocked(m, dayStart, day); err != nil {
+	entry, err := v.ensureStaticDayLocked(m, dayStart, day)
+	if err != nil {
 		return nil, err
+	}
+	entry.lastUsed = time.Now()
+	if entry.data != nil && time.Since(entry.builtAt) < tripStopTimesMemoTTL {
+		return entry.data, nil
 	}
 
 	realtimeAdjustments := map[string]realtimeTripAdjustment{}
@@ -1362,27 +1417,59 @@ func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsreal
 	}
 	now := time.Now().In(v.timeZone)
 	today := now.Format("20060102")
-	built := applyRealtimeToTripStopTimes(m.static, realtimeAdjustments, day, today, int(now.Sub(dayStart).Seconds()))
+	built := applyRealtimeToTripStopTimes(entry.static.trips, realtimeAdjustments, day, today, int(now.Sub(dayStart).Seconds()))
 
-	m.data, m.day, m.builtAt = built, day, time.Now()
-	return built, nil
+	entry.data, entry.builtAt = entry.static.withTrips(built), time.Now()
+	return entry.data, nil
 }
 
-// ensureStaticTripStopTimesLocked (re)builds m's static layer for `day` if it
-// holds another day or nothing. m.mu must be held.
-func (v Database) ensureStaticTripStopTimesLocked(m *tripStopTimesMemo, dayStart time.Time, day string) error {
-	if m.static != nil && m.staticDay == day {
-		return nil
+// loadTripStopTimes is loadPlannerDay without the index.
+func (v Database) loadTripStopTimes(dayStart time.Time, realtimeClient *gtfsrealtime.Realtime) (map[string][]tripStopTime, error) {
+	d, err := v.loadPlannerDay(dayStart, realtimeClient)
+	if err != nil {
+		return nil, err
 	}
-	// Drop the old day before building the next so two days' worth of stop
-	// times are never held at once.
-	m.static, m.data = nil, nil
+	return d.trips, nil
+}
+
+func (v Database) plannerMemo() *tripStopTimesMemo {
+	mi, _ := tripStopTimesMemos.LoadOrStore(v.name, &tripStopTimesMemo{})
+	return mi.(*tripStopTimesMemo)
+}
+
+// ensureStaticDayLocked returns m's entry for `day`, building its static layer
+// if needed and evicting the least recently used other day once more than
+// plannerDaysKept are held (today's is never evicted). m.mu must be held.
+func (v Database) ensureStaticDayLocked(m *tripStopTimesMemo, dayStart time.Time, day string) (*memoDay, error) {
+	if m.days == nil {
+		m.days = map[string]*memoDay{}
+	}
+	if e, ok := m.days[day]; ok {
+		return e, nil
+	}
+	today := serviceDayNoon(serviceDayStart(time.Now().In(v.timeZone), v.timeZone)).Format("20060102")
+	for len(m.days) >= plannerDaysKept {
+		oldest := ""
+		for d, e := range m.days {
+			if d == today {
+				continue
+			}
+			if oldest == "" || e.lastUsed.Before(m.days[oldest].lastUsed) {
+				oldest = d
+			}
+		}
+		if oldest == "" {
+			break
+		}
+		delete(m.days, oldest)
+	}
 	static, err := v.buildStaticTripStopTimes(dayStart)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	m.static, m.staticDay = static, day
-	return nil
+	e := &memoDay{static: newPlannerDay(static), lastUsed: time.Now()}
+	m.days[day] = e
+	return e, nil
 }
 
 // EnableJourneyPlannerWarmup keeps the journey planner's caches built ahead of
@@ -1408,18 +1495,25 @@ func (v Database) EnableJourneyPlannerWarmup() {
 
 func (v Database) warmJourneyPlanner() {
 	now := time.Now().In(v.timeZone)
-	dayStart := serviceDayStart(now, v.timeZone)
-	mi, _ := tripStopTimesMemos.LoadOrStore(v.name, &tripStopTimesMemo{})
-	m := mi.(*tripStopTimesMemo)
-	m.mu.Lock()
-	err := v.ensureStaticTripStopTimesLocked(m, dayStart, serviceDayNoon(dayStart).Format("20060102"))
-	m.mu.Unlock()
-	if err != nil {
-		log.Printf("gtfs: journey planner warmup for %s: %v", v.name, err)
+	days := []time.Time{serviceDayStart(now, v.timeZone)}
+	// From the evening, tomorrow's timetable too: that's when people plan
+	// tomorrow's trips, and building it in a request costs ~2 s.
+	if now.Hour() >= tomorrowWarmHour {
+		days = append(days, serviceDayStart(now.AddDate(0, 0, 1), v.timeZone))
+	}
+	m := v.plannerMemo()
+	for _, dayStart := range days {
+		m.mu.Lock()
+		_, err := v.ensureStaticDayLocked(m, dayStart, serviceDayNoon(dayStart).Format("20060102"))
+		m.mu.Unlock()
+		if err != nil {
+			log.Printf("gtfs: journey planner warmup for %s: %v", v.name, err)
+		}
 	}
 
 	if stopMap, err := v.GetStopsMap(true); err == nil {
 		v.stopTransferGraph(stopMap, true)
+		v.interchangeGaps(stopMap, true)
 	}
 }
 
@@ -1481,7 +1575,8 @@ func (v Database) buildStaticTripStopTimes(dayStart time.Time) (map[string][]tri
 		st.arrival_time,
 		st.departure_time,
 		COALESCE(st.pickup_type, 0),
-		COALESCE(st.drop_off_type, 0)
+		COALESCE(st.drop_off_type, 0),
+		COALESCE(t.wheelchair_accessible, 0)
 	FROM stop_times st
 	JOIN trips t ON st.trip_id = t.trip_id
 	JOIN adjusted_services a ON t.service_id = a.service_id
@@ -1497,22 +1592,50 @@ func (v Database) buildStaticTripStopTimes(dayStart time.Time) (map[string][]tri
 	defer rows.Close()
 
 	trips := make(map[string][]tripStopTime)
+	// Rows come grouped by trip, so the trip ID string is reused for every row
+	// of a trip, and stop/route IDs are interned: a day is ~500k rows, and a
+	// fresh copy of each ID per row was most of the memo's memory.
+	intern := make(map[string]string, 8192)
+	internStr := func(b []byte) string {
+		if v, ok := intern[string(b)]; ok {
+			return v
+		}
+		v := string(b)
+		intern[v] = v
+		return v
+	}
+	var tripID string
+	var tripBuf, routeBuf, stopBuf []byte
+	// One trip's rows collect here, then move into an exact-size slice
+	// (append's doubling would leave ~40% of the day unused).
+	var current []tripStopTime
+	flush := func() {
+		if len(current) > 0 {
+			trips[tripID] = append([]tripStopTime(nil), current...)
+			current = current[:0]
+		}
+	}
 
 	for rows.Next() {
-		var tripID, routeID, stopID, arrivalTime, departureTime string
-		var sequence, pickupType, dropOffType int
+		var arrivalTime, departureTime string
+		var sequence, pickupType, dropOffType, access int
 
 		if err := rows.Scan(
-			&tripID,
-			&routeID,
-			&stopID,
+			&tripBuf,
+			&routeBuf,
+			&stopBuf,
 			&sequence,
 			&arrivalTime,
 			&departureTime,
 			&pickupType,
 			&dropOffType,
+			&access,
 		); err != nil {
 			return nil, err
+		}
+		if tripID != string(tripBuf) {
+			flush()
+			tripID = string(tripBuf)
 		}
 
 		arrivalSec, err := parseTimeToSeconds(arrivalTime)
@@ -1525,23 +1648,23 @@ func (v Database) buildStaticTripStopTimes(dayStart time.Time) (map[string][]tri
 			departureSec = arrivalSec
 		}
 
-		trips[tripID] = append(trips[tripID], tripStopTime{
-			StopID:                stopID,
+		current = append(current, tripStopTime{
+			StopID:                internStr(stopBuf),
 			StopSequence:          sequence,
 			ArrivalSec:            arrivalSec,
 			DepartureSec:          departureSec,
-			RouteID:               routeID,
+			RouteID:               internStr(routeBuf),
 			TripID:                tripID,
-			ArrivalTime:           arrivalTime,
-			DepartureTime:         departureTime,
 			ScheduledArrivalSec:   arrivalSec,
 			ScheduledDepartureSec: departureSec,
 			RealtimeStatus:        "scheduled",
 			TripUsable:            true,
 			Boardable:             pickupType == 0,
 			Alightable:            dropOffType == 0,
+			Access:                int8(access),
 		})
 	}
+	flush()
 
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -2581,12 +2704,22 @@ func dropNegligibleOriginWalk(legs []JourneyLeg) []JourneyLeg {
 // populateRouteGeoJSON fills in RouteGeoJSON for each plan, one goroutine per
 // plan, since it's only ever called on the final (small, deduped) result set.
 func populateRouteGeoJSON(db Database, req JourneyRequest, plans []JourneyPlan) {
+	osrm := req.OsrmURL
+	if req.StraightWalks {
+		req.OsrmURL = ""
+	}
+	pending := req.StraightWalks && osrm != ""
 	var wg sync.WaitGroup
 	for i := range plans {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			plans[i].RouteGeoJSON = buildJourneyGeoJSON(db, req, plans[i].Legs)
+			plans[i].WalkRoutesPending = pending && hasWalkLeg(plans[i].Legs)
+			if later := plans[i].LeaveLater; later != nil {
+				later.RouteGeoJSON = buildJourneyGeoJSON(db, req, later.Legs)
+				later.WalkRoutesPending = pending && hasWalkLeg(later.Legs)
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -2602,7 +2735,7 @@ func buildJourneyGeoJSON(db Database, req JourneyRequest, legs []JourneyLeg) map
 			if leg.TripID == "" {
 				continue
 			}
-			shape, err := db.GetShapeByTripID(leg.TripID)
+			shape, err := db.plannerTripShape(leg.TripID)
 			if err != nil {
 				continue
 			}
