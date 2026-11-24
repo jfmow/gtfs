@@ -579,7 +579,7 @@ func (v Database) refreshDatabaseData() error {
 	// The fresh feed may change today's schedule - drop the loadTripStopTimes
 	// memo (static schedule + realtime overlay) so the next plan rebuilds
 	// against the new data.
-	tripStopTimesMemos.Delete(v.name)
+	dropPlannerCaches(v.name)
 
 	v.refreshNotifier.broadcast()
 	return nil
