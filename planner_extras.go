@@ -173,7 +173,8 @@ func sameBoardingPlace(stop Stop, stopMap map[string]Stop) []Stop {
 
 // AddWalkRoutes replaces a WalkRoutesPending plan's straight-line walks with
 // walking routes from OSRM (and its LeaveLater's too). A no-op for a plan
-// that isn't pending.
+// that isn't pending. It only assigns plan's own fields (LeaveLater gets a
+// new copy), so a copy of a cached plan can be filled while the cache is read.
 func (v Database) AddWalkRoutes(plan *JourneyPlan, osrmURL string) {
 	if plan == nil || !plan.WalkRoutesPending {
 		return
@@ -182,8 +183,11 @@ func (v Database) AddWalkRoutes(plan *JourneyPlan, osrmURL string) {
 	plan.RouteGeoJSON = buildJourneyGeoJSON(v, req, plan.Legs)
 	plan.WalkRoutesPending = false
 	if plan.LeaveLater != nil {
-		plan.LeaveLater.WalkRoutesPending = true
-		v.AddWalkRoutes(plan.LeaveLater, osrmURL)
+		// A copy: callers keep plans (and share this pointer) elsewhere.
+		later := *plan.LeaveLater
+		later.WalkRoutesPending = true
+		v.AddWalkRoutes(&later, osrmURL)
+		plan.LeaveLater = &later
 	}
 }
 
