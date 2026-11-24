@@ -175,3 +175,55 @@ func TestPruneDominatedPlans(t *testing.T) {
 		t.Fatalf("kept %v, want good and direct", []string{out[0].ID, out[1].ID})
 	}
 }
+
+func TestOvernightTripsShiftOntoTheNextDay(t *testing.T) {
+	// Friday's 23:50 bus: stops at 23:50, 24:10 and 24:30 (Friday's clock).
+	prev := map[string][]tripStopTime{
+		"late":  {st("late", "R", "a", 23*3600+50*60), st("late", "R", "b", 24*3600+10*60), st("late", "R", "c", 24*3600+30*60)},
+		"early": {st("early", "R", "a", 20*3600), st("early", "R", "b", 21*3600)},
+	}
+	out := overnightTrips(prev, -24*3600)
+	got, ok := out["late"+overnightSuffix]
+	if !ok || len(out) != 1 {
+		t.Fatalf("overnight trips = %v, want only the late bus", out)
+	}
+	if len(got) != 2 || got[0].StopID != "b" || got[0].DepartureSec != 10*60 || got[1].ScheduledArrivalSec != 30*60 {
+		t.Fatalf("late bus after midnight = %+v, want b at 00:10 and c at 00:30", got)
+	}
+	if got[0].TripID != "late" {
+		t.Fatalf("TripID = %q, want the real trip id", got[0].TripID)
+	}
+}
+
+func TestApplyRealtimeUsesThePreviousServiceDayForOvernightTrips(t *testing.T) {
+	static := map[string][]tripStopTime{
+		"t" + overnightSuffix: {st("t", "R", "b", 600), st("t", "R", "c", 1800)},
+	}
+	adj := map[string]realtimeTripAdjustment{"t": {hasRealtime: true, tripDelay: 120, startDate: "20261127", hasVehicle: true}}
+	out := applyRealtimeToTripStopTimes(static, adj, "20261128", "20261128", 900)
+	if got := out["t"+overnightSuffix][0].DepartureSec; got != 720 {
+		t.Fatalf("overnight trip departure = %d, want the 2-min delay applied (720)", got)
+	}
+	// An update for the same trip on the new day doesn't touch it.
+	adj["t"] = realtimeTripAdjustment{hasRealtime: true, tripDelay: 300, startDate: "20261128", hasVehicle: true}
+	out = applyRealtimeToTripStopTimes(static, adj, "20261128", "20261128", 900)
+	if got := out["t"+overnightSuffix][0].DepartureSec; got != 600 {
+		t.Fatalf("overnight trip departure = %d, want it unchanged (600)", got)
+	}
+}
+
+func TestDropLongWaitPlansKeepsTheOnlyOption(t *testing.T) {
+	base := time.Date(2026, 11, 28, 0, 0, 0, 0, time.UTC)
+	m := func(min int) time.Time { return base.Add(time.Duration(min) * time.Minute) }
+	wait := JourneyPlan{ID: "wait", Legs: []JourneyLeg{
+		{Mode: "transit", DepartureTime: m(30), ArrivalTime: m(60)},
+		{Mode: "transit", DepartureTime: m(330), ArrivalTime: m(360)},
+	}}
+	direct := JourneyPlan{ID: "direct", Legs: []JourneyLeg{{Mode: "transit", DepartureTime: m(320), ArrivalTime: m(400)}}}
+	if out := dropLongWaitPlans([]JourneyPlan{wait, direct}); len(out) != 1 || out[0].ID != "direct" {
+		t.Fatalf("kept %v, want only direct", out)
+	}
+	if out := dropLongWaitPlans([]JourneyPlan{wait}); len(out) != 1 {
+		t.Fatal("the only option must be kept")
+	}
+}

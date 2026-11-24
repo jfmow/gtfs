@@ -353,3 +353,145 @@ func reachedByRide(stops []StopWithDistance, ok func(stopID string) bool) []Stop
 	}
 	return out
 }
+
+// --- The previous day's late-night trips ------------------------------------
+//
+// GTFS times count from the service day's start and run past 24:00 for trips
+// that finish after midnight. Planning at 00:30 uses the new day's timetable,
+// which doesn't have them: a Friday-night bus at "24:40" belongs to Friday's
+// service day. Each day's planner timetable therefore also holds the previous
+// day's late trips, from midnight on, shifted onto the new day's clock.
+
+// overnightSuffix marks those trips' keys (a trip ID often runs every day,
+// so the same ID can be on both days). Their stop times keep the real TripID.
+const overnightSuffix = "@prev"
+
+// pastMidnightFilter is the WHERE clause queryTripStopTimes adds for trips that
+// run past 24:00.
+func pastMidnightFilter(on bool) string {
+	if !on {
+		return ""
+	}
+	return `WHERE st.trip_id IN (
+		SELECT trip_id FROM stop_times
+		WHERE CAST(substr(departure_time, 1, instr(departure_time, ':') - 1) AS INTEGER) >= 24
+		   OR CAST(substr(arrival_time, 1, instr(arrival_time, ':') - 1) AS INTEGER) >= 24
+	)`
+}
+
+// overnightTrips shifts the previous service day's trips onto this day's
+// clock (offsetSec = previous day start - this day start, about -24 h) and
+// keeps only the stops from this day's start on; a trip left with fewer than
+// two stops can't be ridden and is dropped.
+func overnightTrips(prev map[string][]tripStopTime, offsetSec int) map[string][]tripStopTime {
+	out := make(map[string][]tripStopTime)
+	for id, times := range prev {
+		var kept []tripStopTime
+		for _, st := range times {
+			st.ArrivalSec += offsetSec
+			st.DepartureSec += offsetSec
+			st.ScheduledArrivalSec += offsetSec
+			st.ScheduledDepartureSec += offsetSec
+			if st.DepartureSec < 0 {
+				continue
+			}
+			if st.ArrivalSec < 0 {
+				st.ArrivalSec, st.ScheduledArrivalSec = st.DepartureSec, st.ScheduledDepartureSec
+			}
+			kept = append(kept, st)
+		}
+		if len(kept) >= 2 {
+			out[id+overnightSuffix] = kept
+		}
+	}
+	return out
+}
+
+// previousServiceDay is the YYYYMMDD before `day` ("" if it doesn't parse).
+func previousServiceDay(day string) string {
+	t, err := time.Parse("20060102", day)
+	if err != nil {
+		return ""
+	}
+	return t.AddDate(0, 0, -1).Format("20060102")
+}
+
+// withOvernightTrips adds the previous service day's late trips to `trips`
+// (this day's, starting at dayStart). A failed load just leaves them out.
+func (v Database) withOvernightTrips(trips map[string][]tripStopTime, dayStart time.Time) map[string][]tripStopTime {
+	prevStart := serviceDayStart(serviceDayNoon(dayStart).AddDate(0, 0, -1), v.timeZone)
+	prev, err := v.queryTripStopTimes(prevStart, true)
+	if err != nil || len(prev) == 0 {
+		return trips
+	}
+	for id, times := range overnightTrips(prev, int(prevStart.Sub(dayStart).Seconds())) {
+		trips[id] = times
+	}
+	return trips
+}
+
+// tripTimesForLeg finds the stop times behind a transit leg: the trip by ID,
+// or the previous day's run of it, whichever boards at the leg's stop at the
+// leg's time.
+func tripTimesForLeg(trips map[string][]tripStopTime, leg JourneyLeg, dayStart time.Time) ([]tripStopTime, bool) {
+	if leg.FromStop == nil {
+		return nil, false
+	}
+	dep := int(leg.ScheduledDepartureTime.Sub(dayStart).Seconds())
+	if leg.ScheduledDepartureTime.IsZero() {
+		dep = int(leg.DepartureTime.Sub(dayStart).Seconds())
+	}
+	for _, key := range []string{leg.TripID, leg.TripID + overnightSuffix} {
+		times, ok := trips[key]
+		if !ok {
+			continue
+		}
+		for _, st := range times {
+			if st.StopID == leg.FromStop.StopId && (st.ScheduledDepartureSec == dep || st.DepartureSec == int(leg.DepartureTime.Sub(dayStart).Seconds())) {
+				return times, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// longWait is the longest wait at a change a plan can have while another
+// option has no such wait (late at night, a last train followed by hours at a
+// stop for the first morning bus otherwise "wins" by leaving earlier).
+const longWait = 45 * time.Minute
+
+// longestChangeWait is the longest time between one ride's arrival and the
+// next ride's departure, less any walk between them.
+func longestChangeWait(p JourneyPlan) time.Duration {
+	var longest time.Duration
+	var lastArrival time.Time
+	var walk time.Duration
+	for _, leg := range p.Legs {
+		if leg.Mode != "transit" {
+			walk += leg.Duration
+			continue
+		}
+		if !lastArrival.IsZero() {
+			if w := leg.DepartureTime.Sub(lastArrival) - walk; w > longest {
+				longest = w
+			}
+		}
+		lastArrival, walk = leg.ArrivalTime, 0
+	}
+	return longest
+}
+
+// dropLongWaitPlans removes plans with a change wait over longWait, unless
+// every plan has one.
+func dropLongWaitPlans(plans []JourneyPlan) []JourneyPlan {
+	out := plans[:0:0]
+	for _, p := range plans {
+		if longestChangeWait(p) <= longWait {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return plans
+	}
+	return out
+}
